@@ -481,3 +481,289 @@ clears active control pages or replays the graph through another mode.
 See [the current validation record](../VALIDATION.md) for actually executed
 commands and evidence. Source existence, `--help`, CPU-only self-tests and
 platform probes alone do not establish this full-model profile's qualification.
+
+## MTP batch pool contract (2026-11-09)
+
+`TP5_MTP_BATCH_POOL=1` enables the worker-local pool in `src/host_pool.h`.
+Each worker owns four lazy slots; a slot allocates its one-token `llama_batch`
+on first acquire and keeps the token inline. A lease returns its slot when it
+leaves scope, including on exception unwinding. When the flag is off or every
+slot is leased, the fallback lease owns the same heap batch that the pre-pool
+path allocated and frees it on release. `llama_batch_init` checks every
+allocation, including the outer `seq_id` array, and reports failure with null
+fields instead of dereferencing a failed allocation. `llama_batch_free` is
+safe on a partial batch because it checks each pointer and stops the `seq_id`
+walk at the first null entry. Every caller in this tree checks the result with
+`llama_batch_is_complete` and frees the partial batch; functions with an error
+channel return or propagate it, and the void entry points with no error channel
+(`llama_context::opt_epoch` and perplexity's void scorers) fail-stop with
+`GGML_ABORT`, recorded at the call site. The MTP pool and the target
+`row_batch` throw `std::bad_alloc`; a failed pool slot stays unready, so a
+later acquire retries.
+
+`row_batch` also keeps its own capacity. `llama_batch` does not store the
+extent it was initialised with, so `row_batch::push` rejects a row that would
+write past `token[]`, `pos[]`, `n_seq_id[]`, `seq_id[]` or `logits[]` with
+`std::logic_error`. Every current caller stays within its allocation; the
+guard exists so a later miscounted row cannot become a silent heap overwrite.
+
+The pool is not thread safe: exactly one worker owns it, and the pool outlives
+every lease. `lease::set` requires a non-null embedding row whose width equals
+the pool width. An MTP decode reads the NextN hidden row, not the token, so a
+missing or narrower row would decode stale bytes, and a wider row would
+overrun the slot. The constructor refuses a non-positive width. The target and
+draft NextN widths are checked once (`10240`) before the worker pool exists.
+
+`TP5_ALLOC_PROBE=1` records lease and release values up to 4096 events per
+pool; the log stops at the cap. With the pool enabled, 10k sequential leases
+perform no heap allocation after the first slot is warm. The CPU test
+`tq-tp5-host-pool` covers reuse, fallback, exhaustion, exception release, the
+probe cap, pool destruction, the `set` contract, and a failure injected at
+each of the six real `llama_batch_init` allocation points (direct, pooled, and
+fallback), plus the fallback token. Injection uses the test-only `LD_PRELOAD`
+interposer in `tests/fail-malloc.c`, which arms a countdown immediately before
+the real call and adds no production hook or ABI. Every failure must report
+`std::bad_alloc` and the next acquire must succeed; without the preload the
+normal path skips injection and still passes. The contract is documented in
+`include/llama.h`.
+
+`mtp_batch_pool::stats()` reports the same reuse without the probe log:
+`pooled_leases`, `fallback_leases`, `slot_inits` and `exhausted`. A run that
+keeps the pool enabled must show `fallback_leases == 0` and
+`slot_inits <= slots`; a nonzero `exhausted` means the slot count is below the
+worker's concurrent lease depth. The destructor asserts that no lease is live,
+because a lease that outlives the pool would write into freed batch storage.
+
+## MTP target state checkpoint (2026-11-09)
+
+The non-native-trim MTP verify path (`GGML_TP5_MTP_RS_RING=0`,
+`GGML_TP5_MTP_ON_DEVICE_CHECKPOINT=0`) keeps one host checkpoint per worker
+across verify epochs. The checkpoint is an `mtp_state_checkpoint`
+(`src/mtp_state_checkpoint.h`): it owns the storage, the current snapshot size,
+and an explicit valid flag. A capture grows the storage only when the new
+snapshot is larger; a same-size or smaller capture reuses the existing bytes
+without zero-filling them. `llama_state_seq_get_data_ext` must write exactly
+the requested size, otherwise the checkpoint stays invalid even though older
+bytes remain in the storage. A restore passes the captured size, not the
+storage size, and consumes the checkpoint; full acceptance invalidates it. A
+failed, short or throwing restore also leaves it invalid, so an older snapshot
+is never restored as the new one. The native-trim path
+(`GGML_TP5_MTP_RS_RING=1`) does not create a host checkpoint. The CPU test
+`tq-tp5-mtp-state-checkpoint` covers same-size retention, growth, shrink,
+short capture, short restore, full acceptance, exception unwinding, zero size,
+and the shrink-after-invalidate and shrink-after-exception epoch sequences.
+
+## MTP target greedy cache (2026-11-09)
+
+The MTP verify epoch caches each target logits row's
+`tq::sampling::select_finite_greedy` result for the duration of that epoch
+(`src/mtp_greedy_cache.h`). The cache is local: a later target decode can
+overwrite the logits buffer, so it is never reused across epochs.
+
+- Rows below the accepted prefix use the verify id. The replay branch refreshes
+  the cached entry with the replay result; the id is required to equal the
+  verify id, and the stored logit bits become the replay bits. The commit uses
+  only the id.
+- The replay mismatch row (row `accepted`) is refreshed with the replay scan.
+  Its argmax may change: the replay gate only requires the replay and original
+  distributions to be close, not the top-1, so the commit must use the replay
+  result, not the verify id.
+- The native-trim mismatch row has no replay and uses the verify result.
+- The full-accept new row `n` is never verified and is always scanned.
+- The LateBind prefetch `g0` seeds row 0. It is usable for an accepted row or
+  the native-trim mismatch; an `accepted == 0` replay refreshes row 0 before
+  the commit.
+- The cache stores the exact `greedy_result` (usable, id, logit bits). The
+  finite/unique-maximum/signed-zero tie rules of `select_finite_greedy` and
+  every `require(usable)` check are unchanged. Cached rows do not perform the
+  greedy scan and do not read the logits buffer unless `capture_logits` is
+  enabled; the capture path still reads the row through the same getter and
+  output-borrow proof. `no_sync_logits_calls` counts rows resolved through the
+  no-sync path under the output barrier; a cached greedy commit row without
+  `capture_logits` does not read the logits and is not counted, while a cached
+  row with `capture_logits` on still reads through the capture path and counts.
+  The field can be 0 when all commit rows are cached and `capture_logits` is
+  off. It is not a barrier proof. The `real_h` NextN read, the `verifier_rows`
+  copy and the replay distribution gate are unchanged.
+
+The CPU unit test `tq-tp5-mtp-greedy-cache` (`tests/test-mtp-greedy-cache.cpp`)
+covers the deterministic cache boundary/semantics: partial mismatch with a
+changed replay argmax and refreshed bits, the verifier copy not aliasing the
+refreshed entry, the accepted-prefix id staying the verify id while the bits
+become the replay result, the full-accept new-row guard (including a direct
+cache of row n), the LateBind g0 rules, signed-zero/tie and NaN results, and
+row bounds. It does not compile or execute runtime.cpp and does not prove the
+runtime wiring, the runtime cancellation/exception path,
+`no_sync_logits_calls`, `capture_logits`, or the real end-to-end. Those remain
+unverified here (no GPU/full).
+
+The unit target has 32 checks; the reviewed unit run is 32 PASS / 0 FAIL. The
+real MTP runtime and GPU path were not run.
+
+## LateBind verdict reuse and full acceptance (2026-11-09)
+
+The LateBind prefetch (`TP5_MTP_LATEBIND_DRAFT1=1`) assumes verdict `a=0`.
+Verdict reuse is on by default. `GGML_TP5_LATEBIND` unset and
+`TP5_MTP_LATEBIND_REUSE_ACCEPT` unset means reuse on. `GGML_TP5_LATEBIND=0`
+turns reuse off and `GGML_TP5_LATEBIND=1` turns it on. The legacy
+`TP5_MTP_LATEBIND_REUSE_ACCEPT` is an override only while
+`GGML_TP5_LATEBIND` is unset: `1` is on and `0` is off. A legacy value other
+than `1` under a set master gate fails loudly. `GGML_TP5_LATEBIND=0` does not
+disable the prefetch; `TP5_MTP_LATEBIND_DRAFT1` does. The `a>0` bind requires
+the native-trim path (`GGML_TP5_MTP_RS_RING=1`). The `accepted==0` base bind
+does not require native trim.
+
+An `a>0` epoch binds the prefetched draft step 1 only when the commit token
+equals the prefetched draft token and the exact-input guard proves that the
+serial row-0 decode would consume bitwise-identical inputs: the same
+position, local row, a prefetch that exported outputs, and a bitwise-equal
+`real_h` NextN residual. The prefetch state is per epoch, so the guard cannot
+cross an epoch. The guard is the only additional authority for reuse; the
+accepted count is not a second gate. The full-checkpoint path
+(`GGML_TP5_MTP_RS_RING=0`) keeps the serial decode: the guard refuses reuse,
+the replay path discards the prefetch, and row 0 decodes serially. This
+section is therefore about native-trim reuse, not every LateBind path.
+
+Full acceptance (`accepted == n`) is a legal bind on that path. It leaves
+row 0's serial inputs unchanged. A stop on the last row `n` is classified in
+the commit loop, after row 0's bind, and keeps the same full-accept verdict.
+The stop cleanup trims the draft attention KV from the stopped request's
+source token, including a stop-row-0 prefetch that the bind site reused.
+Partial acceptance and a stop before the last row latch `full_accept=false`;
+the same guard decides their bind.
+
+The earlier code aborted when the guard passed on a full-accept native-ring
+epoch (`require(!lb_reuse_full_accept)`) unless the opt-in
+`GGML_TP5_LB_SELFCHECK_REUSE` was set. That was a false invariant: full
+acceptance is the normal case when the drafts are right, and the abort fired
+before the row-n stop was classified. The opt-in branch also checked
+`lb_reuse_verdict_n`, `actual_accepted` and `lb_reuse_full_accept` in one
+three-term `require`. Those terms come from the same verify epoch
+(`verdict_n == n`, `full_accept == (accepted == n)`), so the check is a
+same-epoch consistency echo, not an independent safety gate. The guard is the
+authority. The old selfcheck env var is no longer read.
+
+The bind carries an explicit completion proof before the next row can reuse
+the draft context. When row 0 exports outputs (`draft_output=true`), the
+synchronizing `llama_get_logits_ith` / `llama_get_embeddings_nextn_ith`
+getters prove completion on that row. When `TP5_MTP_LAST_DRAFT_LOGITS=1` and
+row 0 is not the last row (`draft_output=false`), the getter does not run; the
+bind calls `llama_synchronize(dctx)` and clears `draft_pending` before the
+next decode. The draft context is single-device with no relay, so this host
+synchronize is the completion proof. This removes the earlier "next decode
+submitted with no explicit synchronize" window.
+
+Do not read the `draft_output` flag as "row 0's outputs are never read":
+`draft_output = !last_draft_logits || last_target_row`. With
+`TP5_MTP_LAST_DRAFT_LOGITS` unset (default false), row 0 has
+`draft_output=true`, so its prefetched outputs are read by the next getter.
+Only with `TP5_MTP_LAST_DRAFT_LOGITS=1` and `accepted>=1` does row 0 have
+`draft_output=false`.
+
+No runtime/GPU run was performed for this tree. The full-accept bind, the
+exact-input guard, the completion proof, and the row-n stop cleanup are
+supported by code review only. `llama_synchronize` is a host synchronization
+of the single-device draft context; it is not a native relay receipt. The
+physical KV deletion after the stop trim and the GPU path remain unproven. No
+new CPU test was added; this tree has no CPU runtime path that reaches the
+LateBind bind.
+
+## Legacy relay channel map reclamation (2026-11-09)
+
+When neither `GGML_TP5_PLAN_UNION=1` nor
+`GGML_TP5_RELAY_SLOT_CHANNELS=1` selects the slotized lane, a window owns one
+`channel_state` per `(plan generation, channel)` in `src/relay_channel_map.h`.
+A provider plan generation can advance when a graph is rebuilt and its terminal
+binding changes (the MTP 1-token / n+1-token alternation is one trigger). The
+map previously never erased an entry, so every generation added its channels
+for the provider lifetime.
+
+Reclamation runs only in the legacy map branch, before the next generation's
+first `INPUT_READY` is inserted. `prepare()` already required the provider to
+be idle (finished, no borrow, every channel released). The same courier
+services older `OUTPUT_RELEASED` events before the next `INPUT_READY`, and a
+deferred `delayed_event` is handled before the next poll. `OUTPUT_RELEASED`
+still finds its entry and never triggers reclamation; failure or abort leaves
+the map to `finish_ledgers()`.
+
+Reclamation is state-driven and preserves availability. When a newer
+`INPUT_READY` arrives, `legacy_channel_map` advances its admitted generation;
+an older entry is retired only on a ledger receipt: `channel_ledger::retirement()`
+returns `bank_released` when every occupied bank recorded input release, output
+publication and every consumer completion, or `no_reservations` when no bank was
+ever reserved. `not_ready` is retained, as is any entry with a held lease. The
+reclaim callback does not call `mark_drained` and does not turn a bool or
+`held == false` into a native-drain proof; the callback only records the
+receipt (`map_retired_bank` or `map_retired_no_reservations`). A held or not-ready old
+entry stays for its later `OUTPUT_RELEASED`, and a later generation retries.
+The provider idle requirement at prepare remains the ordering proof; the
+native-drain proof for entries that remain at close is still `finish_ledgers`.
+A stale `INPUT_READY` older than the admitted generation is rejected
+explicitly and creates no old ledger.
+
+The existing `TP5_DW_COURIER_HIT` line prints `map_retired_bank` and
+`map_retired_no_reservations`, the two receipt classes retired through this path.
+
+The CPU-only `tq-tp5-relay-channel-map` test drives the same
+`INPUT_READY -> held lease -> OUTPUT_RELEASED -> newer INPUT_READY` chain
+through `legacy_channel_map`, with real `channel_ledger` leases (reserve, five
+producer-ready records, reduce done, output published, five consumer-done
+records). It observes map size/generation, held retention, the retired
+`bank_state` drain facts (`input_released`, `output_published`,
+`consumed_ranks`), the `bank_released` / `no_reservations` proofs, an
+incomplete bank that is retained as `not_ready`, the explicit stale refusal,
+and that `OUTPUT_RELEASED` never reclaims. It is not a pure helper-counter
+test, but it is still a narrow host test: no GPU, full-model, or MTP runtime
+evidence is claimed.
+
+## MTP multi-row stop contract (2026-11-09)
+
+One MTP verification batch commits `1 + N` rows (`N` in 1..3): the source
+token plus the accepted draft prefix and its correction row. A stop can occur
+before the last row: an EOG token, the request's cancel threshold, or the
+`predict` budget. The committed prefix is then shorter than the speculative
+batch.
+
+The runtime does not merely suppress the later text pushes. During
+verification it classifies the emitted token of every row that could be
+committed and records the first stop row. The target rollback path then keeps
+only the committed prefix:
+
+- `mtp_native_trim` (the bounded GDN ring) rewinds the target
+  attention/PLE/indexer/recurrent suffix from `source_position + valid_rows`.
+- The full checkpoint path restores the pre-batch target state and replays only
+  the `valid_rows` committed inputs, so the target state never retains the
+  speculative suffix. The replay preserves the original numerical contract:
+  accepted draft rows must match exactly; the correction row may differ only
+  inside the KL/rel/overlap gate; a stop row must match because its token
+  decides the stop. A full accept does not replay the extra row.
+- The commit loop advances `consumed` by the committed rows only, emits only
+  those tokens, and finishes the UTF-8 stream exactly once. The post-loop
+  `apply_commit_trims` remains a safety net for a commit-time stop that the
+  verification row classification did not predict.
+
+The draft context is speculative. The MTP draft context is single-sequence:
+`mtp_batch_pool::lease::set` always writes `seq_id` 0, and the option
+validation requires two windows with one prompt per window. The stop cleanup
+therefore enforces `ids.size() == 1 && local == 0`; this restates the existing
+T4 smoke contract and adds no new restriction on legal inputs. A future
+multi-request MTP path must add per-request draft sequences before removing
+that guard. The trim start is the stopped request's first row position
+(`stopped_source_position`), not necessarily `batch.pos[0]`. On any MTP stop
+the runtime synchronizes a pending draft decode and trims the predicted
+attention KV from that source token, including a stop-row-0 prefetch that the
+bind site reused. The service-round boundary remains the final clear. It is
+not part of the request's committed target state.
+
+The CPU-only `tq-tp5-commit-stop` test exercises the production-used
+`classify_commit_stop`, `commit_stop_state`, `has_later_row`,
+`stopped_source_position`, `replay_token_must_match`, and
+`apply_commit_trims` helpers, plus the real `generation_stream`. It covers
+cancel/EOG/budget precedence, `ignore_eos`, the target trim position with and
+without a later row, state reset, the replay contract, trim application, the
+stopped-request source position on a multi-request row map, and the
+finished-stream push rejection. It does not execute `run()`, a model,
+checkpoint restore/replay, `llama_memory_seq_rm`, teacher forcing, or a draft
+context; those remain covered only by the real-model acceptance suite when it
+is run. The stop-row-0 draft KV cleanup is code-inspected here; this CPU test
+cannot create a draft context.
