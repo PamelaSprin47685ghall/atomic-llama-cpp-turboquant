@@ -113,6 +113,30 @@ int main() {
     ggml_backend_sched_receipt_release(fail_sched, &rf);
     ggml_backend_sched_free(fail_sched);
 
+    // A marked-unproven scheduler is retained by sched_free; the owner drain
+    // proves quiescence through the CPU completion API and frees it.
+    {
+        ggml_backend_sched_t owner_sched =
+            ggml_backend_sched_new(backends, nullptr, 1, 2048, false, false);
+        if (owner_sched == nullptr) {
+            std::fprintf(stderr, "owner scheduler init failed\n");
+            return 1;
+        }
+        int owner_token = 0;
+        ggml_backend_sched_set_owner(owner_sched, &owner_token);
+        ggml_backend_sched_mark_unproven(owner_sched);
+        ggml_backend_sched_free(owner_sched);
+        if (ggml_backend_sched_retained_count(&owner_token) != 1) {
+            std::fprintf(stderr, "unproven scheduler was not retained\n");
+            return 1;
+        }
+        if (ggml_backend_sched_drain_retained(&owner_token) != 1 ||
+                ggml_backend_sched_retained_count(&owner_token) != 0) {
+            std::fprintf(stderr, "owner drain did not release the retained scheduler\n");
+            return 1;
+        }
+    }
+
     ggml_free(ctx);
     ggml_backend_sched_free(sched);
     ggml_backend_free(backend);
