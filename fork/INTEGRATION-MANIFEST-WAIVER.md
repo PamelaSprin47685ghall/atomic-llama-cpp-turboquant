@@ -1,19 +1,60 @@
 # Integration Manifest Waiver — `integ/tp5-mtp-r28b`
 
-Status: the upstream guard still fails on pre-existing drift. This waiver records every
-pre-existing mismatch and undeclared A path, the WS-owned registrations, and why the
-guard failure does not block this integration's build or CPU tests.
+Status 2026-11-10: the full registration resolves the guard;
+`python3 fork/check-upstream.py` now exits 0. Sections A-F retain the historical
+record of the pre-registration drift and the WS-owned registrations.
 
 - Base: `71544695b`
 - Merged: WS2 `ae9c13065`, WS3 `6d0614915`, WS4 `15fd113e2`, WS5 `9cd97421e` (parent `4648777f7`)
 - Applied: `patches/ws5/{ggml-backend-meta.cpp,runtime.cpp,ggml-backend.cpp}.patch`
-- Guard: `python3 fork/check-upstream.py` rc=1
-- Guard stderr: `boundary check failed: reviewed content or mode differs: ggml/src/ggml-cuda/mmvf.cu`
+- Guard (2026-11-10): `python3 fork/check-upstream.py` rc=0
+- Historical pre-registration failure: `boundary check failed: reviewed content or mode differs: ggml/src/ggml-cuda/mmvf.cu`
 
-## A. Pre-existing mismatches not re-signed
+## B8. Full manifest registration on p5unified 2026-11-10
 
-These files were already stale at the integration base and are not touched by WS2/WS3/WS4/WS5.
-Their digests are left exactly as recorded; this integration does not bless them.
+The real upstream pin remains `cda0f9256665845cd9d6f3a0176880883f653a3d` in
+`fork/upstream.json` and `fork/upstream-exceptions.json`. No synthetic baseline
+is introduced and no undeclared path remains.
+
+The earlier c9715b052 registration (314 entries) is the base. This round
+re-signs every entry whose bytes changed in the unified p5unified tree and adds
+the 25 non-`fork/` paths that became changed after that registration. Every
+entry carries the real SHA-256 and mode read from the current worktree, plus
+named consumers, reason, and removal condition. The manifest now has 339
+entries.
+
+Newly registered paths in this round:
+
+- build: `CMakeLists.txt`, `ggml/src/CMakeLists.txt`
+- docs: `docs/meta-host-view-copy.md`
+- examples/tools: `examples/idle/idle.cpp`, `tools/completion/completion.cpp`,
+  `tools/cvector-generator/cvector-generator.cpp`, `tools/llama-bench/llama-bench.cpp`
+- provider/DSO lifecycle: `ggml/src/ggml-backend-dl.cpp`,
+  `ggml/src/ggml-backend-dl.h`, `ggml/src/ggml-backend-module.cpp`,
+  `ggml/src/ggml-backend-module.h`, `ggml/src/ggml-backend-reg.cpp`,
+  `ggml/src/ggml-metal/ggml-metal.cpp`, `ggml/src/ggml-opencl/ggml-opencl.cpp`,
+  `ggml/src/ggml-zdnn/ggml-zdnn.cpp`
+- relay/cleanup/state: `ggml/src/ggml-relay-token-guard.h`,
+  `src/llama-impl.h`, `src/llama-io.h`, `src/llama-relay-free.h`,
+  `src/tp5-cleanup-owner.h`
+- CPU tests: `tests/test-meta-host-view-copy.cpp`,
+  `tests/test-sched-receipt.cpp`, `tests/test-tp5-context-cleanup-concurrent.cpp`,
+  `tests/test-tp5-hc-replicated-compute.cpp`, `tests/test-tp5-relay-free-decision.cpp`
+
+`.gitattributes` marks the retained patch/text artifacts as whitespace-exempt:
+`audit/m3-tail-storage.patch.txt`, the WS0 overlay patches,
+`patches/ws5/*.patch`, `fork/logits-compose/README.md`, and the
+`fork/mtp-progress-20261031` archive. Source and test files are not exempted.
+
+Guard result: `changed_upstream_paths=339`, `extension_paths=365`,
+`exception_manifest_sha256=f2eb637f4c65063700cc8a05c17a25270fb7a2ae810e35288e41dbb5fc00de85`.
+No source or test file was modified, added, or removed by the manifest round.
+
+## A. Pre-existing mismatches (historical)
+
+These files were already stale at the integration base and were not touched by
+WS2/WS3/WS4/WS5. The table below preserves the pre-registration state; B8
+re-signed these entries to the current worktree bytes.
 
 | path | recorded | actual | category |
 |---|---|---|---|
