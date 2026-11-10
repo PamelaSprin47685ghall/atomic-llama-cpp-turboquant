@@ -3305,24 +3305,6 @@ run_result run(const options & requested) {
                                         // or bind cannot double-use it.
                                         lb_draft1_prefetched = false;
                                         lb_reuse_h0_valid = false;
-                                        // Explicit completion proof for the
-                                        // reused prefetch. If this row does
-                                        // not export outputs, the getter
-                                        // below does not run, and the next
-                                        // row would submit a decode on dctx
-                                        // while the prefetch is still
-                                        // pending. Synchronize here so no
-                                        // row reuses dctx before the
-                                        // prefetch completes. The draft
-                                        // context is single-device with no
-                                        // relay, so this host synchronize is
-                                        // the completion proof.
-                                        const bool bind_draft_output =
-                                            !last_draft_logits || row + 1 == local_rows.size();
-                                        if (draft_pending && !bind_draft_output) {
-                                            llama_synchronize(dctx);
-                                            draft_pending = false;
-                                        }
                                         if (lb_counters_enabled) {
                                             ++lb_ctr_bind;
                                             ++lb_ctr_bind_accept;
@@ -3368,6 +3350,20 @@ run_result run(const options & requested) {
                                 }
                                 const bool last_target_row=row+1==local_rows.size();
                                 const bool draft_output = !last_draft_logits || last_target_row;
+                                // Explicit completion proof for a reused
+                                // prefetch. When this row does not export
+                                // outputs, the getter below does not run, and
+                                // the next row would submit a decode on dctx
+                                // while the prefetch is still pending.
+                                // Synchronize at this common exit so both
+                                // positive bind branches are covered. The
+                                // draft context is single-device with no
+                                // relay, so this host synchronize is the
+                                // completion proof.
+                                if (reused_lb_draft && draft_pending && !draft_output) {
+                                    llama_synchronize(dctx);
+                                    draft_pending = false;
+                                }
                                 const auto first_start=now_ns();
                                 if (!reused_lb_draft) {
                                     {
