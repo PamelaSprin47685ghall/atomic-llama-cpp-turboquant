@@ -109,10 +109,33 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 
 // Host-only KV journal/prepare accounting (C++ extension). This is not part
 // of the buffer-type map above and does not change llama_get_memory_breakdown's
-// device-buffer meaning. Call it only while no decode/update is running; like
-// the existing memory query it reads live host containers without locks.
-// Values are payload capacities, excluding allocator overhead and resident
-// KV cell metadata.
+// device-buffer meaning.
+//
+// The values are capacity accounts of the cache's host containers, not a
+// resident-memory total. The query is not a thread-safe snapshot and takes no
+// locks. The caller must serialize it with every memory mutation: decode and
+// encode, set_input, llama_memory_clear, the seq_* family,
+// state_read/state_write, update/shift, prepare/replay, and pool
+// acquire/release. A const context pointer is not a read-only guarantee: the
+// reported containers are mutated in place, and a concurrent mutation can
+// reallocate them while the query walks them. llama_synchronize() alone does
+// not make the query safe.
+//
+// A batch context returned by init_batch owns the split ubatches and slot
+// infos. On the pooled decode-scratch path they are moved out of the cache
+// scratch; on the non-pooled or pool-exhausted path they are local
+// allocations. In both cases the cache account cannot see them while the
+// context is alive, so scratch is a lower bound. An init_update or init_full
+// context does not take the decode scratch payload. Do not query while any
+// memory context is in use, and serialize the query with the context's
+// creation and destruction.
+//
+// The scope is the journal/prepare high-water payload capacity. It excludes
+// allocator overhead, resident live v_cells/v_heads, recurrent state,
+// compressor state, PLE history, rotation matrices, and every host container
+// that no journal/prepare owner reports. A memory implementation without this
+// account (for example recurrent) contributes zero. Capacities can stay high
+// after clear or replay.
 LLAMA_API llama_host_memory_breakdown_data llama_get_host_memory_breakdown(const struct llama_context * ctx);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past

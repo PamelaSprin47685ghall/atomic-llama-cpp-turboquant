@@ -1278,15 +1278,34 @@ only. The host struct reports `journal`, `trial_index`, `snapshots` and
 `scratch` payload capacity: `cell_journal::bytes()` is now called, the
 snapshot pools/fallback slots and shift backup are counted once, the flat
 trial index is counted from the scratch blocks, and scratch control vectors
-are separate. Main resident `v_cells` metadata is not included in this
+are separate. `slot_info` now reports its nested stream and per-stream index
+heap, so snapshot slots and decode scratches no longer lose those payloads.
+`cell_journal::bytes()` also counts the set/map nodes the journal extracted
+from live cells, matching the payload that `llama_kv_cells::host_bytes()`
+stops counting after the extract. `heads_before` belongs to the prepare
+snapshot and is counted in `snapshots`, next to the per-slot `v_heads_old`
+arrays. Main resident `v_cells` metadata is not included in this
 journal/prepare account. These are payload capacities, not allocator
 bookkeeping. hybrid/hybrid-iswa/hybrid-idx aggregate their KV sub-caches;
 dsa/msa/dsv4 aggregate their KV members; recurrent contributes zero.
 
 This is a C++ extension, not a new field in the device-buffer map. Call it
-only while no decode/update is running: it reads the live host containers
-without locks, matching the existing context memory-query contract. It is not
-a concurrent snapshot and does not imply thread safety.
+only while the memory is quiescent, and serialize it with every memory
+mutation: decode/encode, set_input, `llama_memory_clear`, the `seq_*` family,
+state_read/state_write, update/shift, prepare/replay, and pool
+acquire/release. It reads the live host containers without locks.
+`llama_synchronize()` alone does not make the query safe. A const context
+pointer is not a read-only guarantee: a concurrent mutation can reallocate
+the containers while the query walks them. A batch context from init_batch
+owns the split ubatches and slot infos: the pooled path moves them out of the
+cache scratch, while the non-pooled or pool-exhausted path allocates them
+locally. While any such context is alive, the cache account cannot see that
+payload and `scratch` is a lower bound. An init_update or init_full context
+does not take the decode scratch payload. Do not query while any memory
+context is in use, and serialize the query with its creation and destruction.
+The account also excludes resident live `v_cells`/`v_heads`, recurrent
+state, compressor state, PLE history, rotation matrices, and every host
+container that no journal/prepare owner reports.
 
 `shift_backup_restore()` now swaps cell payloads in place instead of swapping
 the `v_cells` vector, so `get_cells()` references and the cell objects keep
@@ -1300,6 +1319,14 @@ exercises `llama_get_host_memory_breakdown()` and the hybrid aggregation. The
 test still exits 77/SKIP because that cache cannot shift, so it does not print
 the core K-shift PASS. The dense host field check is in the same test but was
 not rerun after this public-check addition.
+
+The host-account regression lives in `tests/test-tp5-ubatch-pool.cpp` and
+runs without a model file: it checks reserved-capacity slot-info payload,
+non-empty snapshot and fallback slots, the journal node payload for entries,
+trials and discards, a real prepare, and the `heads_before` classification.
+The model-backed public-API state check is in `tests/test-kv-update-status.cpp`:
+an empty journal at construction and a nonzero journal after one decode, when
+`LLAMA_NTOK_TEST_MODEL` is set.
 
 CPU microbenchmark (agent://safe-devops t8; raw values in
 `/tmp/tmp.7Kd6QbMNvC/results.csv`): it compares the 18-bit index direct

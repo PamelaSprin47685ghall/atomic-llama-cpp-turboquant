@@ -1258,7 +1258,9 @@ llama_host_memory_breakdown_data llama_kv_cache::host_memory_breakdown() const {
         res.snapshots += c.host_bytes();
     }
 
-    res.scratch += heads_before.capacity()*sizeof(uint32_t);
+    // heads_before is the prepare snapshot of v_heads, next to the per-slot
+    // v_heads_old arrays. It is not decode scratch.
+    res.snapshots += heads_before.capacity()*sizeof(uint32_t);
 
     return res;
 }

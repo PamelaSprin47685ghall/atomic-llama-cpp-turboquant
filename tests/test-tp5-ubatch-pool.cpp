@@ -735,6 +735,31 @@ struct llama_kv_cache_prepare_test_access {
         return kv.v_heads;
     }
 
+    static bool journal_begin(llama_kv_cache & kv) {
+        return kv.prepare_journal_begin();
+    }
+
+    static void journal_end(llama_kv_cache & kv) {
+        kv.prepare_journal_end(true);
+    }
+
+    static std::vector<uint32_t> & heads_before(llama_kv_cache & kv) {
+        return kv.heads_before;
+    }
+
+    static llama_kv_cache::decode_scratch * scratch_acquire(llama_kv_cache & kv) {
+        return kv.scratch_acquire();
+    }
+
+    static void scratch_return(llama_kv_cache & kv, llama_kv_cache::decode_scratch * scratch) {
+        kv.scratch_return(scratch->sinfos, scratch->ubatches, scratch);
+    }
+
+    static bool prepare_into_scratch(
+            llama_kv_cache & kv, const std::vector<llama_ubatch> & ubatches,
+            llama_kv_cache::decode_scratch * scratch) {
+        return kv.prepare_into(ubatches, scratch->sinfos, scratch);
+    }
 
 };
 
@@ -1800,6 +1825,281 @@ static void test_persistent_oom() {
     }
 }
 
+// The host account counts payload capacity, not the number of live elements.
+// Every container below reserves more than its current size, so a size() vs
+// capacity() mistake is visible.
+static void test_host_breakdown_scratch_payload() {
+    llama_kv_cache::decode_scratch scratch;
+
+    scratch.sinfos.reserve(4);
+    scratch.sinfos.resize(2);
+    for (auto & slot : scratch.sinfos) {
+        slot.strm.reserve(4);
+        slot.strm.resize(2);
+        slot.idxs.reserve(3);
+        slot.idxs.resize(2);
+        slot.idxs[0].reserve(16);
+        slot.idxs[0].assign(8, 0);
+        slot.idxs[1].reserve(8);
+        slot.idxs[1].assign(4, 0);
+    }
+
+    scratch.ubatches.reserve(3);
+    scratch.trial_idx.reserve(5);
+    scratch.states.reserve(3);
+    scratch.pooled.reserve(2);
+
+    auto fallback = std::make_unique<llama_kv_cache::snapshot_slot>();
+    fallback->sinfo.resize(1);
+    fallback->sinfo.strm.reserve(2);
+    fallback->sinfo.idxs.reserve(2);
+    fallback->sinfo.idxs[0].reserve(12);
+    fallback->sinfo.idxs[0].assign(6, 0);
+    fallback->v_heads_old.reserve(3);
+    fallback->v_cells.reserve(2);
+    fallback->v_cells.resize(1);
+    fallback->v_cells[0].resize(2);
+    scratch.fallback.push_back(std::move(fallback));
+
+    const auto b = scratch.host_memory_breakdown();
+
+    check(b.trial_index == scratch.trial_idx.capacity()*sizeof(size_t),
+          "host account: trial index uses the reserved capacity");
+
+    size_t sinfo_payload = scratch.sinfos.capacity()*sizeof(llama_kv_cache::slot_info);
+    for (const auto & slot : scratch.sinfos) {
+        sinfo_payload += slot.strm.capacity()*sizeof(llama_seq_id) +
+                         slot.idxs.capacity()*sizeof(llama_kv_cache::slot_info::idx_vec_t);
+        for (const auto & idx : slot.idxs) {
+            sinfo_payload += idx.capacity()*sizeof(uint32_t);
+        }
+    }
+    check(b.scratch >= sinfo_payload + scratch.ubatches.capacity()*sizeof(llama_ubatch),
+          "host account: scratch counts reserved slot-info capacity");
+
+    const auto & slot = *scratch.fallback[0];
+    const size_t snapshot_payload =
+        slot.sinfo.strm.capacity()*sizeof(llama_seq_id) +
+        slot.sinfo.idxs.capacity()*sizeof(llama_kv_cache::slot_info::idx_vec_t) +
+        slot.sinfo.idxs[0].capacity()*sizeof(uint32_t) +
+        slot.v_heads_old.capacity()*sizeof(uint32_t) +
+        slot.v_cells.capacity()*sizeof(llama_kv_cells) +
+        slot.v_cells[0].host_bytes();
+    check(b.snapshots >= snapshot_payload,
+          "host account: non-empty fallback slot is counted");
+}
+
+// A journal entry owns the set/map nodes it extracted from a live cell. Each
+// case isolates one node kind or one owner, so a wrong kind or a wrong owner
+// cannot hide behind the same total.
+static void test_host_breakdown_journal_nodes() {
+    // Used-node only.
+    {
+        llama_kv_cells cells;
+        cells.resize(4);
+        cells.pos_set(0, 7);
+
+        cell_journal j;
+        j.begin(4);
+        cells.set_journal(&j);
+
+        const size_t live0 = cells.host_bytes();
+        cells.rm(0);
+        const size_t live1 = cells.host_bytes();
+        check(live0 - live1 == sizeof(uint32_t),
+              "host account: live used-node payload");
+
+        cells.set_journal(nullptr);
+        const size_t owned = j.bytes();
+        j.clear();
+        check(owned - j.bytes() == live0 - live1,
+              "host account: journal owns the used node");
+    }
+
+    // Seq-node only: a non-last seq_rm extracts one map node and keeps the
+    // used node.
+    {
+        llama_kv_cells cells;
+        cells.resize(4);
+        cells.pos_set(0, 7);
+        cells.seq_add(0, 1);
+        cells.seq_add(0, 2);
+
+        cell_journal j;
+        j.begin(4);
+        cells.set_journal(&j);
+
+        const size_t live0 = cells.host_bytes();
+        cells.seq_rm(0, 1);
+        const size_t live1 = cells.host_bytes();
+        check(live0 - live1 == sizeof(llama_pos) + sizeof(int),
+              "host account: live seq-node payload");
+
+        cells.set_journal(nullptr);
+        const size_t owned = j.bytes();
+        j.clear();
+        check(owned - j.bytes() == live0 - live1,
+              "host account: journal owns the seq node");
+    }
+
+    // Trial entry: the first mutation of a recorded cell owns both nodes; a
+    // replay moves them back into the live cell.
+    {
+        llama_kv_cells cells;
+        cells.resize(4);
+        cells.pos_set(0, 7);
+        cells.seq_add(0, 2);
+
+        cell_journal j;
+        j.begin(4);
+        cells.set_journal(&j);
+        cells.ext_set(0, llama_kv_cell_ext{});
+
+        j.begin_trial();
+        const size_t live0 = cells.host_bytes();
+        cells.rm(0);
+        const size_t live1 = cells.host_bytes();
+        check(live0 - live1 == sizeof(uint32_t) + sizeof(llama_pos) + sizeof(int),
+              "host account: live trial node payload");
+
+        cells.set_journal(nullptr);
+        const size_t owned = j.bytes();
+        j.replay([&](cell_journal::entry & e) {
+            check(cells.restore_from_journal(j, e),
+                  "host account: journal node replay");
+        });
+        check(cells.host_bytes() == live0,
+              "host account: replay restores the live node payload");
+        check(owned - j.bytes() == live0 - live1,
+              "host account: replay releases the trial node payload");
+    }
+
+    // Discard seq node: a seq added after the trial snapshot is not in the
+    // trial entry, so its removal goes to discard_seq_.
+    {
+        llama_kv_cells cells;
+        cells.resize(4);
+        cells.pos_set(0, 7);
+        cells.seq_add(0, 1);
+
+        cell_journal j;
+        j.begin(4);
+        cells.set_journal(&j);
+        cells.ext_set(0, llama_kv_cell_ext{});
+        j.begin_trial();
+        cells.seq_add(0, 2);
+
+        const size_t live0 = cells.host_bytes();
+        cells.seq_rm(0, 2);
+        const size_t live1 = cells.host_bytes();
+        check(live0 - live1 == sizeof(llama_pos) + sizeof(int),
+              "host account: live discard-seq payload");
+
+        cells.set_journal(nullptr);
+        const size_t owned = j.bytes();
+        j.clear();
+        check(owned - j.bytes() == live0 - live1,
+              "host account: discard owns the seq node");
+    }
+
+    // Discard used node: pos_set records the empty pre-state, so the trial
+    // entry has pos == -1 and cannot own the used node extracted by rm.
+    {
+        llama_kv_cells cells;
+        cells.resize(4);
+
+        cell_journal j;
+        j.begin(4);
+        cells.set_journal(&j);
+        cells.pos_set(0, 7);
+
+        const size_t live0 = cells.host_bytes();
+        cells.rm(0);
+        const size_t live1 = cells.host_bytes();
+        check(live0 - live1 == sizeof(uint32_t),
+              "host account: live discard-used payload");
+
+        cells.set_journal(nullptr);
+        const size_t owned = j.bytes();
+        j.clear();
+        check(owned - j.bytes() == live0 - live1,
+              "host account: discard owns the used node");
+    }
+}
+
+// A real prepare fills a snapshot slot and a cache-owned scratch. This is the
+// only test that runs the journal, snapshot and scratch owners together.
+static void test_host_breakdown_real_prepare() {
+    test_kv_fixture f(4, LLAMA_SWA_TYPE_STANDARD);
+    llama_kv_cache * kv = make_test_cache(f, 4, LLAMA_SWA_TYPE_STANDARD, 8);
+    seed_test_cache(*kv, 4, ~0u, ~0u, 4);
+
+    test_ubatch a(4);
+    const std::vector<llama_ubatch> ubatches = { a.ub };
+
+    const auto before = kv->host_memory_breakdown();
+
+    llama_kv_cache::decode_scratch * scratch =
+        llama_kv_cache_prepare_test_access::scratch_acquire(*kv);
+    check(scratch != nullptr, "host account: real prepare acquires a scratch");
+    if (scratch == nullptr) {
+        delete kv;
+        return;
+    }
+
+    check(llama_kv_cache_prepare_test_access::prepare_into_scratch(*kv, ubatches, scratch),
+          "host account: real prepare succeeds");
+
+    const auto during = kv->host_memory_breakdown();
+
+    size_t sinfo_payload = scratch->sinfos.capacity()*sizeof(llama_kv_cache::slot_info);
+    for (const auto & slot : scratch->sinfos) {
+        sinfo_payload += slot.strm.capacity()*sizeof(llama_seq_id) +
+                         slot.idxs.capacity()*sizeof(llama_kv_cache::slot_info::idx_vec_t);
+        for (const auto & idx : slot.idxs) {
+            sinfo_payload += idx.capacity()*sizeof(uint32_t);
+        }
+    }
+    check(during.scratch >= sinfo_payload,
+          "host account: real prepare leaves slot-info payload in scratch");
+    check(during.snapshots >= before.snapshots +
+                              sizeof(llama_kv_cells) +
+                              sizeof(llama_seq_id) +
+                              sizeof(uint32_t),
+          "host account: real prepare fills a snapshot slot");
+    check(during.journal > before.journal,
+          "host account: real prepare leaves journal capacity");
+
+    llama_kv_cache_prepare_test_access::scratch_return(*kv, scratch);
+
+    delete kv;
+}
+
+// heads_before is the prepare snapshot of v_heads, not decode scratch.
+static void test_host_breakdown_prepare_heads() {
+    test_kv_fixture f(0, LLAMA_SWA_TYPE_NONE);
+    llama_kv_cache * kv = make_test_cache(f, 0, LLAMA_SWA_TYPE_NONE, 8);
+
+    const auto before = kv->host_memory_breakdown();
+    check(llama_kv_cache_prepare_test_access::journal_begin(*kv),
+          "host account: prepare journal begins");
+    const auto & heads = llama_kv_cache_prepare_test_access::heads_before(*kv);
+    const auto during = kv->host_memory_breakdown();
+    check(during.scratch == before.scratch,
+          "host account: prepare heads are not scratch");
+    check(during.snapshots == before.snapshots + heads.capacity()*sizeof(uint32_t),
+          "host account: prepare heads are snapshot payload");
+    llama_kv_cache_prepare_test_access::journal_end(*kv);
+
+    const auto after = kv->host_memory_breakdown();
+    check(after.scratch == before.scratch,
+          "host account: journal end keeps prepare heads out of scratch");
+    check(after.snapshots == during.snapshots,
+          "host account: journal end keeps the head capacity in snapshots");
+
+    delete kv;
+}
+
 int main() {
     test_reuse_and_lifetime();
     test_pool_outlives_owner();
@@ -1830,6 +2130,10 @@ int main() {
     test_cell_journal_purge_then_reuse();
     test_shift_backup_strong_oom();
     test_clear_with_context();
+    test_host_breakdown_scratch_payload();
+    test_host_breakdown_journal_nodes();
+    test_host_breakdown_real_prepare();
+    test_host_breakdown_prepare_heads();
 
     std::printf("%s failures=%d allocs=%lld frees=%lld\n",
                 g_failures ? "FAILED" : "OK", g_failures,

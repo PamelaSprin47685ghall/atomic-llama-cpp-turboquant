@@ -101,6 +101,24 @@ public:
         size_t size() const { return n_inl + more.size(); }
         size_t heap_capacity() const { return more.capacity(); }
 
+        // Payload bytes of the extracted set/map nodes this object owns. The
+        // inline nodes and the vector handles live inside sizeof(entry); only
+        // the nodes themselves are separate allocations.
+        size_t host_payload_bytes() const {
+            size_t n = 0;
+            for (uint32_t k = 0; k < n_inl; ++k) {
+                if (!inl[k].node.empty()) {
+                    n += sizeof(llama_pos) + sizeof(int);
+                }
+            }
+            for (const auto & e : more) {
+                if (!e.node.empty()) {
+                    n += sizeof(llama_pos) + sizeof(int);
+                }
+            }
+            return n;
+        }
+
         // n is the total node count the caller expects to hold.
         void reserve(size_t n) {
             if (n > 2) {
@@ -550,6 +568,11 @@ public:
     size_t entry_capacity() const { return entries_.capacity(); }
     size_t seen_size()      const { return seen_.size(); }
 
+    // Payload capacity of the journal. The node handles live inside the entry
+    // objects; the set/map nodes they own are separate heap payloads and are
+    // counted here. Extracting a node removes it from the live cell, whose
+    // host_bytes() then drops by the same amount, so the two accounts stay
+    // disjoint.
     size_t bytes() const {
         size_t n = seen_.capacity()*sizeof(uint64_t) + trial_seen_.capacity()*sizeof(uint32_t) +
                    entries_.capacity()*sizeof(entry) +
@@ -558,10 +581,20 @@ public:
                    discard_used_.capacity()*sizeof(used_node_t) +
                    discard_seq_.capacity()*sizeof(seq_pos_node_t);
         for (const auto & e : entries_) {
-            n += e.seq_nodes.heap_capacity()*sizeof(seq_node_t);
+            n += e.seq_nodes.heap_capacity()*sizeof(seq_node_t) +
+                 e.seq_nodes.host_payload_bytes() +
+                 (e.used_node.empty() ? 0 : sizeof(uint32_t));
         }
         for (const auto & e : trial_entries_) {
-            n += e.seq_nodes.heap_capacity()*sizeof(seq_node_t);
+            n += e.seq_nodes.heap_capacity()*sizeof(seq_node_t) +
+                 e.seq_nodes.host_payload_bytes() +
+                 (e.used_node.empty() ? 0 : sizeof(uint32_t));
+        }
+        for (const auto & node : discard_used_) {
+            n += node.empty() ? 0 : sizeof(uint32_t);
+        }
+        for (const auto & node : discard_seq_) {
+            n += node.empty() ? 0 : sizeof(llama_pos) + sizeof(int);
         }
         return n;
     }

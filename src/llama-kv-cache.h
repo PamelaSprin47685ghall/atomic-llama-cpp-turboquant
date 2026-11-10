@@ -103,6 +103,18 @@ public:
             idxs.clear();
         }
 
+        // Heap payload owned by this slot. The surrounding container counts
+        // sizeof(slot_info) itself; this counts only the two vectors and the
+        // per-stream index blocks they allocate.
+        size_t host_bytes() const {
+            size_t n = strm.capacity()*sizeof(llama_seq_id) +
+                       idxs.capacity()*sizeof(idx_vec_t);
+            for (const auto & idx : idxs) {
+                n += idx.capacity()*sizeof(uint32_t);
+            }
+            return n;
+        }
+
         // check if indices are contiguous starting from head()
         bool is_contiguous() const {
             if (idxs.empty() || idxs[0].empty()) {
@@ -136,6 +148,7 @@ public:
 
         size_t host_bytes() const {
             size_t n = sizeof(*this) +
+                       sinfo.host_bytes() +
                        v_heads_old.capacity()*sizeof(uint32_t) +
                        v_cells.capacity()*sizeof(llama_kv_cells);
             for (const auto & c : v_cells) {
@@ -146,7 +159,10 @@ public:
     };
 
     // decode-time buffers reused by one batch context. the context returns
-    // them when it dies, so the next decode finds the capacity still there
+    // them when it dies, so the next decode finds the capacity still there.
+    // while a pooled batch context is alive it owns the moved-out
+    // sinfos/ubatches, so a host query sees only the cache-side containers
+    // and is a lower bound.
     struct decode_scratch {
         slot_info_vec_t sinfos;
         std::vector<llama_ubatch> ubatches;
@@ -168,6 +184,9 @@ public:
                            states.capacity()*sizeof(snapshot_slot *) +
                            pooled.capacity()*sizeof(snapshot_slot *) +
                            fallback.capacity()*sizeof(std::unique_ptr<snapshot_slot>);
+            for (const auto & slot : sinfos) {
+                res.scratch += slot.host_bytes();
+            }
             res.trial_index += trial_idx.capacity()*sizeof(size_t);
             for (const auto & slot : fallback) {
                 res.snapshots += slot->host_bytes();
@@ -275,6 +294,10 @@ public:
         }
 
     private:
+        // reserve(), acquire() and release() take this mutex. The host
+        // breakdown does not: it reads storage/free under the caller's
+        // quiescent contract. This mutex protects the free list and storage
+        // metadata, not the scratch contents.
         mutable std::mutex mutex;
         std::vector<std::unique_ptr<decode_scratch>> storage;
         std::vector<decode_scratch *> free;
@@ -337,6 +360,9 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    // Host payload of the journal and the prepare/decode scratch. The caller
+    // must keep the cache quiescent: no decode/update, no memory mutation,
+    // and no live memory context. See llama-ext.h.
     llama_host_memory_breakdown_data host_memory_breakdown() const override;
 
     bool has_kv_stream_targets() const override;
@@ -780,6 +806,10 @@ private:
         }
 
     private:
+        // reserve(), acquire() and release() take this mutex. The host
+        // breakdown does not: it reads storage/free under the caller's
+        // quiescent contract. This mutex protects the free list and storage
+        // metadata, not the slot contents.
         mutable std::mutex mutex;
 
         std::vector<std::unique_ptr<snapshot_slot>> storage;

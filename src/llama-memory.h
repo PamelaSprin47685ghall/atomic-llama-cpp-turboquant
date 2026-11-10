@@ -193,6 +193,9 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+    // Default: this memory implementation reports no host journal/prepare
+    // payload. Recurrent memory is one such implementation; its cells, tails
+    // and replay buffers are outside the declared host account.
     virtual llama_host_memory_breakdown_data host_memory_breakdown() const { return {}; }
 
     //
