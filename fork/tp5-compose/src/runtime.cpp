@@ -1686,8 +1686,9 @@ class relay_service {
 
 struct row_batch {
     llama_batch batch{};
+    std::uint32_t capacity_ = 0;
 
-    explicit row_batch(std::uint32_t capacity) {
+    explicit row_batch(std::uint32_t capacity) : capacity_(capacity) {
         batch = llama_batch_init(capacity, 0, 1);
         if (!llama_batch_is_complete(&batch, static_cast<int32_t>(capacity), false, true)) {
             llama_batch_free(batch);
@@ -1704,6 +1705,14 @@ struct row_batch {
     void clear() { batch.n_tokens = 0; }
 
     void push(llama_token token, std::uint64_t position, llama_seq_id seq, bool output) {
+        // llama_batch does not store its capacity, so this wrapper is the only
+        // place that can reject an overrun before it writes past token[],
+        // pos[], n_seq_id[], seq_id[] or logits[]. The current callers stay
+        // within the allocation; the guard keeps a future path from turning a
+        // miscounted row into a silent heap overwrite.
+        if (batch.n_tokens < 0 || std::uint32_t(batch.n_tokens) >= capacity_) {
+            throw std::logic_error("row_batch push exceeds its allocated capacity");
+        }
         auto i             = batch.n_tokens++;
         batch.token[i]     = token;
         batch.pos[i]       = static_cast<llama_pos>(position);

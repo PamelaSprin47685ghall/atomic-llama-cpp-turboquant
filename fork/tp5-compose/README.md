@@ -635,6 +635,12 @@ channel return or propagate it, and the void entry points with no error channel
 `row_batch` throw `std::bad_alloc`; a failed pool slot stays unready, so a
 later acquire retries.
 
+`row_batch` also keeps its own capacity. `llama_batch` does not store the
+extent it was initialised with, so `row_batch::push` rejects a row that would
+write past `token[]`, `pos[]`, `n_seq_id[]`, `seq_id[]` or `logits[]` with
+`std::logic_error`. Every current caller stays within its allocation; the
+guard exists so a later miscounted row cannot become a silent heap overwrite.
+
 The pool is not thread safe: exactly one worker owns it, and the pool outlives
 every lease. `lease::set` requires a non-null embedding row whose width equals
 the pool width. An MTP decode reads the NextN hidden row, not the token, so a
