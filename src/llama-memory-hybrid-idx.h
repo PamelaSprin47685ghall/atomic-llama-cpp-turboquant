@@ -97,6 +97,15 @@ public:
     // const because set_input updates it through a const memory context
     ple_history & ple_hist_get(llama_seq_id seq_id) const;
 
+    // Scoped undo for a K-shift transaction. save() runs before the PLE
+    // window moves; commit() only after both KV caches applied the shift, and
+    // rollback() when any participant failed or refused.
+    bool ple_hist_backup_save(llama_seq_id seq_id) const;
+    void ple_hist_backup_restore() const;
+    void ple_hist_backup_clear() const;
+    bool ple_hist_backup_failed() const { return ple_hist_backup_failed_flag; }
+    bool ple_hist_transaction_pending() const { return !ple_hist_undo_log.empty(); }
+
     // Non-inserting lookup; returns nullptr when seq_id has no history yet.
     const ple_history * ple_hist_peek(llama_seq_id seq_id) const;
 
@@ -117,6 +126,24 @@ private:
 
     // [TAG_PLE_HISTORY] empty for every architecture but qwen4exp, the only one that asks for a history
     mutable std::unordered_map<llama_seq_id, ple_history> ple_hist;
+
+    struct ple_hist_undo {
+        llama_seq_id seq_id;
+        bool         existed;
+        ple_history  prior;
+    };
+
+    // entries are appended by seq_add and replayed in reverse on rollback
+    mutable std::vector<ple_hist_undo> ple_hist_undo_log;
+    mutable bool ple_hist_backup_failed_flag = false;
+
+    // forget the undo entries of a dropped sequence; a restore must not
+    // resurrect a history that state_drop() removed
+    void ple_hist_undo_drop(llama_seq_id seq_id);
+
+    // A transaction that cannot be restored must fail closed: mark both KV
+    // caches invalid so state guards refuse until clear(true).
+    void shift_abort_if_pending();
 
     // the seq_* halves of the history bookkeeping, one per llama_memory_i operation
     void ple_hist_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1);

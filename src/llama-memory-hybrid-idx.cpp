@@ -153,11 +153,85 @@ bool llama_memory_hybrid_idx::clear(bool data) {
 
     // [TAG_PLE_HISTORY] every sequence is gone, so no window is trusted any more
     ple_hist.clear();
+    ple_hist_backup_clear();
 
     return true;
 }
 
+bool llama_memory_hybrid_idx::ple_hist_backup_save(llama_seq_id seq_id) const {
+    ple_hist_undo entry;
+    entry.seq_id = seq_id;
+
+    auto it = ple_hist.find(seq_id);
+    entry.existed = it != ple_hist.end();
+
+    try {
+        if (entry.existed) {
+            entry.prior = it->second;
+        }
+        ple_hist_undo_log.push_back(std::move(entry));
+    } catch (...) {
+        ple_hist_backup_failed_flag = true;
+        return false;
+    }
+
+    return true;
+}
+
+void llama_memory_hybrid_idx::ple_hist_backup_restore() const {
+    for (auto it = ple_hist_undo_log.rbegin(); it != ple_hist_undo_log.rend(); ++it) {
+        try {
+            if (it->existed) {
+                ple_hist.insert_or_assign(it->seq_id, it->prior);
+            } else {
+                ple_hist.erase(it->seq_id);
+            }
+        } catch (...) {
+            // The history is no longer known to match the cells. Keep the
+            // failure flag set so apply() keeps refusing until clear().
+            ple_hist_backup_failed_flag = true;
+        }
+    }
+
+    ple_hist_undo_log.clear();
+}
+
+void llama_memory_hybrid_idx::ple_hist_backup_clear() const {
+    ple_hist_undo_log.clear();
+    ple_hist_backup_failed_flag = false;
+}
+
+void llama_memory_hybrid_idx::ple_hist_undo_drop(llama_seq_id seq_id) {
+    if (seq_id < 0) {
+        ple_hist_undo_log.clear();
+        return;
+    }
+
+    ple_hist_undo_log.erase(
+        std::remove_if(ple_hist_undo_log.begin(), ple_hist_undo_log.end(),
+            [seq_id](const ple_hist_undo & e) { return e.seq_id == seq_id; }),
+        ple_hist_undo_log.end());
+}
+
+void llama_memory_hybrid_idx::shift_abort_if_pending() {
+    const bool attn_pending = get_mem_attn()->get_has_shift();
+    const bool idx_pending  = mem_idx && mem_idx->get_has_shift();
+
+    if (!attn_pending && !idx_pending) {
+        return;
+    }
+
+    get_mem_attn()->shift_mark_failed();
+    if (mem_idx) {
+        mem_idx->shift_mark_failed();
+    }
+}
+
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (ple_hist_transaction_pending()) {
+        LLAMA_LOG_ERROR("%s: refusing seq_rm while a K-shift PLE transaction is pending\n", __func__);
+        return false;
+    }
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it
     // first and leave the other caches untouched if it does
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
@@ -174,6 +248,10 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if (ple_hist_transaction_pending()) {
+        LLAMA_LOG_ERROR("%s: refusing seq_cp while a K-shift PLE transaction is pending\n", __func__);
+        return;
+    }
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
 
     if (mem_idx) {
@@ -184,6 +262,10 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
+    if (ple_hist_transaction_pending()) {
+        LLAMA_LOG_ERROR("%s: refusing seq_keep while a K-shift PLE transaction is pending\n", __func__);
+        return;
+    }
     llama_memory_hybrid::seq_keep(seq_id);
 
     if (mem_idx) {
@@ -194,16 +276,70 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-    llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
-
-    if (mem_idx) {
-        mem_idx->seq_add(seq_id, p0, p1, shift);
+    // A K-shift moves the attention cells, the indexer cells and the PLE
+    // window. Refuse before moving any of them when one participant cannot
+    // follow, and keep the PLE window undo until the composite applies.
+    if (get_mem_attn()->shift_is_failed() || (mem_idx && mem_idx->shift_is_failed())) {
+        LLAMA_LOG_ERROR("%s: refusing seq_add while a K-shift is unresolved; clear(true) is required\n", __func__);
+        return;
+    }
+    if (!get_mem_attn()->get_can_shift() || (mem_idx && !mem_idx->get_can_shift())) {
+        LLAMA_LOG_ERROR("%s: refusing seq_add: not every cache in this memory can shift\n", __func__);
+        return;
     }
 
-    ple_hist_add(seq_id, p0, p1, shift);
+    if (!ple_hist_backup_save(seq_id)) {
+        shift_abort_if_pending();
+        return;
+    }
+
+    try {
+        ple_hist_add(seq_id, p0, p1, shift);
+    } catch (...) {
+        // Undo only this participant, not earlier successful seq_add calls.
+        if (!ple_hist_undo_log.empty()) {
+            const auto & last = ple_hist_undo_log.back();
+            try {
+                if (last.existed) {
+                    ple_hist.insert_or_assign(last.seq_id, last.prior);
+                } else {
+                    ple_hist.erase(last.seq_id);
+                }
+            } catch (...) {
+                ple_hist_backup_failed_flag = true;
+            }
+            ple_hist_undo_log.pop_back();
+        }
+        ple_hist_backup_failed_flag = true;
+        shift_abort_if_pending();
+        return;
+    }
+
+    try {
+        llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
+        if (mem_idx) {
+            mem_idx->seq_add(seq_id, p0, p1, shift);
+        }
+    } catch (...) {
+        ple_hist_backup_restore();
+        ple_hist_backup_failed_flag = true;
+        shift_abort_if_pending();
+    }
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    if (ple_hist_transaction_pending()) {
+        LLAMA_LOG_ERROR("%s: refusing seq_div while a K-shift PLE transaction is pending\n", __func__);
+        return;
+    }
+    if (get_mem_attn()->shift_is_failed() || (mem_idx && mem_idx->shift_is_failed())) {
+        LLAMA_LOG_ERROR("%s: refusing seq_div while a K-shift is unresolved; clear(true) is required\n", __func__);
+        return;
+    }
+    if (!get_mem_attn()->get_can_shift() || (mem_idx && !mem_idx->get_can_shift())) {
+        LLAMA_LOG_ERROR("%s: refusing seq_div: not every cache in this memory can shift\n", __func__);
+        return;
+    }
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
 
     if (mem_idx) {
@@ -562,6 +698,7 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     }
 
     ple_hist.erase(seq_id);
+    ple_hist_undo_drop(seq_id);
 }
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
@@ -672,10 +809,47 @@ bool llama_memory_hybrid_idx_context::next() {
 }
 
 bool llama_memory_hybrid_idx_context::apply() {
+    if (mem != nullptr && mem->ple_hist_backup_failed()) {
+        mem->ple_hist_backup_restore();
+        return false;
+    }
+
+    // The attention and indexer caches share one position line. Keep each
+    // cache's shift undo until both have applied, then commit or roll back
+    // them and the PLE window as one transaction.
+    const bool is_update = ctx_attn != nullptr &&
+        static_cast<const llama_kv_cache_context *>(ctx_attn.get())->is_update();
+
+    if (is_update) {
+        static_cast<llama_kv_cache_context *>(ctx_attn.get())->set_keep_shift_undo(true);
+        if (ctx_idx) {
+            static_cast<llama_kv_cache_context *>(ctx_idx.get())->set_keep_shift_undo(true);
+        }
+    }
+
     bool res = llama_memory_hybrid_context::apply();
 
-    if (ctx_idx) {
-        res = res & ctx_idx->apply();
+    if (res && ctx_idx) {
+        res = ctx_idx->apply();
+    }
+
+    if (is_update && mem != nullptr) {
+        llama_kv_cache * attn = mem->get_mem_attn();
+        llama_kv_cache * idx  = mem->get_mem_idx();
+
+        if (res) {
+            attn->shift_backup_clear();
+            if (idx != nullptr) {
+                idx->shift_backup_clear();
+            }
+            mem->ple_hist_backup_clear();
+        } else {
+            attn->shift_backup_restore();
+            if (idx != nullptr) {
+                idx->shift_backup_restore();
+            }
+            mem->ple_hist_backup_restore();
+        }
     }
 
     return res;

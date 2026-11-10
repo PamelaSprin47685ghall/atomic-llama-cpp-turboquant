@@ -850,6 +850,7 @@ llama_kv_cache::llama_kv_cache(
 }
 
 bool llama_kv_cache::clear(bool data) {
+    sc_info = {};
     shift_backup_clear();
     if (data) {
         shift_failed = false;
@@ -1163,6 +1164,11 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         return;
     }
 
+    if (!get_can_shift()) {
+        LLAMA_LOG_ERROR("%s: this cache cannot shift its K/V; ignoring seq_div\n", __func__);
+        return;
+    }
+
     if (p0 < 0) {
         p0 = 0;
     }
@@ -1175,6 +1181,10 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     if (p0 == p1) {
         return;
     }
+
+    // pos_div() sets the shift flag, so the next update runs a K-shift graph.
+    // Keep the pre-division cells until that graph completes.
+    shift_backup_save();
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (!cells.pos_in(i, p0, p1)) {
@@ -1892,7 +1902,8 @@ void llama_kv_cache::scratch_return(
     }
 }
 
-llama_memory_apply_status llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+llama_memory_apply_status llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info,
+        bool keep_shift_undo) {
     if (shift_failed) {
         LLAMA_LOG_ERROR("%s: KV state is invalid after a failed K-shift; clear(true) is required\n", __func__);
         return LLAMA_MEMORY_APPLY_FAILED;
@@ -1993,7 +2004,9 @@ llama_memory_apply_status llama_kv_cache::update(llama_context * lctx, bool do_s
 
             cells.reset_shift();
         }
-        shift_backup_clear();
+        if (!keep_shift_undo) {
+            shift_backup_clear();
+        }
         status = LLAMA_MEMORY_APPLY_APPLIED;
     } else {
         shift_backup_clear();
@@ -2003,7 +2016,11 @@ llama_memory_apply_status llama_kv_cache::update(llama_context * lctx, bool do_s
 }
 
 void llama_kv_cache::shift_backup_save() {
-    if (!shift_cells_backup.empty()) {
+    // An existing backup belongs to a pending shift; keep it so the undo
+    // reaches the state before the first shift. A backup without a pending
+    // shift is stale (a composite context was dropped before commit) and is
+    // replaced.
+    if (!shift_cells_backup.empty() && get_has_shift()) {
         return;
     }
 
@@ -4865,7 +4882,7 @@ bool llama_kv_cache_context::apply() {
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
-        update_status = kv->update(lctx, do_shift, sc_info);
+        update_status = kv->update(lctx, do_shift, sc_info, keep_shift_undo);
 
         return update_status != LLAMA_MEMORY_APPLY_FAILED;
     }

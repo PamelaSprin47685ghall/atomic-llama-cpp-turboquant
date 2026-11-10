@@ -147,14 +147,15 @@ public:
     const llama_kv_cache_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
 
+protected:
+    const llama_memory_context_ptr ctx_attn;
+    const llama_memory_context_ptr ctx_recr;
+
 private:
     // the index of the next ubatch to process
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;
-
-    const llama_memory_context_ptr ctx_attn;
-    const llama_memory_context_ptr ctx_recr;
 
     const llama_memory_status status;
 };

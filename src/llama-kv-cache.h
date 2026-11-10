@@ -485,10 +485,13 @@ public:
     // take the vectors back into the scratch and mark it free again
     void scratch_return(slot_info_vec_t & sinfos, std::vector<llama_ubatch> & ubatches, decode_scratch * scratch);
 
-    llama_memory_apply_status update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
+    llama_memory_apply_status update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info,
+            bool keep_shift_undo = false);
     void shift_backup_save();
     void shift_backup_restore();
     void shift_backup_clear();
+    bool shift_is_failed() const { return shift_failed; }
+    void shift_mark_failed() { shift_failed = true; }
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
@@ -943,6 +946,11 @@ public:
     bool apply() override;
     llama_memory_apply_status get_update_status() const override { return update_status; }
 
+    // A composite memory keeps the shift undo until every participant applied.
+    // The default context commits its own shift as before.
+    void set_keep_shift_undo(bool keep) { keep_shift_undo = keep; }
+    bool is_update() const { return ubatches.empty() && lctx != nullptr; }
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
@@ -1130,6 +1138,10 @@ private:
     //
 
     bool do_shift = false;
+
+    // when set, a successful update keeps shift_cells_backup for a composite
+    // transaction to commit or roll back
+    bool keep_shift_undo = false;
 
     stream_copy_info sc_info;
 
