@@ -2307,10 +2307,6 @@ run_result run(const options & requested) {
                         }
                         return true; // default-on candidate
                     }();
-                    static const bool lb_selfcheck_reuse = [] {
-                        const char * e = std::getenv("GGML_TP5_LB_SELFCHECK_REUSE");
-                        return e != nullptr && e[0] == '1' && e[1] == '\0';
-                    }();
                     static const bool lb_counters_enabled = [] {
                         const char * e = std::getenv("TP5_MTP_LB_COUNTERS");
                         return e != nullptr && e[0] == '1' && e[1] == '\0';
@@ -2939,8 +2935,18 @@ run_result run(const options & requested) {
                             else ++mtp_rollback_rounds;
                             actual_accepted = accepted;
                             if (lb_reuse_accept_enabled && lb_draft1_prefetched) {
+                                // Latch the same-epoch verdict terms for the
+                                // commit-site consistency check. Full
+                                // acceptance is a legal reuse bind:
+                                // accepted == n leaves row 0's serial inputs
+                                // unchanged, so the exact-input guard, not
+                                // the accept count, decides whether the
+                                // serial decode is skipped. A stop on the
+                                // last row n is classified at commit time,
+                                // after row 0's bind, and keeps this same
+                                // full-accept verdict.
                                 lb_reuse_full_accept = full_accept;
-                                if (lb_selfcheck_reuse) lb_reuse_verdict_n = n;
+                                lb_reuse_verdict_n = n;
                             }
                             if (lb_draft1_enabled && lb_draft1_prefetched &&
                                 accepted != lb_draft1_assumed_accepted) {
@@ -3426,18 +3432,26 @@ run_result run(const options & requested) {
                                         reused_lb_draft = true;
                                         if (lb_counters_enabled) ++lb_ctr_bind;
                                     } else if (selected == lb_draft1_token && guard_ok) {
-                                        if (lb_selfcheck_reuse) {
-                                            // Do not classify full acceptance as an error: the
-                                            // input guard above is authoritative for reuse.
-                                            // Check the latched verdict against its original N.
-                                            require(lb_reuse_verdict_n >= 1 &&
-                                                    actual_accepted <= lb_reuse_verdict_n &&
-                                                    lb_reuse_full_accept == (actual_accepted == lb_reuse_verdict_n),
-                                                    "LateBind reuse verifier verdict inconsistent");
-                                        } else {
-                                            require(!lb_reuse_full_accept,
-                                                    "LateBind reuse guard passed on a full_accept epoch");
-                                        }
+                                        // Full acceptance is a legal bind: the
+                                        // exact-input guard above is the
+                                        // authority for reuse, and accepted
+                                        // == n leaves row 0's serial inputs
+                                        // unchanged. A stop on the last row n
+                                        // is classified at commit time, after
+                                        // this bind, and keeps the same
+                                        // full-accept verdict.
+                                        //
+                                        // The three terms below come from the
+                                        // same verify epoch (verdict_n == n,
+                                        // full_accept == (accepted == n)), so
+                                        // they are a consistency echo, not an
+                                        // independent safety gate. They stay
+                                        // as a debug-style invariant; the
+                                        // guard decides the bind.
+                                        require(lb_reuse_verdict_n >= 1 &&
+                                                actual_accepted <= lb_reuse_verdict_n &&
+                                                lb_reuse_full_accept == (actual_accepted == lb_reuse_verdict_n),
+                                                "LateBind reuse verifier verdict inconsistent");
                                         reused_lb_draft = true;
                                         // Deviation from base: base keeps
                                         // lb_draft1_prefetched=true after a
@@ -3446,6 +3460,24 @@ run_result run(const options & requested) {
                                         // or bind cannot double-use it.
                                         lb_draft1_prefetched = false;
                                         lb_reuse_h0_valid = false;
+                                        // Explicit completion proof for the
+                                        // reused prefetch. If this row does
+                                        // not export outputs, the getter
+                                        // below does not run, and the next
+                                        // row would submit a decode on dctx
+                                        // while the prefetch is still
+                                        // pending. Synchronize here so no
+                                        // row reuses dctx before the
+                                        // prefetch completes. The draft
+                                        // context is single-device with no
+                                        // relay, so this host synchronize is
+                                        // the completion proof.
+                                        const bool bind_draft_output =
+                                            !last_draft_logits || row + 1 == local_rows.size();
+                                        if (draft_pending && !bind_draft_output) {
+                                            llama_synchronize(dctx);
+                                            draft_pending = false;
+                                        }
                                         if (lb_counters_enabled) {
                                             ++lb_ctr_bind;
                                             ++lb_ctr_bind_accept;

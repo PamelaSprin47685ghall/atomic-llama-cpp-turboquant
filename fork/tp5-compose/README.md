@@ -734,6 +734,74 @@ unverified here (no GPU/full).
 The unit target has 32 checks; the reviewed unit run is 32 PASS / 0 FAIL. The
 real MTP runtime and GPU path were not run.
 
+## LateBind verdict reuse and full acceptance (2026-11-09)
+
+The LateBind prefetch (`TP5_MTP_LATEBIND_DRAFT1=1`) assumes verdict `a=0`.
+Verdict reuse is on by default. `GGML_TP5_LATEBIND` unset and
+`TP5_MTP_LATEBIND_REUSE_ACCEPT` unset means reuse on. `GGML_TP5_LATEBIND=0`
+turns reuse off and `GGML_TP5_LATEBIND=1` turns it on. The legacy
+`TP5_MTP_LATEBIND_REUSE_ACCEPT` is an override only while
+`GGML_TP5_LATEBIND` is unset: `1` is on and `0` is off. A legacy value other
+than `1` under a set master gate fails loudly. `GGML_TP5_LATEBIND=0` does not
+disable the prefetch; `TP5_MTP_LATEBIND_DRAFT1` does. The `a>0` bind requires
+the native-trim path (`GGML_TP5_MTP_RS_RING=1`). The `accepted==0` base bind
+does not require native trim.
+
+An `a>0` epoch binds the prefetched draft step 1 only when the commit token
+equals the prefetched draft token and the exact-input guard proves that the
+serial row-0 decode would consume bitwise-identical inputs: the same
+position, local row, a prefetch that exported outputs, and a bitwise-equal
+`real_h` NextN residual. The prefetch state is per epoch, so the guard cannot
+cross an epoch. The guard is the only additional authority for reuse; the
+accepted count is not a second gate. The full-checkpoint path
+(`GGML_TP5_MTP_RS_RING=0`) keeps the serial decode: the guard refuses reuse,
+the replay path discards the prefetch, and row 0 decodes serially. This
+section is therefore about native-trim reuse, not every LateBind path.
+
+Full acceptance (`accepted == n`) is a legal bind on that path. It leaves
+row 0's serial inputs unchanged. A stop on the last row `n` is classified in
+the commit loop, after row 0's bind, and keeps the same full-accept verdict.
+The stop cleanup trims the draft attention KV from the stopped request's
+source token, including a stop-row-0 prefetch that the bind site reused.
+Partial acceptance and a stop before the last row latch `full_accept=false`;
+the same guard decides their bind.
+
+The earlier code aborted when the guard passed on a full-accept native-ring
+epoch (`require(!lb_reuse_full_accept)`) unless the opt-in
+`GGML_TP5_LB_SELFCHECK_REUSE` was set. That was a false invariant: full
+acceptance is the normal case when the drafts are right, and the abort fired
+before the row-n stop was classified. The opt-in branch also checked
+`lb_reuse_verdict_n`, `actual_accepted` and `lb_reuse_full_accept` in one
+three-term `require`. Those terms come from the same verify epoch
+(`verdict_n == n`, `full_accept == (accepted == n)`), so the check is a
+same-epoch consistency echo, not an independent safety gate. The guard is the
+authority. The old selfcheck env var is no longer read.
+
+The bind carries an explicit completion proof before the next row can reuse
+the draft context. When row 0 exports outputs (`draft_output=true`), the
+synchronizing `llama_get_logits_ith` / `llama_get_embeddings_nextn_ith`
+getters prove completion on that row. When `TP5_MTP_LAST_DRAFT_LOGITS=1` and
+row 0 is not the last row (`draft_output=false`), the getter does not run; the
+bind calls `llama_synchronize(dctx)` and clears `draft_pending` before the
+next decode. The draft context is single-device with no relay, so this host
+synchronize is the completion proof. This removes the earlier "next decode
+submitted with no explicit synchronize" window.
+
+Do not read the `draft_output` flag as "row 0's outputs are never read":
+`draft_output = !last_draft_logits || last_target_row`. With
+`TP5_MTP_LAST_DRAFT_LOGITS` unset (default false), row 0 has
+`draft_output=true`, so its prefetched outputs are read by the next getter.
+Only with `TP5_MTP_LAST_DRAFT_LOGITS=1` and `accepted>=1` does row 0 have
+`draft_output=false`.
+
+No runtime/GPU run was performed for this tree. The full-accept bind, the
+exact-input guard, the completion proof, and the row-n stop cleanup are
+supported by code review only. `llama_synchronize` is a host synchronization
+of the single-device draft context; it is not a native relay receipt. The
+physical KV deletion after the stop trim and the GPU path remain unproven. No
+new CPU test was added; this tree has no CPU runtime path that reaches the
+LateBind bind.
+
 ## Legacy relay channel map reclamation (2026-11-09)
 
 When neither `GGML_TP5_PLAN_UNION=1` nor
