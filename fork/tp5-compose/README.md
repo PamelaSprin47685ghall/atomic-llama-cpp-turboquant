@@ -690,17 +690,49 @@ and the shrink-after-invalidate and shrink-after-exception epoch sequences.
 With `GGML_TP5_MTP_ON_DEVICE_CHECKPOINT=1` the state flags are
 `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`. The checkpoint object then retains only the
 metadata; the tensor snapshot lives in `ctx->mem_storage[seq_id]` and is owned
-by the context. The runtime captures once per verify epoch and consumes or
-invalidates the checkpoint before the next capture; a second ON_DEVICE capture
-for the same seq replaces that device snapshot. The device metadata carries a
-generation, so restoring the older metadata returns 0 instead of silently
-copying the newer tensors; the runtime also refuses to capture while a
-checkpoint is still live. The 512 MiB gate uses the full host state size for
-ON_DEVICE, not the metadata size, so the device copy is bounded by the same
-limit. A restore without a matching device snapshot returns 0 from
-`llama_state_seq_set_data_ext` and the runtime fails with a clear error; it does
-not abort. The class cannot validate the device bytes, so the rejected-prefix
-replay KL check remains the content guard.
+by the context. The runtime invalidates the checkpoint at the start of every
+verify epoch; `capture()` also resets the valid flag before writing, so a
+second capture replaces the previous checkpoint rather than preserving it. A
+second ON_DEVICE capture for the same seq replaces that device snapshot; the
+old and new snapshot buffers coexist until the swap, so peak device memory is
+about twice the snapshot size. The in-memory host blob keeps its existing
+magic/seq_id layout and the device blob is versioned; a blob used with the
+other flag set is rejected before the memory state is touched. The host blob
+remains portable across contexts. The device metadata also carries the owning
+context identity and a generation; restoring metadata from another context,
+older metadata after a later capture, or truncated or corrupt metadata returns
+0. A device capture is prepared in a fresh buffer map. Each tensor copy uses
+the buffer `cpy_tensor` (bool) and falls back to `ggml_backend_tensor_copy`.
+CUDA/CPU buffers block or synchronize at return; normal async streams are not
+disabled. A Meta destination is split into its real child buffers and each
+child is copied with the child buffer's `cpy_tensor` (with the blocking
+fallback); the staging owner is not used. The child split preflights every
+child (split state, simple view, buffer/data, type/shape/nbytes) before any
+side effect: false means preflight/unsupported with the destination untouched,
+true means all child blocking copies completed. A false preflight is
+no-side-effect unsupported: the ON_DEVICE call returns 0 and does not mark
+unproven; the caller must explicitly request the host format (host flags) for a
+host blob. The ON_DEVICE blob is a device metadata handle, not the full host
+state; the host blob is a separate format whose size includes the tensor bytes.
+A started copy that throws is partial/unknown: the ON_DEVICE restore returns 0
+and marks/retains; the capture returns 0 with the old snapshot; no fallback is
+attempted and unproven is not cleared. A cross-context device blob is rejected
+by its context id. A legal Meta child copy completes the ON_DEVICE
+capture/restore. Non-Meta device errors keep the existing clear-on-failure. A
+CUDA_CHECK abort is not a returned status. The previous snapshot remains in the
+context.
+Host-flag and file restores follow the memory clear-on-failure policy; they are
+not rolled back and do not allocate a full host backup. An invalid destination
+seq id (below -1 or at least n_seq_max) returns 0; -1 addresses all sequences.
+A single-sequence restore clears the destination first, so an empty or shorter
+source cannot leave stale attention. The runtime checks that the full host state
+size is available for ON_DEVICE and reports both the host snapshot size and the
+metadata size; it does not impose a fixed byte cap, because the device
+allocator is the real limit. The class cannot validate the device bytes, so the
+rejected-prefix replay KL check remains the content guard. The CPU test
+exercises the device path through CPU backend buffers, including Q8_0 KV when
+the model supports it; GPU backend allocation and copy behavior remain
+untested.
 
 ## MTP target greedy cache (2026-11-09)
 

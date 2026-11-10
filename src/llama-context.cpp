@@ -2,6 +2,7 @@
 #include "llama-context.h"
 
 #include "../ggml/src/ggml-backend-moe-cache.h"
+#include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-impl.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -33,14 +34,22 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+static thread_local bool g_state_copy_unproven = false;
+
+bool llama_state_copy_unproven() {
+    return g_state_copy_unproven;
+}
 
 //
 // llama_context
@@ -211,6 +220,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+    // One staging snapshot can be retained if a device copy is unproven.
+    mem_storage_retired.reserve(1);
 
     // per-context union-binder state slot (llama-nout-state.h): NOT created
     // here eagerly - the constructor reads the env gate below and creates the
@@ -2500,6 +2511,31 @@ ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
 
+void llama_context::retire_state_snapshot(llama_memory_buffers && storage) {
+    mem_storage_retired.push_back(std::move(storage));
+}
+
+bool llama_context::reserve_state_copy_contexts(size_t n) {
+    try {
+        state_copy_retired.reserve(n);
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+void llama_context::retire_state_copy_context(ggml_context_ptr && ctx) {
+    state_copy_retired.push_back(std::move(ctx));
+}
+
+void llama_context::mark_state_copy_unproven() {
+    state_copy_unproven = true;
+    g_state_copy_unproven = true;
+    if (memory) {
+        memory->mark_unproven();
+    }
+}
+
 uint32_t llama_context::n_ctx() const {
     return cparams.n_ctx;
 }
@@ -3188,6 +3224,9 @@ void llama_context::detach_threadpool() {
 }
 
 bool llama_context::has_unproven() const {
+    if (state_copy_unproven) {
+        return true;
+    }
     if (sched && ggml_backend_sched_has_unproven(sched.get())) {
         return true;
     }
@@ -8476,12 +8515,7 @@ class llama_io_read_host : public llama_io_read_i {
   public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
-    ~llama_io_read_host() {
-        // flush the reads
-        for (const auto & rinfo : rinfos) {
-            ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
-        }
-    }
+    ~llama_io_read_host() override = default;
 
     void read(void * dst, size_t size) override {
         if (size > buf_size) {
@@ -8498,8 +8532,9 @@ class llama_io_read_host : public llama_io_read_i {
             throw std::runtime_error("unexpectedly reached end of buffer");
         }
 
-        // save for later during destruction
-        rinfos.push_back({ tensor, ptr, size, offset });
+        // Host state readers are used on the native/CPU path; set_tensor is
+        // the blocking copy for those buffers.
+        ggml_backend_tensor_set(tensor, ptr, offset, size);
 
         ptr += size;
         size_read += size;
@@ -8512,15 +8547,6 @@ class llama_io_read_host : public llama_io_read_i {
     const uint8_t * ptr;
     size_t          buf_size  = 0;
     size_t          size_read = 0;
-
-    struct read_info {
-        ggml_tensor *   tensor;
-        const uint8_t * ptr;
-        size_t          size;
-        size_t          offset;
-    };
-
-    std::vector<read_info> rinfos;
 };
 
 class llama_io_write_file : public llama_io_write_i {
@@ -8558,6 +8584,8 @@ class llama_io_read_file : public llama_io_read_i {
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
         temp_buffer.resize(size);
         read(temp_buffer.data(), size);
+        // File state readers are used on the native/CPU path; set_tensor is
+        // the blocking copy for those buffers.
         ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
     }
 
@@ -8576,10 +8604,20 @@ class llama_io_write_device : public llama_io_write_i {
         buf_size(len),
         mbufs(mbufs) {}
 
-    ~llama_io_write_device() {
+    ~llama_io_write_device() override = default;
+
+    bool finalize() override {
+        if (finalized) {
+            return true;
+        }
+        finalized = true;
+
         llama_memory_buffers mbufs_new;
 
         for (const auto & winfo : winfos) {
+            if (winfo.tensor == nullptr || winfo.tensor->buffer == nullptr) {
+                throw std::runtime_error("device state tensor has no buffer");
+            }
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
             mbufs_new[buft].n_tensors++;
@@ -8594,79 +8632,91 @@ class llama_io_write_device : public llama_io_write_i {
             };
 
             mbuf.ctx.reset(ggml_init(params));
+            if (!mbuf.ctx) {
+                throw std::runtime_error("failed to allocate device state context");
+            }
 
             mbuf.org.reserve(mbuf.n_tensors);
             mbuf.cpy.reserve(mbuf.n_tensors);
         }
 
         for (const auto & winfo : winfos) {
+            if (winfo.tensor == nullptr || winfo.tensor->buffer == nullptr) {
+                throw std::runtime_error("device state tensor has no buffer");
+            }
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size / ggml_element_size(winfo.tensor);
+            // ggml_element_size() is the block type size for a quantized
+            // tensor, so convert the byte count back to elements before
+            // building the view. For F32/F16 the block size is one.
+            const size_t type_size = ggml_element_size(winfo.tensor);
+            if (type_size == 0 || winfo.size % type_size != 0) {
+                throw std::runtime_error("device state tensor range is not type-aligned");
+            }
+            const int64_t n = (int64_t) (winfo.size / type_size) * ggml_blck_size(winfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
-            mbuf.org.push_back(ggml_view_1d(mbuf.ctx.get(), winfo.tensor, n, winfo.offset));
+            ggml_tensor * org = ggml_view_1d(mbuf.ctx.get(), winfo.tensor, n, winfo.offset);
+            ggml_set_name(org, winfo.tensor->name);
+            mbuf.org.push_back(org);
             mbuf.cpy.push_back(ggml_new_tensor_1d(mbuf.ctx.get(), winfo.tensor->type, n));
         }
 
         for (auto & [buft, mbuf] : mbufs_new) {
             auto & mbuf_cur = mbufs[buft];
 
-            bool need_alloc = false;
+            // mbufs is a fresh map owned by this capture. Build a complete
+            // snapshot there and let the caller swap it into the context only
+            // after finalize returns. The previous snapshot is not touched.
+            mbuf_cur = std::move(mbuf);
 
-            need_alloc = need_alloc || (!mbuf_cur.buf);
-            need_alloc = need_alloc || (mbuf_cur.org.size() != mbuf.org.size());
-            need_alloc = need_alloc || (mbuf_cur.total_size != mbuf.total_size);
-
-            if (!need_alloc) {
-                for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                    auto * org0 = mbuf_cur.org[i];
-                    auto * org1 = mbuf.org[i];
-
-                    if (!ggml_are_same_shape(org0, org1)) {
-                        need_alloc = true;
-                        break;
-                    }
-
-                    if (org0->view_src != org1->view_src || org0->view_offs != org1->view_offs) {
-                        need_alloc = true;
-                        break;
-                    }
-                }
+            mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), buft));
+            if (!mbuf_cur.buf) {
+                throw std::runtime_error("failed to allocate device state buffer");
             }
 
-            if (need_alloc) {
-                if (!mbuf_cur.buf || mbuf_cur.total_size != mbuf.total_size) {
-                    mbuf_cur = std::move(mbuf);
+            LLAMA_LOG_INFO("%s: allocated '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft),
+                           mbuf_cur.total_size / 1024.0 / 1024.0);
+        }
 
-                    mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), buft));
-
-                    LLAMA_LOG_INFO("%s: allocated '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft),
-                                   mbuf.total_size / 1024.0 / 1024.0);
-                } else {
-                    //LLAMA_LOG_INFO("%s: reallocating tensors in '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf.total_size/1024.0/1024.0);
-
-                    // save the old buffer and allocate the new tensors in it
-                    auto buf = std::move(mbuf_cur.buf);
-
-                    mbuf_cur = std::move(mbuf);
-
-                    ggml_tallocr talloc = ggml_tallocr_new(buf.get());
-
-                    for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                        ggml_backend_view_init(mbuf_cur.org[i]);
-                        ggml_tallocr_alloc(&talloc, mbuf_cur.cpy[i]);
-                    }
-
-                    mbuf_cur.buf = std::move(buf);
-                }
+        // Preflight every Meta destination. IMPOSSIBLE leaves the new staging
+        // untouched and returns false; EXACT uses the child fast copy; SLOW
+        // uses the generic host-staging tensor copy with the same ON_DEVICE
+        // snapshot. A throw after a copy starts is partial/unknown in the new
+        // staging; the old snapshot is not touched.
+        for (const auto & [buft, mbuf] : mbufs) {
+            if (!ggml_backend_buffer_is_meta(mbuf.buf.get())) {
+                continue;
             }
-
-            for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
+            for (size_t i = 0; i < mbuf.org.size(); ++i) {
+                if (ggml_backend_meta_buffer_copy_kind(mbuf.org[i], mbuf.cpy[i]) ==
+                    GGML_BACKEND_META_COPY_IMPOSSIBLE) {
+                    return false;
+                }
             }
         }
+
+        for (const auto & [buft, mbuf] : mbufs) {
+            for (size_t i = 0; i < mbuf.org.size(); ++i) {
+                if (ggml_backend_buffer_is_meta(mbuf.buf.get())) {
+                    const ggml_backend_meta_copy_kind kind =
+                        ggml_backend_meta_buffer_copy_kind(mbuf.org[i], mbuf.cpy[i]);
+                    if (kind == GGML_BACKEND_META_COPY_EXACT) {
+                        if (!ggml_backend_buffer_copy_tensor(mbuf.org[i], mbuf.cpy[i])) {
+                            throw std::runtime_error("device state meta copy rejected after preflight");
+                        }
+                    } else if (kind == GGML_BACKEND_META_COPY_SLOW) {
+                        ggml_backend_tensor_copy(mbuf.org[i], mbuf.cpy[i]);
+                    } else {
+                        throw std::runtime_error("device state meta copy impossible after preflight");
+                    }
+                } else if (!ggml_backend_buffer_copy_tensor(mbuf.org[i], mbuf.cpy[i])) {
+                    ggml_backend_tensor_copy(mbuf.org[i], mbuf.cpy[i]);
+                }
+            }
+        }
+        return true;
     }
 
     void write(const void * src, size_t size) override {
@@ -8680,7 +8730,7 @@ class llama_io_write_device : public llama_io_write_i {
     }
 
     void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        // save the write for later during destruction
+        // save the write for the deferred device copy
         winfos.push_back({ tensor, ptr, size, offset });
     }
 
@@ -8701,62 +8751,86 @@ class llama_io_write_device : public llama_io_write_i {
     std::vector<write_info> winfos;
 
     llama_memory_buffers & mbufs;
+    bool finalized = false;
 };
 
 class llama_io_read_device : public llama_io_read_i {
+  private:
+    struct copy_state {
+        size_t next = 0;
+        ggml_context_ptr ctx;
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pending;
+    };
+
   public:
-    llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs) :
+    llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs, llama_context * ctx) :
         ptr(p),
         buf_size(len),
-        mbufs(mbufs) {}
+        mbufs(mbufs),
+        ctx(ctx) {}
 
-    ~llama_io_read_device() {
-        llama_memory_buffers mbufs_new;
-
-        for (const auto & rinfo : rinfos) {
-            auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
-
-            mbufs_new[buft].n_tensors++;
-            mbufs_new[buft].total_size += rinfo.size;
+    ~llama_io_read_device() override {
+        if (unproven) {
+            retire_copy_contexts();
         }
+    }
 
-        for (auto & [buft, mbuf] : mbufs_new) {
-            ggml_init_params params = {
-                /*.mem_size   =*/mbuf.n_tensors * ggml_tensor_overhead(),
-                /*.mem_buffer =*/NULL,
-                /*.no_alloc   =*/true,
-            };
-
-            mbuf.ctx.reset(ggml_init(params));
-
-            mbuf.org.reserve(mbuf.n_tensors);
+    bool finalize() override {
+        if (unproven) {
+            retire_copy_contexts();
+            return false;
         }
-
-        for (const auto & rinfo : rinfos) {
-            auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
-
-            const int64_t n = rinfo.size / ggml_element_size(rinfo.tensor);
-
-            auto & mbuf = mbufs_new[buft];
-
-            mbuf.org.push_back(ggml_view_1d(mbuf.ctx.get(), rinfo.tensor, n, rinfo.offset));
-
-            ggml_backend_view_init(mbuf.org.back());
+        if (finalized) {
+            return true;
         }
+        finalized = true;
 
-        for (auto & [buft, mbuf] : mbufs_new) {
-            const auto & mbuf_cur = mbufs.at(buft);
-
-            if (!mbuf_cur.buf || mbuf_cur.n_tensors != mbuf.n_tensors || mbuf_cur.total_size != mbuf.total_size) {
-                GGML_ABORT("%s: memory buffer mismatch\n", __func__);
-            }
-
-            for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+        // CPU pairs copied in read_tensor(). All Meta pairs are preflighted
+        // before any Meta copy. IMPOSSIBLE leaves the target untouched and
+        // returns false; EXACT uses the child fast copy; SLOW uses the generic
+        // host-staging tensor copy. A throw after a copy starts is
+        // partial/unknown and retains the target views.
+        for (const auto & [buft, mbuf] : mbufs) {
+            const auto it = copies.find(buft);
+            const size_t copied = it == copies.end() ? 0 : it->second.next;
+            if (copied != mbuf.n_tensors) {
+                throw std::runtime_error("device state tensor count mismatch");
             }
         }
-
-        GGML_ASSERT(buf_size == 0);
+        for (const auto & [buft, copy] : copies) {
+            for (const auto & [cpy, view] : copy.pending) {
+                if (ggml_backend_meta_buffer_copy_kind(cpy, view) ==
+                    GGML_BACKEND_META_COPY_IMPOSSIBLE) {
+                    return false;
+                }
+            }
+        }
+        for (auto & [buft, copy] : copies) {
+            for (auto & [cpy, view] : copy.pending) {
+                try {
+                    const ggml_backend_meta_copy_kind kind =
+                        ggml_backend_meta_buffer_copy_kind(cpy, view);
+                    if (kind == GGML_BACKEND_META_COPY_EXACT) {
+                        if (!ggml_backend_buffer_copy_tensor(cpy, view)) {
+                            unproven = true;
+                            retire_copy_contexts();
+                            throw std::runtime_error("device state meta copy rejected after preflight");
+                        }
+                    } else if (kind == GGML_BACKEND_META_COPY_SLOW) {
+                        ggml_backend_tensor_copy(cpy, view);
+                    } else {
+                        unproven = true;
+                        retire_copy_contexts();
+                        throw std::runtime_error("device state meta copy impossible after preflight");
+                    }
+                } catch (...) {
+                    unproven = true;
+                    retire_copy_contexts();
+                    throw std::runtime_error("device state copy unproven");
+                }
+            }
+        }
+        return true;
     }
 
     void read(void * dst, size_t size) override {
@@ -8770,30 +8844,118 @@ class llama_io_read_device : public llama_io_read_i {
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        // save for later during destruction
-        rinfos.push_back({ tensor, ptr, size, offset });
+        if (tensor == nullptr || tensor->buffer == nullptr) {
+            throw std::runtime_error("device state tensor has no buffer");
+        }
+        const size_t tensor_size = ggml_nbytes(tensor);
+        if (offset > tensor_size || size > tensor_size - offset) {
+            throw std::runtime_error("device state tensor range is out of bounds");
+        }
+        const size_t type_size = ggml_element_size(tensor);
+        if (type_size == 0 || size % type_size != 0) {
+            throw std::runtime_error("device state tensor range is not type-aligned");
+        }
+        const int64_t n = (int64_t) (size / type_size) * ggml_blck_size(tensor->type);
+        if (ggml_backend_buffer_is_meta(tensor->buffer)) {
+            has_meta = true;
+        }
+
+        auto * buft = ggml_backend_buffer_get_type(tensor->buffer);
+        const auto it = mbufs.find(buft);
+        if (it == mbufs.end() || !it->second.buf) {
+            throw std::runtime_error("device state buffer type mismatch");
+        }
+
+        auto & copy = copies[buft];
+        if (copy.next >= it->second.cpy.size()) {
+            throw std::runtime_error("device state tensor count mismatch");
+        }
+        ggml_tensor * cpy = it->second.cpy[copy.next];
+        if (cpy == nullptr) {
+            throw std::runtime_error("device state snapshot tensor is null");
+        }
+
+        if (!copy.ctx) {
+            ggml_init_params params = {
+                /*.mem_size   =*/it->second.n_tensors * ggml_tensor_overhead(),
+                /*.mem_buffer =*/NULL,
+                /*.no_alloc   =*/true,
+            };
+            copy.ctx.reset(ggml_init(params));
+            if (!copy.ctx) {
+                throw std::runtime_error("failed to allocate device state context");
+            }
+        }
+
+        ggml_tensor * view = ggml_view_1d(copy.ctx.get(), tensor, n, offset);
+        if (view == nullptr) {
+            throw std::runtime_error("failed to create device state view");
+        }
+        ggml_set_name(view, tensor->name);
+        ggml_backend_view_init(view);
+
+        if (cpy->type != view->type ||
+            !ggml_are_same_shape(cpy, view) ||
+            ggml_nbytes(cpy) != ggml_nbytes(view)) {
+            throw std::runtime_error("device state tensor layout mismatch");
+        }
+
+        if (ggml_backend_buffer_is_meta(cpy->buffer)) {
+            copy.pending.emplace_back(cpy, view);
+            ++copy.next;
+            return;
+        }
+        try {
+            if (!ggml_backend_buffer_copy_tensor(cpy, view)) {
+                ggml_backend_tensor_copy(cpy, view);
+            }
+        } catch (...) {
+            // The copy may have partially written the target.
+            unproven = true;
+            retire_copy_contexts();
+            throw std::runtime_error("device state copy unproven");
+        }
+        ++copy.next;
     }
 
     size_t n_bytes() override { return size_read; }
+    bool has_meta_buffer() const { return has_meta; }
 
   private:
+    void retire_copy_contexts() {
+        for (auto & [buft, copy] : copies) {
+            if (copy.ctx) {
+                ctx->retire_state_copy_context(std::move(copy.ctx));
+            }
+        }
+    }
+
     const uint8_t * ptr;
     size_t          buf_size  = 0;
     size_t          size_read = 0;
 
-    struct read_info {
-        ggml_tensor *   tensor;
-        const uint8_t * ptr;
-        size_t          size;
-        size_t          offset;
-    };
-
-    std::vector<read_info> rinfos;
+    std::map<ggml_backend_buffer_type_t, copy_state> copies;
 
     const llama_memory_buffers & mbufs;
+    llama_context * ctx;
+    bool finalized = false;
+    bool unproven = false;
+    bool has_meta = false;
 };
 
+bool llama_context::state_copy_blocked(const char * func) {
+    if (state_copy_unproven) {
+        LLAMA_LOG_ERROR("%s: unproven state copy; refusing state operation\n", func);
+        return true;
+    }
+    g_state_copy_unproven = false;
+    return false;
+}
+
 size_t llama_context::state_get_size() {
+    if (state_copy_blocked(__func__)) {
+        return 0;
+    }
     llama_io_write_dummy io(false);
     try {
         return state_write_data(io);
@@ -8804,6 +8966,9 @@ size_t llama_context::state_get_size() {
 }
 
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+    if (state_copy_blocked(__func__)) {
+        return 0;
+    }
     llama_io_write_host io(dst, size);
     try {
         return state_write_data(io);
@@ -8814,6 +8979,9 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 }
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+    if (state_copy_blocked(__func__)) {
+        return 0;
+    }
     llama_io_read_host io(src, size);
     try {
         return state_read_data(io);
@@ -8824,16 +8992,92 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 }
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
+static constexpr uint32_t io_device_magic = 0x4f4e4445; // device state tag
+static constexpr uint32_t io_device_version = 1;
+
+struct state_seq_device_header {
+    llama_seq_id  seq_id      = 0;
+    std::uint64_t context_id  = 0;
+    std::uint64_t generation  = 0;
+};
+
+static void state_seq_write_host_header(llama_io_write_i & io, llama_seq_id seq_id) {
+    io.write(&io_magic, sizeof(io_magic));
+    io.write(&seq_id, sizeof(seq_id));
+}
+
+static llama_seq_id state_seq_read_host_header(llama_io_read_i & io) {
+    uint32_t magic = 0;
+    io.read(&magic, sizeof(magic));
+    if (magic != io_magic) {
+        throw std::runtime_error("wrong sequence state magic");
+    }
+
+    llama_seq_id seq_id = 0;
+    io.read(&seq_id, sizeof(seq_id));
+    return seq_id;
+}
+
+static void state_seq_write_device_header(llama_io_write_i & io, llama_seq_id seq_id,
+                                          std::uint64_t context_id, std::uint64_t generation) {
+    io.write(&io_device_magic, sizeof(io_device_magic));
+    io.write(&seq_id, sizeof(seq_id));
+    io.write(&io_device_version, sizeof(io_device_version));
+    io.write(&context_id, sizeof(context_id));
+    io.write(&generation, sizeof(generation));
+}
+
+static state_seq_device_header state_seq_read_device_header(llama_io_read_i & io) {
+    uint32_t magic = 0;
+    io.read(&magic, sizeof(magic));
+    if (magic != io_device_magic) {
+        throw std::runtime_error("wrong device state magic");
+    }
+
+    state_seq_device_header header;
+    io.read(&header.seq_id, sizeof(header.seq_id));
+    uint32_t version = 0;
+    io.read(&version, sizeof(version));
+    if (version != io_device_version) {
+        throw std::runtime_error("unsupported device state version");
+    }
+
+    io.read(&header.context_id, sizeof(header.context_id));
+    io.read(&header.generation, sizeof(header.generation));
+    return header;
+}
+
+std::uint64_t llama_context::state_seq_device_id_next() {
+    static const std::uint64_t process_nonce = [] {
+        std::uint64_t nonce = 0;
+        try {
+            std::random_device rd;
+            nonce = (std::uint64_t(rd()) << 32) ^ std::uint64_t(rd());
+        } catch (...) {
+            nonce = 0;
+        }
+        return nonce ^ (std::uint64_t) ggml_time_us();
+    }();
+    static std::atomic<std::uint64_t> next { 1 };
+    return process_nonce ^ (next.fetch_add(1, std::memory_order_relaxed) * 0x9e3779b97f4a7c15ull);
+}
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
-    llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    if (state_copy_blocked(__func__)) {
+        return 0;
+    }
+    if (seq_id < -1 || (seq_id >= 0 && (uint32_t) seq_id >= n_seq_max())) {
+        LLAMA_LOG_ERROR("%s: invalid sequence id %d\n", __func__, seq_id);
+        return 0;
+    }
+
     try {
-        io.write(&io_magic, sizeof(io_magic));
-        io.write(&seq_id, sizeof(seq_id));
+        llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
         if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
             // fixed-size placeholder; get_data writes the real generation
-            const std::uint64_t generation = 0;
-            io.write(&generation, sizeof(generation));
+            state_seq_write_device_header(io, seq_id, state_seq_device_id, 0);
+        } else {
+            state_seq_write_host_header(io, seq_id);
         }
 
         return state_seq_write_data(io, seq_id, flags);
@@ -8844,22 +9088,52 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
-    std::unique_ptr<llama_io_write_i> io;
-    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-        io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
-    } else {
-        io = std::make_unique<llama_io_write_host>(dst, size);
+    if (state_copy_blocked(__func__)) {
+        return 0;
+    }
+    if (seq_id < -1 || (seq_id >= 0 && (uint32_t) seq_id >= n_seq_max())) {
+        LLAMA_LOG_ERROR("%s: invalid sequence id %d\n", __func__, seq_id);
+        return 0;
     }
 
+    std::unique_ptr<llama_io_write_i> io;
     try {
-        io->write(&io_magic, sizeof(io_magic));
-        io->write(&seq_id, sizeof(seq_id));
+        llama_memory_buffers new_storage;
+        std::uint64_t generation = 0;
+
         if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-            const std::uint64_t generation = ++mem_storage_gen[seq_id];
-            io->write(&generation, sizeof(generation));
+            // Build the new snapshot in new_storage and commit it only after
+            // the device copy finished. A failed capture therefore leaves the
+            // previous snapshot and its generation intact.
+            const std::uint64_t current_generation = mem_storage_gen[seq_id];
+            if (current_generation == std::numeric_limits<std::uint64_t>::max()) {
+                throw std::runtime_error("device state generation exhausted");
+            }
+            generation = current_generation + 1;
+            io = std::make_unique<llama_io_write_device>(dst, size, new_storage);
+            state_seq_write_device_header(*io, seq_id, state_seq_device_id, generation);
+        } else {
+            io = std::make_unique<llama_io_write_host>(dst, size);
+            state_seq_write_host_header(*io, seq_id);
         }
 
-        return state_seq_write_data(*io, seq_id, flags);
+        const size_t written = state_seq_write_data(*io, seq_id, flags);
+
+        // The device writer returns false only for an impossible Meta preflight.
+        // The new staging is discarded and the old snapshot remains valid; a
+        // copy that started and threw is also confined to the new staging. No
+        // format is switched and no unproven state is set.
+        if (!io->finalize()) {
+            LLAMA_LOG_ERROR("%s: device state copy unsupported\n", __func__);
+            return 0;
+        }
+
+        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            mem_storage[seq_id] = std::move(new_storage);
+            mem_storage_gen[seq_id] = generation;
+        }
+
+        return written;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
@@ -8870,56 +9144,106 @@ size_t llama_context::state_seq_set_data(llama_seq_id          seq_id,
                                          const uint8_t *       src,
                                          size_t                size,
                                          llama_state_seq_flags flags) {
+    if (state_copy_blocked(__func__)) {
+        return 0;
+    }
+    if (seq_id < -1 || (seq_id >= 0 && (uint32_t) seq_id >= n_seq_max())) {
+        LLAMA_LOG_ERROR("%s: invalid destination sequence id %d\n", __func__, seq_id);
+        return 0;
+    }
+
+    return state_seq_set_data_impl(seq_id, src, size, flags);
+}
+
+size_t llama_context::state_seq_set_data_impl(llama_seq_id          seq_id,
+                                              const uint8_t *       src,
+                                              size_t                size,
+                                              llama_state_seq_flags flags) {
+    if (state_copy_blocked(__func__)) {
+        return 0;
+    }
+    if (seq_id < -1 || (seq_id >= 0 && (uint32_t) seq_id >= n_seq_max())) {
+        LLAMA_LOG_ERROR("%s: invalid destination sequence id %d\n", __func__, seq_id);
+        return 0;
+    }
+
+    bool restore_started = false;
     std::unique_ptr<llama_io_read_i> io;
     try {
         if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
             // Read the metadata header first. The device tensor copy lives in
             // mem_storage[seq_id]; a restore without a prior capture must fail
             // with 0 instead of aborting.
-            auto header = std::make_unique<llama_io_read_host>(src, size);
+            llama_io_read_host header_io(src, size);
+            const state_seq_device_header header = state_seq_read_device_header(header_io);
 
-            uint32_t magic_read;
-            header->read(&magic_read, sizeof(magic_read));
-            if (io_magic != magic_read) {
-                throw std::runtime_error("wrong sequence state magic");
-            }
-
-            llama_seq_id seq_id_read;
-            header->read(&seq_id_read, sizeof(seq_id_read));
-
-            std::uint64_t generation_read = 0;
-            header->read(&generation_read, sizeof(generation_read));
-
-            const auto it = mem_storage.find(seq_id_read);
-            if (it == mem_storage.end()) {
-                LLAMA_LOG_ERROR("%s: no device snapshot for seq %d\n", __func__, seq_id_read);
+            if (header.context_id != state_seq_device_id) {
+                LLAMA_LOG_ERROR("%s: device snapshot for seq %d belongs to another context\n", __func__, header.seq_id);
                 return 0;
             }
-            if (mem_storage_gen[seq_id_read] != generation_read) {
-                LLAMA_LOG_ERROR("%s: device snapshot for seq %d was overwritten\n", __func__, seq_id_read);
+            if (header.generation == 0) {
+                LLAMA_LOG_ERROR("%s: device snapshot for seq %d has no committed generation\n", __func__, header.seq_id);
                 return 0;
             }
 
-            io = std::make_unique<llama_io_read_device>(src, size, it->second);
+            const auto it  = mem_storage.find(header.seq_id);
+            const auto git = mem_storage_gen.find(header.seq_id);
+            if (it == mem_storage.end() || git == mem_storage_gen.end() || git->second != header.generation) {
+                LLAMA_LOG_ERROR("%s: no current device snapshot for seq %d\n", __func__, header.seq_id);
+                return 0;
+            }
+
+            if (!reserve_state_copy_contexts(state_copy_retired.size() + it->second.size())) {
+                LLAMA_LOG_ERROR("%s: failed to reserve retained copy contexts\n", __func__);
+                return 0;
+            }
+            io = std::make_unique<llama_io_read_device>(src, size, it->second, this);
+
+            // The device reader consumes the same header before the state.
+            const state_seq_device_header header_again = state_seq_read_device_header(*io);
+            if (header_again.seq_id != header.seq_id ||
+                header_again.context_id != header.context_id ||
+                header_again.generation != header.generation) {
+                throw std::runtime_error("device state header changed between reads");
+            }
         } else {
             io = std::make_unique<llama_io_read_host>(src, size);
+            state_seq_read_host_header(*io);
         }
 
-        uint32_t magic_read;
-        io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
-            throw std::runtime_error("wrong sequence state magic");
+        // From here on the memory module may already have modified the
+        // destination sequence. A failure clears that sequence rather than
+        // leaving a mixed attention/recurrent state.
+        restore_started = true;
+        const size_t read = state_seq_read_data(*io, seq_id, flags);
+
+        // The device reader returns false only for an impossible Meta preflight
+        // before any Meta copy. The ON_DEVICE call returns 0; the target may
+        // have been prepared by the memory module. No format is switched.
+        if (!io->finalize()) {
+            LLAMA_LOG_ERROR("%s: device state copy unsupported\n", __func__);
+            return 0;
         }
 
-        llama_seq_id seq_id_read;
-        io->read(&seq_id_read, sizeof(seq_id_read));
-        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-            std::uint64_t generation_read = 0;
-            io->read(&generation_read, sizeof(generation_read));
-        }
-
-        return state_seq_read_data(*io, seq_id, flags);
+        return read;
     } catch (const std::exception & err) {
+        auto * reader = dynamic_cast<llama_io_read_device *>(io.get());
+        if (restore_started && reader != nullptr && reader->has_meta_buffer()) {
+            // A Meta copy started and threw: partial/unknown. No fallback is
+            // attempted and unproven is not cleared.
+            mark_state_copy_unproven();
+            LLAMA_LOG_ERROR("%s: error loading device state: %s\n", __func__, err.what());
+            return 0;
+        }
+        if (restore_started && memory && !llama_state_copy_unproven()) {
+            // The destination sequence may be partially restored. Drop it so
+            // the failed load cannot leave a mixed attention/recurrent state.
+            try {
+                memory->seq_rm(seq_id, -1, -1);
+            } catch (...) {
+                // Best effort; report the original failure below.
+            }
+        }
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
     }
@@ -8929,6 +9253,9 @@ bool llama_context::state_load_file(const char *  filepath,
                                     llama_token * tokens_out,
                                     size_t        n_token_capacity,
                                     size_t *      n_token_count_out) {
+    if (state_copy_blocked(__func__)) {
+        return false;
+    }
     llama_file file(filepath, "rb");
 
     // sanity checks
@@ -8961,12 +9288,22 @@ bool llama_context::state_load_file(const char *  filepath,
         const size_t n_state_size_cur = file.size() - file.tell();
 
         llama_io_read_file io(&file);
-        const size_t       n_read = state_read_data(io);
+        try {
+            const size_t n_read = state_read_data(io);
 
-        if (n_read != n_state_size_cur) {
-            LLAMA_LOG_ERROR("%s: did not read all of the session file data! size %zu, got %zu\n", __func__,
-                            n_state_size_cur, n_read);
-            return false;
+            if (n_read != n_state_size_cur) {
+                LLAMA_LOG_ERROR("%s: did not read all of the session file data! size %zu, got %zu\n", __func__,
+                                n_state_size_cur, n_read);
+                if (memory) {
+                    try { memory->seq_rm(-1, -1, -1); } catch (...) {}
+                }
+                return false;
+            }
+        } catch (...) {
+            if (memory) {
+                try { memory->seq_rm(-1, -1, -1); } catch (...) {}
+            }
+            throw;
         }
     }
 
@@ -8974,6 +9311,9 @@ bool llama_context::state_load_file(const char *  filepath,
 }
 
 bool llama_context::state_save_file(const char * filepath, const llama_token * tokens, size_t n_token_count) {
+    if (state_copy_blocked(__func__)) {
+        return false;
+    }
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_SESSION_MAGIC);
@@ -8995,6 +9335,14 @@ size_t llama_context::state_seq_load_file(llama_seq_id  seq_id,
                                           llama_token * tokens_out,
                                           size_t        n_token_capacity,
                                           size_t *      n_token_count_out) {
+    if (state_copy_blocked(__func__)) {
+        return 0;
+    }
+    if (seq_id < -1 || (seq_id >= 0 && (uint32_t) seq_id >= n_seq_max())) {
+        LLAMA_LOG_ERROR("%s: invalid sequence id %d\n", __func__, seq_id);
+        return 0;
+    }
+
     llama_file file(filepath, "rb");
 
     // version checks
@@ -9025,15 +9373,32 @@ size_t llama_context::state_seq_load_file(llama_seq_id  seq_id,
 
     // restore the context state
     {
-        const size_t       state_size = file.size() - file.tell();
+        const size_t state_size = file.size() - file.tell();
+
         llama_io_read_file io(&file);
-        const size_t       nread = state_seq_read_data(io, seq_id, 0);
-        if (!nread) {
-            LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
-            return 0;
+        try {
+            const size_t nread = state_seq_read_data(io, seq_id, 0);
+            if (!nread) {
+                LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
+                if (memory) {
+                    try { memory->seq_rm(seq_id, -1, -1); } catch (...) {}
+                }
+                return 0;
+            }
+            if (nread > state_size ||
+                nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out != file.tell()) {
+                LLAMA_LOG_ERROR("%s: inconsistent sequence state file size\n", __func__);
+                if (memory) {
+                    try { memory->seq_rm(seq_id, -1, -1); } catch (...) {}
+                }
+                return 0;
+            }
+        } catch (...) {
+            if (memory) {
+                try { memory->seq_rm(seq_id, -1, -1); } catch (...) {}
+            }
+            throw;
         }
-        GGML_ASSERT(nread <= state_size);
-        GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
     }
 
     return file.tell();
@@ -9043,6 +9408,14 @@ size_t llama_context::state_seq_save_file(llama_seq_id        seq_id,
                                           const char *        filepath,
                                           const llama_token * tokens,
                                           size_t              n_token_count) {
+    if (state_copy_blocked(__func__)) {
+        return 0;
+    }
+    if (seq_id < -1 || (seq_id >= 0 && (uint32_t) seq_id >= n_seq_max())) {
+        LLAMA_LOG_ERROR("%s: invalid sequence id %d\n", __func__, seq_id);
+        return 0;
+    }
+
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_STATE_SEQ_MAGIC);
@@ -9919,11 +10292,15 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 }
 
 void llama_synchronize(llama_context * ctx) {
+    if (ctx->has_unproven()) {
+        LLAMA_LOG_ERROR("%s: unproven submission; refusing to synchronize\n", __func__);
+        return;
+    }
     ctx->synchronize();
 }
 
 bool llama_memory_release_compute(llama_context * ctx) {
-    return ctx != nullptr && ctx->release_compute();
+    return ctx != nullptr && !ctx->has_unproven() && ctx->release_compute();
 }
 
 uint64_t llama_memory_compute_bytes(const llama_context * ctx) {
@@ -9931,12 +10308,18 @@ uint64_t llama_memory_compute_bytes(const llama_context * ctx) {
 }
 
 float * llama_get_logits(llama_context * ctx) {
+    if (ctx->has_unproven()) {
+        return nullptr;
+    }
     ctx->synchronize();
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+    if (ctx->has_unproven()) {
+        return nullptr;
+    }
     ctx->synchronize();
 
     float * res = nullptr;
@@ -9956,7 +10339,7 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 // synchronize). Only the host-side output reorder and row resolution happen
 // here.
 float * llama_get_logits_ith_no_sync(llama_context * ctx, int32_t i) {
-    if (ctx == nullptr) {
+    if (ctx == nullptr || ctx->has_unproven()) {
         return nullptr;
     }
 
@@ -9971,18 +10354,27 @@ float * llama_get_logits_ith_no_sync(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
+    if (ctx->has_unproven()) {
+        return nullptr;
+    }
     ctx->synchronize();
 
     return ctx->get_embeddings();
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
+    if (ctx->has_unproven()) {
+        return nullptr;
+    }
     ctx->synchronize();
 
     return ctx->get_embeddings_ith(i);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+    if (ctx->has_unproven()) {
+        return nullptr;
+    }
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
@@ -10210,12 +10602,18 @@ void llama_attention_clear_views(llama_context * ctx) {
 }
 
 bool llama_memory_seq_rm_recurrent(llama_memory_t mem, llama_seq_id seq_id) {
-    return mem && seq_id >= 0 && mem->seq_rm_recurrent(seq_id);
+    return mem && !mem->has_unproven() && seq_id >= 0 && mem->seq_rm_recurrent(seq_id);
 }
 
 bool llama_memory_clear(llama_memory_t mem, bool data) {
     if (!mem) {
         return true;
+    }
+    if (mem->has_unproven()) {
+        // An unproven device copy leaves the destination unknown; the clear
+        // cannot claim a completed recovery. Report the refusal through the
+        // bool contract so the caller fails closed.
+        return false;
     }
 
     return mem->clear(data);
@@ -10224,6 +10622,9 @@ bool llama_memory_clear(llama_memory_t mem, bool data) {
 bool llama_memory_seq_rm(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (!mem) {
         return true;
+    }
+    if (mem->has_unproven()) {
+        return false;
     }
 
     return mem->seq_rm(seq_id, p0, p1);
@@ -10234,7 +10635,7 @@ void llama_memory_seq_cp(llama_memory_t mem,
                          llama_seq_id   seq_id_dst,
                          llama_pos      p0,
                          llama_pos      p1) {
-    if (!mem) {
+    if (!mem || mem->has_unproven()) {
         return;
     }
 
@@ -10242,7 +10643,7 @@ void llama_memory_seq_cp(llama_memory_t mem,
 }
 
 void llama_memory_seq_keep(llama_memory_t mem, llama_seq_id seq_id) {
-    if (!mem) {
+    if (!mem || mem->has_unproven()) {
         return;
     }
 
@@ -10250,7 +10651,7 @@ void llama_memory_seq_keep(llama_memory_t mem, llama_seq_id seq_id) {
 }
 
 void llama_memory_seq_add(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
-    if (!mem) {
+    if (!mem || mem->has_unproven()) {
         return;
     }
 
@@ -10258,7 +10659,7 @@ void llama_memory_seq_add(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0,
 }
 
 void llama_memory_seq_div(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
-    if (!mem) {
+    if (!mem || mem->has_unproven()) {
         return;
     }
 
@@ -10326,10 +10727,16 @@ bool llama_save_session_file(llama_context *     ctx,
 // Returns the *actual* size of the state.
 // Intended to be used when saving to state to a buffer.
 size_t llama_state_get_size(llama_context * ctx) {
+    if (ctx->has_unproven()) {
+        return 0;
+    }
     return ctx->state_get_size();
 }
 
 size_t llama_state_get_data(llama_context * ctx, uint8_t * dst, size_t size) {
+    if (ctx->has_unproven()) {
+        return 0;
+    }
     ctx->synchronize();
 
     return ctx->state_get_data(dst, size);
@@ -10337,6 +10744,9 @@ size_t llama_state_get_data(llama_context * ctx, uint8_t * dst, size_t size) {
 
 // Sets the state reading from the specified source address
 size_t llama_state_set_data(llama_context * ctx, const uint8_t * src, size_t size) {
+    if (ctx->has_unproven()) {
+        return 0;
+    }
     ctx->synchronize();
 
     return ctx->state_set_data(src, size);
@@ -10347,6 +10757,9 @@ bool llama_state_load_file(llama_context * ctx,
                            llama_token *   tokens_out,
                            size_t          n_token_capacity,
                            size_t *        n_token_count_out) {
+    if (ctx->has_unproven()) {
+        return false;
+    }
     ctx->synchronize();
 
     try {
@@ -10361,6 +10774,9 @@ bool llama_state_save_file(llama_context *     ctx,
                            const char *        path_session,
                            const llama_token * tokens,
                            size_t              n_token_count) {
+    if (ctx->has_unproven()) {
+        return false;
+    }
     ctx->synchronize();
 
     try {
@@ -10384,6 +10800,9 @@ size_t llama_state_seq_set_data(llama_context * ctx, const uint8_t * src, size_t
 }
 
 size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (ctx->has_unproven()) {
+        return 0;
+    }
     return ctx->state_seq_get_size(seq_id, flags);
 }
 
@@ -10392,6 +10811,9 @@ size_t llama_state_seq_get_data_ext(llama_context *       ctx,
                                     size_t                size,
                                     llama_seq_id          seq_id,
                                     llama_state_seq_flags flags) {
+    if (ctx->has_unproven()) {
+        return 0;
+    }
     ctx->synchronize();
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
@@ -10402,6 +10824,9 @@ size_t llama_state_seq_set_data_ext(llama_context *       ctx,
                                     size_t                size,
                                     llama_seq_id          seq_id,
                                     llama_state_seq_flags flags) {
+    if (ctx->has_unproven()) {
+        return 0;
+    }
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
@@ -10412,6 +10837,9 @@ size_t llama_state_seq_save_file(llama_context *     ctx,
                                  llama_seq_id        seq_id,
                                  const llama_token * tokens,
                                  size_t              n_token_count) {
+    if (ctx->has_unproven()) {
+        return 0;
+    }
     ctx->synchronize();
 
     try {
@@ -10428,6 +10856,9 @@ size_t llama_state_seq_load_file(llama_context * ctx,
                                  llama_token *   tokens_out,
                                  size_t          n_token_capacity,
                                  size_t *        n_token_count_out) {
+    if (ctx->has_unproven()) {
+        return 0;
+    }
     ctx->synchronize();
 
     try {
@@ -10441,6 +10872,9 @@ size_t llama_state_seq_load_file(llama_context * ctx,
 ///
 
 int32_t llama_encode(llama_context * ctx, llama_batch batch) {
+    if (ctx->has_unproven()) {
+        return -1;
+    }
     const int ret = ctx->encode(batch);
     if (ret != 0) {
         LLAMA_LOG_ERROR("%s: failed to encode, ret = %d\n", __func__, ret);
@@ -10450,6 +10884,9 @@ int32_t llama_encode(llama_context * ctx, llama_batch batch) {
 }
 
 int32_t llama_decode(llama_context * ctx, llama_batch batch) {
+    if (ctx->has_unproven()) {
+        return -1;
+    }
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);

@@ -7,12 +7,31 @@
 // tensor bytes live in ctx->mem_storage[seq_id] and are owned by the context.
 // In device mode this class cannot see or validate that device copy: the caller
 // must keep the context alive and must not overwrite the device snapshot
-// between capture and restore. A second ON_DEVICE capture for the same seq
-// replaces mem_storage[seq]; the device metadata carries a generation, so
-// restoring the older metadata returns 0 from llama_state_seq_set_data_ext
-// instead of silently copying the newer tensors. The current size and valid
-// flag identify the bytes in this object's storage only; they do not identify
-// the device snapshot.
+// between capture and restore. The device metadata is versioned and carries
+// the owning context identity and a generation. Restoring it in another
+// context, restoring older metadata after a second ON_DEVICE capture for the
+// same seq, or passing truncated/corrupt metadata returns 0 from
+// llama_state_seq_set_data_ext instead of silently copying the wrong tensors
+// or aborting. The context API commits a device capture after the buffer
+// cpy_tensor/blocking fallback copy returns (CUDA/CPU); a Meta destination is
+// split into its real child buffers and copied child by child after a full
+// preflight (split state, view, buffer/data, type/shape/nbytes); false leaves
+// the destination untouched, the ON_DEVICE call returns 0 and does not mark
+// unproven; the caller explicitly requests the host format for a host blob.
+// The ON_DEVICE blob is a device metadata handle, not the full host state; the
+// host blob is a separate format with tensor bytes. True means all child
+// copies completed; a started copy that throws is partial/unknown: the
+// ON_DEVICE restore returns 0 and marks/retains, the capture returns 0 with
+// the old snapshot, no fallback runs and unproven is not cleared. A
+// CUDA_CHECK abort is not a returned status.
+// A failed capture leaves the previous device snapshot valid. An unproven
+// device copy is fail-stop: the context retains the source, destination,
+// backends and model, and llama_free retains the context. Non-Meta device
+// errors keep the clear-on-failure policy; a cross-context device blob is
+// rejected by its context id. Host-flag restores follow the memory
+// clear-on-failure policy; no host rollback is performed.
+// The current size and valid flag identify the bytes in this object's storage
+// only; they do not identify the device snapshot.
 //
 // The storage survives across verify epochs. The current snapshot size and an
 // explicit valid flag identify the bytes that belong to this epoch, so a buffer

@@ -97,6 +97,14 @@ struct llama_context {
 
     ggml_backend_sched_t get_sched() const;
 
+    // Retain a staging snapshot/context after an unproven device copy. The
+    // context is fail-stop and llama_free retains it, so these resources stay
+    // alive until the owner resolves the submission.
+    void retire_state_snapshot(llama_memory_buffers && storage);
+    bool reserve_state_copy_contexts(size_t n);
+    void retire_state_copy_context(ggml_context_ptr && ctx);
+    void mark_state_copy_unproven();
+
     ggml_backend_t get_tp5_relay_backend() const { return backend_tp5_relay; }
     ggml_backend_t get_quantized_matmul_f32_backend() const { return backend_quantized_matmul_f32; }
 
@@ -236,6 +244,7 @@ struct llama_context {
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+    size_t state_seq_set_data_impl(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
     bool state_load_file(
             const char * filepath,
@@ -488,6 +497,9 @@ private:
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
+    bool state_copy_blocked(const char * func);
+    static std::uint64_t state_seq_device_id_next();
+
     //
     // members
     //
@@ -675,9 +687,17 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
-    // generation of each device snapshot; a later capture for the same seq
-    // replaces mem_storage[seq], so older metadata must not restore it
+    // generation of each device snapshot, committed only after the device
+    // copy finished; a later capture for the same seq replaces mem_storage[seq],
+    // so older metadata must not restore it
     std::map<llama_seq_id, std::uint64_t> mem_storage_gen;
+    // staging resources retained after an unproven device copy
+    std::vector<llama_memory_buffers> mem_storage_retired;
+    std::vector<ggml_context_ptr>     state_copy_retired;
+    bool state_copy_unproven = false;
+    // identity written into ON_DEVICE metadata; device snapshots are
+    // context-local because the tensor bytes live in this context
+    std::uint64_t state_seq_device_id = state_seq_device_id_next();
 
     bool has_evaluated_once = false;
     // Observation state for the last memory_update(): failed distinguishes a

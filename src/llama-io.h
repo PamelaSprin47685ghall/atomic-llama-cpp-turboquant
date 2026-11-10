@@ -17,6 +17,12 @@ public:
     // bytes written so far
     virtual size_t n_bytes() = 0;
 
+    // Finish deferred work (for example, device tensor copies). Returns false
+    // when a copy submission is unproven and its resources must be retained.
+    // The default is true because host and file streams finish their work
+    // synchronously or in the destructor.
+    virtual bool finalize() { return true; }
+
     void write_string(const std::string & str);
 };
 
@@ -30,6 +36,9 @@ public:
 
     // bytes read so far
     virtual size_t n_bytes() = 0;
+
+    // Finish deferred work. See llama_io_write_i::finalize().
+    virtual bool finalize() { return true; }
 
     void read_string(std::string & str);
 };

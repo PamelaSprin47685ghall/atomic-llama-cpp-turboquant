@@ -321,6 +321,10 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
     // Migrate KV cache from seq 0 to seq 1 (on-device path)
     {
         std::vector<uint8_t> seq_store(llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+        if (seq_store.empty()) {
+            LOG_ERR("\n%s: empty on-device sequence state\n", __func__);
+            return false;
+        }
         const size_t ncopy = llama_state_seq_get_data_ext(ctx.get(), seq_store.data(), seq_store.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
         if (ncopy != seq_store.size()) {
             LOG_ERR("\n%s: seq copy data length %zd does not match expected length %zd\n", __func__, ncopy, seq_store.size());

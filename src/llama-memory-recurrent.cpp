@@ -909,8 +909,11 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
         cell_ranges.emplace_back(cell_range_begin, size);
     }
 
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && cell_ranges.size() > 1) {
-        GGML_ABORT("cannot save/load multiple ranges of cells to/from device memory\n");
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && cell_ranges_data.size() > 1) {
+        // This is a legal host state shape, but the device copy is defined
+        // only for one contiguous range. Report it through the state API's
+        // zero-return path instead of aborting the process.
+        throw std::runtime_error("cannot save/load multiple ranges of cells to/from device memory");
     }
 
     // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count
@@ -949,10 +952,12 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     }
 
     if (!res) {
-        if (seq_id == -1) {
-            clear(true);
-        } else {
-            seq_rm(seq_id, -1, -1);
+        if (!llama_state_copy_unproven()) {
+            if (seq_id == -1) {
+                clear(true);
+            } else {
+                seq_rm(seq_id, -1, -1);
+            }
         }
         throw std::runtime_error("failed to restore kv cache");
     }
@@ -1082,6 +1087,11 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id) {
     if (dest_seq_id != -1) {
         // single sequence
+        if (cell_count > size) {
+            LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
+            return false;
+        }
+
         seq_rm(dest_seq_id, -1, -1);
 
         if (cell_count == 0) {

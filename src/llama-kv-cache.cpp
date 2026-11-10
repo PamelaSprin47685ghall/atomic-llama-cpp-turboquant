@@ -4285,11 +4285,15 @@ const slot_info_vec_t *   sinfos_in) {
         throw std::runtime_error("n_stream mismatch");
     }
 
-    // a whole-context restore replaces every stream, so the cache is emptied once here. clear()
-    // resets all streams at once, so doing this per stream below would throw away the streams
-    // already read and leave only the last one
+    // A restore replaces the destination. Clear it before reading so an empty
+    // source or a source shorter than the old destination cannot leave stale
+    // cells behind. A whole-context restore replaces every stream, so clear()
+    // resets all streams at once; doing this per stream below would throw away
+    // the streams already read and leave only the last one.
     if (seq_id == -1) {
         clear(true);
+    } else if (!seq_rm(seq_id, -1, -1)) {
+        throw std::runtime_error("failed to clear destination sequence before restore");
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -4318,10 +4322,12 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         if (!res) {
-            if (seq_id == -1) {
-                clear(true);
-            } else {
-                seq_rm(seq_id, -1, -1);
+            if (!llama_state_copy_unproven()) {
+                if (seq_id == -1) {
+                    clear(true);
+                } else {
+                    seq_rm(seq_id, -1, -1);
+                }
             }
             throw std::runtime_error("failed to restore kv cache");
         }

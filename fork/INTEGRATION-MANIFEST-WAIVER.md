@@ -1414,6 +1414,141 @@ their actual post-integration hashes. `tests/test-kv-cells-journal-ownership.cpp
 has no manifest entry and was not added. Existing K-shift entries and stale
 red items were not re-signed.
 
+### E.16 ON_DEVICE checkpoint contract repair round 2026-11-09
+
+Fixes candidate `507dded7c` and the first review round. The host sequence blob
+keeps its existing 8 B magic/seq_id header, so existing host states remain
+readable and writable and host restore remains legal across contexts. The
+device blob has a private 28 B versioned header (device magic, seq_id, version,
+context identity, generation); it is context-bound. A device blob passed with
+host or PARTIAL_ONLY flags is rejected before any memory module sees it, and
+vice versa. The sequence file format (v3) and the whole-context state format
+are unchanged. The device blob is a private context-local handle: a
+prior-version device blob cannot reference a live `mem_storage` snapshot in a
+new context, so the version bump returns 0 instead of silently using a
+different snapshot. Host blobs and file v3 remain compatible.
+
+Boundaries and transactions:
+
+- get_size/get_data/set_data and sequence save/load file allow seq_id == -1
+  (all sequences, matching the internal sequence state paths) and reject
+  seq_id < -1 or >= n_seq_max with 0 instead of reaching a memory-module
+  assert.
+- The recurrent single-sequence restore checks `cell_count <= size` before
+  clearing the destination or reserving a ubatch.
+- A single-sequence KV restore clears the destination seq first, so an empty or
+  shorter source cannot leave stale attention.
+- Device state copies try the destination buffer `cpy_tensor` (bool) and fall
+  back to `ggml_backend_tensor_copy`. The CUDA buffer `cpy_tensor` synchronizes
+  the per-thread stream and the CPU buffer blocks; these are complete at return
+  and normal async streams are not disabled. A Meta destination is split into
+  its real child buffers and each child is copied with the child buffer's
+  `cpy_tensor` (blocking fallback); the staging owner is not used. The Meta
+  child copy preflights every child (exact split state, simple view,
+  buffer/data, type/shape/nbytes) before any side effect: false means
+  preflight/unsupported with the destination untouched; true means all child
+  blocking copies completed. A false preflight is no-side-effect unsupported:
+  the ON_DEVICE call returns 0 and does not mark unproven; the caller must
+  explicitly request the host format (host flags) for a host blob. The
+  ON_DEVICE blob is a device metadata handle, not the full host state; the host
+  blob is a separate format whose size includes the tensor bytes. A started
+  copy that throws is partial/unknown: the ON_DEVICE restore returns 0 and
+  marks/retains; the capture returns 0 with the old snapshot; no fallback runs
+  and unproven is not cleared. Non-Meta device errors keep clear-on-failure; a
+  cross-context device blob is rejected by its context id. A legal Meta child
+  copy completes the ON_DEVICE capture/restore. A CUDA_CHECK abort is not a
+  returned status. The generic `ggml_backend_tensor_copy` fallback checks its
+  malloc. The staging map/copy contexts are retired on a partial restore copy;
+  the capture's new staging is discarded with no unproven; a partial restore
+  sets `state_copy_unproven` and marks the memory unproven.
+  `has_unproven()` makes `llama_free` retain the whole context (source,
+  destination, backends, model); the state API returns 0. The memory modules
+  and the outer state catch check `llama_state_copy_unproven()` and skip
+  `seq_rm`/`clear`, so the destination cells remain owned by the retained
+  context. Public memory mutators refuse while the memory is unproven.
+- A device capture builds a fresh buffer map and swaps it in after the
+  CUDA/CPU/Meta child blocking copy returns. A failed capture leaves the
+  previous snapshot and generation intact; the new staging is discarded and no
+  unproven state is set. The old and new buffers coexist until the swap, so peak device
+  memory is about twice the snapshot size; the 512 MiB cap is gone and no
+  fixed cap replaces it.
+- `llama_tp5_context_staging_drain` from `/home/kunweiz/work/r28b-pillar5-sync-owner-v4-e123`
+  @7fac3140f is not used. Static comparison: with no relay backend it returns
+  DRAINED without querying the memory backend, while an ordinary checkpoint
+  D2D copy can still be async there; with a relay backend it drains the
+  staging provider/owner, not the CUDA buffer `cpy_tensor` blocking copy. The
+  CUDA copy is not owned by that staging owner. The checkpoint does not
+  integrate it. The Meta destination is split into real child buffers and each
+  child is copied with the child buffer's `cpy_tensor`; the staging owner is
+  not involved in those child copies. The staging candidate is pending review
+  and is not a dependency. The staging owner confirms that 7fac3140f is
+  superseded by an uncommitted rework, that staging DRAINED must not be used
+  for an ordinary D2D checkpoint copy, and that an explicit memory-backend
+  producer registration or UNKNOWN may be added later; the checkpoint does not
+  need it for the child split.
+- t9 M1 (a completed Meta child copy marked unproven by
+  `state_copy_events_wait`) is stale for this worktree: the current
+  `src/llama-context.cpp` has no `state_copy_events_wait` or
+  `ggml_backend_event`; the Meta path uses `ggml_backend_buffer_copy_tensor`.
+  The current Meta CPU test exercises that path. t9 M2/M3/M5 (view/split
+  preflight and partial-child fallback) are fixed by the full preflight, the
+  no-false-after-side-effect copy loop, and the explicit unsupported contract
+  (ON_DEVICE returns 0; the caller requests the host format explicitly); the
+  actual state API Meta test covers a bad-split context, cross-context device
+  rejection and host restore. M4 (CUDA_CHECK abort) is a backend fatal, not a
+  returned status; M6 GPU/HIP remains uncovered.
+- Host-flag and file restores have no rollback and allocate no full host
+  backup. A failed host/file restore returns 0/false and the destination
+  follows the memory clear-on-failure policy. Device unproven copies use the
+  fail-stop retention above.
+- The 512 MiB host-size proxy is gone; the runtime requires a positive host
+  state size and reports host and metadata bytes separately. Allocation
+  failure is a failed capture and preserves the old snapshot.
+- `common_prompt_checkpoint`'s four update/load methods and their bool callers
+  are owned by the context-lifecycle branch; this branch reverted its 0-size
+  edit and does not change them. The `empty()`/`data_spec` semantics remain
+  with that branch. The save/load test rejects an empty device state.
+- The unreachable live-checkpoint guard was removed.
+- Device views convert byte counts through the type block size (quantized
+  tensors), and the recurrent multi-range device guard now checks the tensor
+  range vector, not the metadata range vector.
+
+Verification: CPU-only `llama` build in an exclusive mktemp directory (r40).
+The narrow state test binary was run once with the tiny Mamba fixture: 83
+PASS, 0 FAIL. It includes the original 14 Meta buffer cases, the existing CPU
+state tests, and the actual state API Meta cases: normal Meta memory
+capture/restore; a second bad-split context device capture/restore;
+cross-context device blob rejected; host-format restore across contexts; the
+normal state unchanged and the context usable. The ON_DEVICE blob remains the
+device metadata handle; the host blob is a separate format. The test binary
+compiles; the runtime, `common.cpp` and `test-save-load-state.cpp` passed
+`-fsyntax-only` checks. The earlier host/-1 and full 69/64 runs predate this
+change and are not rerun. GPU/HIP Meta child copies and the CUDA_CHECK fatal
+path are not run.
+
+Not covered: GPU/HIP Meta child copy completion and the CUDA_CHECK fatal abort
+(a backend fatal, not a returned status), the Meta partial-copy mark/retention
+(the child throw is not triggered), different buft/quantized child layouts,
+the staging owner's receipt (not used; staging candidate pending), allocation,
+a real TP5 MTP run, split-axis or strided quantized views, the recurrent
+multi-range guard (code-reviewed only), host/file target preservation
+(clear-on-failure, no rollback), the staging owner's ordinary-copy receipt (the
+staging candidate is pending review and its drain is not used), old device
+blobs from prior library versions (the private device handle is versioned and
+rejected), `common_prompt_checkpoint`'s bool API/`empty()`/`data_spec` and its
+callers (owned by the context-lifecycle branch; integration must use that bool
+API), ASan/LSan, the full suite and the manifest guard (not rerun), and the
+existing model file/generation tests (not rerun).
+
+Manifest: `src/llama-io.h`, `src/llama-impl.h`, `src/llama-memory-hybrid.cpp`,
+`src/llama-memory-hybrid-idx.cpp`, `tests/test-save-load-state.cpp` and
+`fork/tp5-compose/tests/test-mtp-state-real.cpp` have no entries;
+`include/llama.h`, `src/llama-context.cpp`, `src/llama-context.h`,
+`src/llama-kv-cache.cpp`, `src/llama-memory-recurrent.cpp`,
+`src/llama-memory.h`, `ggml/src/ggml-backend-meta.cpp`,
+`ggml/src/ggml-backend.cpp` and `ggml/src/ggml-backend-impl.h` have existing
+entries whose digests were not updated. The B5-B7 red items remain.
+
 ## F. Why this does not block the integration
 
 - The guard is a manifest boundary check, not a compiler or runtime test. Its failure

@@ -677,6 +677,12 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 
     ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    // Meta buffers report is_host=true when all children are host buffers, but
+    // src/dst->data are logical sentinels, not host addresses. Do not take the
+    // direct host paths below for Meta; route them through the blocking
+    // get/set fallback so the real simple-tensor bytes move.
+    const bool src_meta = ggml_backend_buffer_is_meta(src_buf);
+    const bool dst_meta = ggml_backend_buffer_is_meta(dst_buf);
     // A Meta destination needs the source tensor identity for staging slot
     // selection. cpy_tensor is the only buffer hook that receives src; the
     // blocking set path below sees only the scheduler's decorated copy. A
@@ -686,9 +692,9 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
             ggml_backend_buffer_copy_tensor(src, dst)) {
         return;
     }
-    if (ggml_backend_buffer_is_host(src_buf)) {
+    if (ggml_backend_buffer_is_host(src_buf) && !src_meta && !dst_meta) {
         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
-    } else if (ggml_backend_buffer_is_host(dst_buf)) {
+    } else if (ggml_backend_buffer_is_host(dst_buf) && !src_meta && !dst_meta) {
         ggml_backend_moe_cache_invalidate_buffer(
                 dst_buf, dst->data, ggml_nbytes(dst));
         ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
@@ -698,6 +704,9 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 #endif // NDEBUG
         size_t nbytes = ggml_nbytes(src);
         void * data = malloc(nbytes);
+        if (data == nullptr) {
+            GGML_ABORT("%s: failed to allocate %zu bytes for the copy fallback\n", __func__, nbytes);
+        }
         ggml_backend_tensor_get(src, data, 0, nbytes);
         ggml_backend_tensor_set(dst, data, 0, nbytes);
         free(data);

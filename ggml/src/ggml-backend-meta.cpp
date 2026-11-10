@@ -1738,7 +1738,7 @@ static void ggml_backend_meta_buffer_memset_tensor(
             ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
-    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
         GGML_ASSERT(tensor->ne[3] == 1);
@@ -1846,7 +1846,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
             (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
              split_state.n_segments == 1 && split_state.nr[0] == 1));
 
-    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
         GGML_ASSERT(tensor->ne[3] == 1);
@@ -1864,6 +1864,23 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
             GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
 
             const int64_t blck_size = ggml_blck_size(tensor->type);
+            if (tensor->ne[1] == 1) {
+                for (size_t s = 0; s < split_state.n_segments; s++) {
+                    for (size_t r = 0; r < split_state.nr[s]; r++) {
+                        for (size_t j = 0; j < n_bufs; j++) {
+                            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                            GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
+                            const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
+                            ggml_backend_tensor_set(simple_tensor, (const char *) data + offset_data,
+                                simple_offsets[j], nbytes);
+                            offset_data       += nbytes;
+                            simple_offsets[j] += nbytes;
+                        }
+                    }
+                }
+                GGML_ASSERT(offset_data == size);
+                return;
+            }
             for (size_t s = 0; s < split_state.n_segments; s++) {
                 for (size_t r = 0; r < split_state.nr[s]; r++) {
                     for (size_t j = 0; j < n_bufs; j++) {
@@ -2163,6 +2180,77 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 // a child write or enqueue is possible the function returns true and the
 // existing fail-stop/partial publication owns the error, so the caller never
 // replays a destination that may have been partially written.
+static bool ggml_backend_meta_split_state_equal(
+        const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b, size_t n_bufs) {
+    if (a.axis != b.axis || a.n_segments != b.n_segments) {
+        return false;
+    }
+    for (size_t s = 0; s < a.n_segments; s++) {
+        if (a.nr[s] != b.nr[s]) {
+            return false;
+        }
+        for (size_t j = 0; j < n_bufs; j++) {
+            if (a.ne[s*n_bufs + j] != b.ne[s*n_bufs + j]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Pure preflight for a Meta-to-Meta tensor copy. IMPOSSIBLE leaves both
+// tensors untouched; EXACT uses the child fast copy; SLOW uses the generic
+// host-staging tensor copy with the same ON_DEVICE snapshot/format. The buffer
+// cpy_tensor only takes the EXACT path.
+ggml_backend_meta_copy_kind ggml_backend_meta_buffer_copy_kind(ggml_tensor * src, ggml_tensor * dst) {
+    if (src == nullptr || dst == nullptr) {
+        return GGML_BACKEND_META_COPY_IMPOSSIBLE;
+    }
+    const ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+    const ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (src_buf == nullptr || dst_buf == nullptr ||
+            src->data == nullptr || dst->data == nullptr ||
+            !ggml_are_same_layout(src, dst) ||
+            !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
+            !ggml_backend_buffer_is_meta(src_buf) ||
+            !ggml_backend_buffer_is_meta(dst_buf)) {
+        return GGML_BACKEND_META_COPY_IMPOSSIBLE;
+    }
+    const size_t n_bufs_src = ggml_backend_meta_buffer_n_bufs(src_buf);
+    const size_t n_bufs_dst = ggml_backend_meta_buffer_n_bufs(dst_buf);
+    if (n_bufs_src != n_bufs_dst) {
+        return GGML_BACKEND_META_COPY_IMPOSSIBLE;
+    }
+    const ggml_backend_meta_split_state src_split =
+        ggml_backend_meta_get_split_state(src, /*assume_sync =*/ false);
+    const ggml_backend_meta_split_state dst_split =
+        ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
+    if (!ggml_backend_meta_split_state_equal(src_split, dst_split, n_bufs_src)) {
+        // The whole tensor layout is identical; get/set on each side handle
+        // the different child splits. This is the real Meta slow path.
+        return GGML_BACKEND_META_COPY_SLOW;
+    }
+    for (size_t j = 0; j < n_bufs_src; j++) {
+        ggml_tensor * src_simple = ggml_backend_meta_buffer_simple_tensor(src, j);
+        ggml_tensor * dst_simple = ggml_backend_meta_buffer_simple_tensor(dst, j);
+        if (src_simple == nullptr || dst_simple == nullptr ||
+                src_simple->buffer == nullptr || dst_simple->buffer == nullptr ||
+                src_simple->data == nullptr || dst_simple->data == nullptr) {
+            return GGML_BACKEND_META_COPY_IMPOSSIBLE;
+        }
+        if (src_simple->type != dst_simple->type ||
+                !ggml_are_same_shape(src_simple, dst_simple) ||
+                ggml_nbytes(src_simple) != ggml_nbytes(dst_simple)) {
+            return GGML_BACKEND_META_COPY_SLOW;
+        }
+    }
+    return GGML_BACKEND_META_COPY_EXACT;
+}
+
+bool ggml_backend_meta_buffer_can_copy(ggml_tensor * src, ggml_tensor * dst) {
+    return ggml_backend_meta_buffer_copy_kind(src, dst) == GGML_BACKEND_META_COPY_EXACT;
+}
+
 static bool ggml_backend_meta_buffer_cpy_tensor(
         ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
     if (buffer == nullptr || src == nullptr || dst == nullptr ||
@@ -2172,11 +2260,37 @@ static bool ggml_backend_meta_buffer_cpy_tensor(
     const ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
     const ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
     if (src_buf == nullptr || dst_buf != buffer ||
-            dst->view_src != nullptr || dst->buffer != dst_buf ||
             src->data == nullptr || dst->data == nullptr ||
-            ggml_backend_buffer_is_meta(src_buf) || !ggml_backend_buffer_is_host(src_buf) ||
             !ggml_are_same_layout(src, dst) ||
             !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    // Device-to-device Meta copy: split both tensors into their real child
+    // buffers and copy each child segment with the child buffer's cpy_tensor.
+    // The child cpy_tensor is the actual backend copy (CUDA synchronizes its
+    // per-thread stream; CPU blocks); a false child result falls back to the
+    // blocking tensor copy. The Meta staging owner is not involved.
+    if (ggml_backend_buffer_is_meta(src_buf)) {
+        if (!ggml_backend_meta_buffer_can_copy(const_cast<ggml_tensor *>(src), dst)) {
+            return false;
+        }
+        const size_t n_bufs_src = ggml_backend_meta_buffer_n_bufs(src_buf);
+
+        // The preflight passed. A child failure here may leave earlier children
+        // written; the caller must retain/fail-stop, not replay the destination.
+        for (size_t j = 0; j < n_bufs_src; j++) {
+            ggml_tensor * src_simple = ggml_backend_meta_buffer_simple_tensor(src, j);
+            ggml_tensor * dst_simple = ggml_backend_meta_buffer_simple_tensor(dst, j);
+            if (!ggml_backend_buffer_copy_tensor(src_simple, dst_simple)) {
+                ggml_backend_tensor_copy(src_simple, dst_simple);
+            }
+        }
+        return true;
+    }
+
+    if (dst->view_src != nullptr || dst->buffer != dst_buf ||
+            !ggml_backend_buffer_is_host(src_buf)) {
         return false;
     }
     const size_t nbytes = ggml_nbytes(src);
@@ -2198,7 +2312,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
-    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
         GGML_ASSERT(tensor->ne[3] == 1);
@@ -2216,6 +2330,23 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
 
             const int64_t blck_size = ggml_blck_size(tensor->type);
+            if (tensor->ne[1] == 1) {
+                for (size_t s = 0; s < split_state.n_segments; s++) {
+                    for (size_t r = 0; r < split_state.nr[s]; r++) {
+                        for (size_t j = 0; j < n_bufs; j++) {
+                            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                            GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
+                            const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
+                            ggml_backend_tensor_get(simple_tensor, (char *) data + offset_data,
+                                simple_offsets[j], nbytes);
+                            offset_data       += nbytes;
+                            simple_offsets[j] += nbytes;
+                        }
+                    }
+                }
+                GGML_ASSERT(offset_data == size);
+                return;
+            }
             for (size_t s = 0; s < split_state.n_segments; s++) {
                 for (size_t r = 0; r < split_state.nr[s]; r++) {
                     for (size_t j = 0; j < n_bufs; j++) {
@@ -2375,6 +2506,11 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         t->buffer = meta_buf;
+        // The simple-tensor init computes its data as child base +
+        // (t->data - meta buffer base). Assign the Meta base before init so
+        // this offset is the real in-buffer offset, not a subtraction from
+        // the post-init sentinel.
+        t->data = ggml_backend_buffer_get_base(meta_buf);
         ggml_backend_meta_buffer_init_tensor_impl(meta_buf_ctx->stc_static, t);
         t->data = (void *) 0x2000000000000000; // FIXME
     }

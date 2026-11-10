@@ -104,3 +104,8 @@ std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
+
+// True while a state tensor copy submission is unproven on this thread. A
+// memory-module failure path must then retain the destination cells instead
+// of clearing or reusing them.
+bool llama_state_copy_unproven();

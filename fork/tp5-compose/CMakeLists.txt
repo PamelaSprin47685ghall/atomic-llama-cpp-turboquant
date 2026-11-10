@@ -100,6 +100,23 @@ if(BUILD_TESTING)
     target_compile_features(tq_tp5_mtp_state_real_tests PRIVATE cxx_std_17)
     target_link_libraries(tq_tp5_mtp_state_real_tests PRIVATE llama)
     add_test(NAME tq-tp5-mtp-state-real COMMAND tq_tp5_mtp_state_real_tests)
+    set_tests_properties(tq-tp5-mtp-state-real PROPERTIES SKIP_RETURN_CODE 77)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND AND EXISTS
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/rsz/make_tiny_rsz_mamba.py")
+        set(tq_tp5_tiny_mamba_model "${CMAKE_CURRENT_BINARY_DIR}/tiny-mamba.gguf")
+        add_custom_command(
+            OUTPUT "${tq_tp5_tiny_mamba_model}"
+            COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/rsz/make_tiny_rsz_mamba.py"
+                "${tq_tp5_tiny_mamba_model}"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/rsz/make_tiny_rsz_mamba.py"
+            COMMENT "Generating tiny Mamba fixture for the checkpoint test")
+        add_custom_target(tq_tp5_tiny_mamba_fixture ALL DEPENDS "${tq_tp5_tiny_mamba_model}")
+        add_dependencies(tq_tp5_mtp_state_real_tests tq_tp5_tiny_mamba_fixture)
+        set_tests_properties(tq-tp5-mtp-state-real PROPERTIES
+            ENVIRONMENT "TP5_TEST_MODEL=${tq_tp5_tiny_mamba_model}")
+    endif()
     add_executable(tq_tp5_mtp_greedy_cache_tests tests/test-mtp-greedy-cache.cpp)
     target_compile_features(tq_tp5_mtp_greedy_cache_tests PRIVATE cxx_std_17)
     target_include_directories(tq_tp5_mtp_greedy_cache_tests PRIVATE

@@ -2480,18 +2480,21 @@ run_result run(const options & requested) {
                             // 248320 logits quality (KL 7.31), so use the ONLY
                             // qualified full host sequence snapshot.
                             std::size_t state_sz=0;
+                            std::size_t host_sz=0;
                             if(!mtp_native_trim) {
-                                require(!target_state_checkpoint.is_valid(),
-                                        "MTP target checkpoint still live before capture");
                                 state_sz=llama_state_seq_get_size_ext(ctx,0,checkpoint_flags);
                                 // ON_DEVICE returns metadata only; the tensor
-                                // copy lives in ctx->mem_storage[seq]. Bound
-                                // that copy by the full host state size.
-                                const std::size_t gate_sz = mtp_device_snapshot
+                                // copy lives in ctx->mem_storage[seq] and is
+                                // the full host state. Check that the host
+                                // state is available, but do not turn its size
+                                // into a fixed cap: a long-context snapshot is
+                                // legal, and the device allocator is the real
+                                // limit.
+                                host_sz = mtp_device_snapshot
                                     ? llama_state_seq_get_size_ext(ctx,0,LLAMA_STATE_SEQ_FLAGS_NONE)
                                     : state_sz;
-                                require(state_sz>0 && gate_sz>0 && gate_sz<=(512ull<<20),
-                                        "MTP valid full GDN+KV checkpoint unavailable or exceeds 512 MiB");
+                                require(state_sz>0 && host_sz>0,
+                                        "MTP valid full GDN+KV checkpoint unavailable");
                                 // capture records state_sz as this epoch's
                                 // valid length; the retained storage may be
                                 // larger after a shrink.
@@ -2514,9 +2517,9 @@ run_result run(const options & requested) {
                             mtp_proposal_tokens+=pending_mtp_tokens.size();
                             if (mtp_state_trace) {
                                 std::fprintf(stderr,
-                                    "TP5_REAL_MTP_TARGET_MULTI_BEGIN window=%u N=%u draft_n=%zu source_pos=%llu snapshot_bytes=%zu draft0=%d\n",
+                                    "TP5_REAL_MTP_TARGET_MULTI_BEGIN window=%u N=%u draft_n=%zu source_pos=%llu snapshot_bytes=%zu metadata_bytes=%zu draft0=%d\n",
                                     wi,unsigned(output_rows),pending_mtp_tokens.size(),
-                                    (unsigned long long)consumed[0],state_sz,int(pending_mtp_tokens[0]));
+                                    (unsigned long long)consumed[0],host_sz,state_sz,int(pending_mtp_tokens[0]));
                                 std::fflush(stderr);
                             }
                         }
@@ -3239,9 +3242,12 @@ run_result run(const options & requested) {
                                 if(replay_n==1)
                                     single_output_logits=llama_get_logits_ith(ctx,0);
                                 if (mtp_state_trace) {
+                                    const std::size_t restored_host = mtp_device_snapshot
+                                        ? llama_state_seq_get_size_ext(ctx,0,LLAMA_STATE_SEQ_FLAGS_NONE)
+                                        : restored;
                                     std::fprintf(stderr,
-                                        "TP5_REAL_MTP_MULTI_REJECT_ROLLBACK_PASS window=%u matched_prefix=%zu replay_N=%zu restored_bytes=%zu\n",
-                                        wi,accepted,replay_n,restored);
+                                        "TP5_REAL_MTP_MULTI_REJECT_ROLLBACK_PASS window=%u matched_prefix=%zu replay_N=%zu restored_bytes=%zu restored_metadata_bytes=%zu\n",
+                                        wi,accepted,replay_n,restored_host,restored);
                                     std::fflush(stderr);
                                 }
                                     // LateBind-only: discard prefetch and roll back dctx (fence + trim)

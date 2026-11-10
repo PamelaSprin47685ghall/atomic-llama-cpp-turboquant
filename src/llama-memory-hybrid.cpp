@@ -224,10 +224,29 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        mem_attn->state_read(io, seq_id, flags);
+    try {
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            mem_attn->state_read(io, seq_id, flags);
+        }
+        mem_recr->state_read(io, seq_id, flags);
+    } catch (...) {
+        // A restore that fails after the attention cache was replaced must not
+        // leave attention and recurrent state from different epochs. Drop the
+        // destination from both caches before reporting the failure.
+        if (!llama_state_copy_unproven()) {
+            try {
+                if (seq_id < 0) {
+                    clear(true);
+                } else {
+                    mem_attn->seq_rm(seq_id, -1, -1);
+                    mem_recr->seq_rm(seq_id, -1, -1);
+                }
+            } catch (...) {
+                // Best effort; the original failure is more useful.
+            }
+        }
+        throw;
     }
-    mem_recr->state_read(io, seq_id, flags);
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {

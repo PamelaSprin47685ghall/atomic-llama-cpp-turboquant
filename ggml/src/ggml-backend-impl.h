@@ -91,6 +91,16 @@ extern "C" {
     GGML_API bool ggml_backend_is_meta       (ggml_backend_t backend);
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
+    // Pure Meta-to-Meta preflight. IMPOSSIBLE leaves both tensors untouched;
+    // EXACT uses the child fast copy; SLOW uses the host-staging tensor copy.
+    typedef enum ggml_backend_meta_copy_kind {
+        GGML_BACKEND_META_COPY_IMPOSSIBLE = 0,
+        GGML_BACKEND_META_COPY_EXACT      = 1,
+        GGML_BACKEND_META_COPY_SLOW       = 2,
+    } ggml_backend_meta_copy_kind;
+    GGML_API ggml_backend_meta_copy_kind ggml_backend_meta_buffer_copy_kind(
+        struct ggml_tensor * src, struct ggml_tensor * dst);
+    GGML_API bool ggml_backend_meta_buffer_can_copy(struct ggml_tensor * src, struct ggml_tensor * dst);
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);

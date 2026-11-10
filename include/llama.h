@@ -1329,7 +1329,8 @@ extern "C" {
                    const uint8_t * src),
         "use llama_state_set_data instead");
 
-    // Save/load session file
+    // Save/load session file.
+    // A failed load returns false/0; the destination follows the memory clear-on-failure policy.
     LLAMA_API bool llama_state_load_file(
             struct llama_context * ctx,
                       const char * path_session,
@@ -1402,10 +1403,36 @@ extern "C" {
 #define LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY 1
 
 // Keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load).
-// Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
+// A successful get for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
+// A failed get leaves the previous device snapshot valid.
+// The metadata is versioned and bound to the llama_context that produced it. It is not portable:
+// llama_state_seq_set_data_ext returns 0 when the metadata belongs to another context, was invalidated
+// by a later get for the same seq_id, or is truncated or corrupt. The tensor bytes are not part of the
+// metadata; they stay owned by that context.
+// The host sequence blob keeps its existing magic/seq_id layout and remains portable across contexts.
+// The device blob is versioned and context-bound; using a blob with the other flag set returns 0.
+// Device state copies try the buffer cpy_tensor (bool) and fall back to the blocking tensor copy.
+// CUDA/CPU buffers block or synchronize at return; the normal async streams are not disabled. A Meta
+// destination is split into its real child buffers and each child is copied with the child buffer's
+// cpy_tensor (with the blocking fallback); the staging owner is not used. The child split preflights
+// every child (split state, simple view, buffer/data, type/shape/nbytes) before any side effect: false
+// means preflight/unsupported with the destination untouched, true means all child blocking copies
+// completed. A false Meta preflight is no-side-effect unsupported: the ON_DEVICE call returns 0 and
+// does not mark unproven; the caller must explicitly request the host format (host flags) for a host
+// blob. The ON_DEVICE blob is a device metadata handle, not the full host state; the host blob is a
+// separate format whose size includes the tensor bytes. A started copy that throws is partial/unknown:
+// the ON_DEVICE restore returns 0 and marks/retains; the capture returns 0 with the old snapshot; no
+// fallback is attempted and unproven is not cleared. A cross-context device blob is rejected by its
+// context id. A legal Meta child copy completes the ON_DEVICE capture/restore. Non-Meta device errors
+// keep the existing clear-on-failure. A CUDA_CHECK abort is not a returned status. The previous
+// snapshot is kept until the copy returns; restore returns success only after it. Do not reuse the
+// destination or call synchronize on an unproven context. Host-flag and file restores follow the
+// memory clear-on-failure policy and are not rolled back; no full host backup is made.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
     typedef uint32_t llama_state_seq_flags;
+
+    // A seq_id of -1 addresses all sequences, matching the internal sequence state paths.
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
             struct llama_context * ctx,

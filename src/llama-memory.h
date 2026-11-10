@@ -221,6 +221,14 @@ struct llama_memory_i {
     virtual bool has_kv_stream_targets() const { return false; }
 
     virtual std::vector<llama_kv_stream_target> get_kv_stream_targets() const { return {}; }
+
+    // A state restore left a device copy submission unproven. The memory must
+    // not clear, reuse or move the destination cells until the owner resolves.
+    void mark_unproven() { state_unproven = true; }
+    bool has_unproven() const { return state_unproven; }
+
+  private:
+    bool state_unproven = false;
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

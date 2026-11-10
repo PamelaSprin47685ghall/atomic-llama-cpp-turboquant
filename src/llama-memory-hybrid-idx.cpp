@@ -675,7 +675,9 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         // a half-restored context is the one state the indexer cache cannot be brought back from
         // by itself: the attention cache holds the restored cells and the indexer the old ones.
         // drop what was being restored from all of them, which is a state they do agree on.
-        state_drop(seq_id);
+        if (!llama_state_copy_unproven()) {
+            state_drop(seq_id);
+        }
 
         throw;
     }
