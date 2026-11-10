@@ -1878,7 +1878,7 @@ static void ggml_backend_meta_copy_range_axis01(
                         const size_t begin = std::max(col_pos, row_off);
                         const size_t end   = std::min(col_pos + block, row_off + n);
                         if (begin < end) {
-                            const ggml_tensor * simple = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                            ggml_tensor * simple = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                             GGML_ASSERT(simple != nullptr);
                             const size_t simple_off = row*simple->nb[1] + simple_pos[j] + (begin - col_pos);
                             const size_t host_off   = (pos - offset) + (begin - row_off);
@@ -1904,7 +1904,7 @@ static void ggml_backend_meta_copy_range_axis01(
                     for (size_t j = 0; j < n_bufs; j++) {
                         const size_t child_rows = split_state.ne[s*n_bufs + j];
                         if (row >= row_base && row < row_base + child_rows) {
-                            const ggml_tensor * simple = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                            ggml_tensor * simple = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                             GGML_ASSERT(simple != nullptr);
                             const size_t simple_off = (row - row_base)*simple->nb[1] + row_off;
                             const size_t host_off   = pos - offset;

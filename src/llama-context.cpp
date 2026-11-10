@@ -8697,7 +8697,6 @@ class llama_io_write_device : public llama_io_write_i {
         // uses the generic host-staging tensor copy with the same ON_DEVICE
         // snapshot. A throw after a copy starts is partial/unknown in the new
         // staging; the old snapshot is not touched.
-        copy_began = true;
         for (const auto & [buft, mbuf] : mbufs) {
             if (!ggml_backend_buffer_is_meta(mbuf.buf.get())) {
                 continue;
@@ -8713,12 +8712,15 @@ class llama_io_write_device : public llama_io_write_i {
             }
         }
 
+        copy_began = true;
         for (const auto & [buft, mbuf] : mbufs) {
             const auto hit = host_ranges.find(buft);
             size_t host_i = 0;
             for (size_t i = 0; i < mbuf.org.size(); ++i) {
                 if (mbuf.org[i] == nullptr) {
-                    GGML_ASSERT(hit != host_ranges.end() && host_i < hit->second.size());
+                    if (hit == host_ranges.end() || host_i >= hit->second.size()) {
+                        throw std::runtime_error("device state host range mismatch");
+                    }
                     const write_info & winfo = *hit->second[host_i++];
                     std::vector<char> host(winfo.size);
                     ggml_backend_tensor_get(winfo.tensor, host.data(), winfo.offset, winfo.size);
@@ -9181,12 +9183,6 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         // The device writer returns false only for an impossible Meta preflight.
         // The new staging is discarded and the old snapshot remains valid.
         if (!io->finalize()) {
-            auto * reader = dynamic_cast<llama_io_read_device *>(io.get());
-            if (reader != nullptr && reader->is_unproven()) {
-                // A copy was submitted and its completion is unknown. Keep
-                // the destination cells and the snapshot owner alive.
-                mark_state_copy_unproven();
-            }
             LLAMA_LOG_ERROR("%s: device state copy unsupported\n", __func__);
             return 0;
         }
