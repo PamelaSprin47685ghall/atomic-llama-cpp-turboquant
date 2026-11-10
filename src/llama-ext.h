@@ -107,9 +107,12 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
-// Host-only KV journal/prepare accounting. This is not part of the
-// buffer-type map above and does not change llama_get_memory_breakdown's
-// device-buffer meaning.
+// Host-only KV journal/prepare accounting (C++ extension). This is not part
+// of the buffer-type map above and does not change llama_get_memory_breakdown's
+// device-buffer meaning. Call it only while no decode/update is running; like
+// the existing memory query it reads live host containers without locks.
+// Values are payload capacities, excluding allocator overhead and resident
+// KV cell metadata.
 LLAMA_API llama_host_memory_breakdown_data llama_get_host_memory_breakdown(const struct llama_context * ctx);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past

@@ -22,6 +22,7 @@
 #include "llama.h"
 
 #include "llama-context.h"
+#include "llama-ext.h"
 
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
@@ -247,7 +248,13 @@ static void run_backend_failure(const char * model_path) {
         return;
     }
 
+    const auto initial_host = llama_get_host_memory_breakdown(ctx);
+    CHECK(initial_host.journal == 0, "host account starts with an empty journal");
+
     if (!llama_memory_can_shift(llama_get_memory(ctx))) {
+        CHECK(decode_one(ctx, 1), "host-account hybrid decode");
+        const auto host = llama_get_host_memory_breakdown(ctx);
+        CHECK(host.journal > 0, "host account aggregates the hybrid journal");
         // A model whose cache cannot shift cannot reach the K-shift FAILED
         // path. Do not run the core checks or print PASS for it; report a
         // skip so a dense regression cannot hide behind this fixture.
@@ -259,6 +266,8 @@ static void run_backend_failure(const char * model_path) {
     }
 
     CHECK(decode_one(ctx, 1), "mock decode 1");
+    const auto host = llama_get_host_memory_breakdown(ctx);
+    CHECK(host.journal > 0, "host account exposes the dense journal");
     CHECK(decode_one(ctx, 2), "mock decode 2");
     const llama_pos pos_before = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
     // Size every buffer by the actual sequence state. A fixed 1 MiB buffer is
@@ -365,6 +374,10 @@ int main(int argc, char ** argv) {
     if (g_skip) {
         llama_model_free(model);
         llama_backend_free();
+        if (g_fail != 0) {
+            std::fprintf(stderr, "KV_UPDATE_STATUS_TEST FAIL checks=%d failures=%d\n", g_checks, g_fail);
+            return 1;
+        }
         std::fprintf(stderr, "KV_UPDATE_STATUS_TEST SKIP: K-shift test not applicable\n");
         return 77;
     }

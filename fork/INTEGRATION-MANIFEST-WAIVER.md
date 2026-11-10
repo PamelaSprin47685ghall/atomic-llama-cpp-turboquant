@@ -1283,11 +1283,23 @@ journal/prepare account. These are payload capacities, not allocator
 bookkeeping. hybrid/hybrid-iswa/hybrid-idx aggregate their KV sub-caches;
 dsa/msa/dsv4 aggregate their KV members; recurrent contributes zero.
 
+This is a C++ extension, not a new field in the device-buffer map. Call it
+only while no decode/update is running: it reads the live host containers
+without locks, matching the existing context memory-query contract. It is not
+a concurrent snapshot and does not imply thread safety.
+
 `shift_backup_restore()` now swaps cell payloads in place instead of swapping
 the `v_cells` vector, so `get_cells()` references and the cell objects keep
 their addresses. `get_cells()` has no production caller that holds a
 reference across restore; the test access path checks the address and the
 restored state explicitly.
+
+Public-consumer verification: the qwen4exp tiny hybrid context reports an
+empty journal at construction, then a nonzero journal after one decode; this
+exercises `llama_get_host_memory_breakdown()` and the hybrid aggregation. The
+test still exits 77/SKIP because that cache cannot shift, so it does not print
+the core K-shift PASS. The dense host field check is in the same test but was
+not rerun after this public-check addition.
 
 Manifest: `src/llama-kv-cache.cpp`, `src/llama-kv-cache.h`,
 `src/llama-kv-cells.h` and `tests/test-tp5-ubatch-pool.cpp` were updated to

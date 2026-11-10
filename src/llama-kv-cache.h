@@ -262,7 +262,6 @@ public:
         }
 
         llama_host_memory_breakdown_data host_memory_breakdown() const {
-            std::lock_guard<std::mutex> lock(mutex);
             llama_host_memory_breakdown_data res;
             res.scratch += storage.capacity()*sizeof(std::unique_ptr<decode_scratch>) +
                            free.capacity()*sizeof(decode_scratch *);
@@ -771,7 +770,6 @@ private:
         }
 
         llama_host_memory_breakdown_data host_memory_breakdown() const {
-            std::lock_guard<std::mutex> lock(mutex);
             llama_host_memory_breakdown_data res;
             res.snapshots += storage.capacity()*sizeof(std::unique_ptr<snapshot_slot>) +
                              free.capacity()*sizeof(snapshot_slot *);
