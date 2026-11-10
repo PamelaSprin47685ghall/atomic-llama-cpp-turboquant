@@ -1235,6 +1235,18 @@ exit 0 (synthetic real-cache OOM/SWA/non-SWA sweep, not a full model);
 `KV_UPDATE_STATUS_TEST PASS checks=21`, exit 0 (real CPU dense context).
 `test-kv-cells-journal-ownership` was not run. No GPU/full suite was run.
 
+The K-shift shift backup is now strong on allocation failure:
+`shift_backup_save()` copies `v_cells` and `v_heads` into locals and swaps only
+after both copies succeed, so a throw leaves the committed backup empty and a
+retry starts from a complete snapshot. `shift_backup_restore()` swaps instead
+of assigning, so it cannot fail halfway. The new
+`test_shift_backup_strong_oom` cases check the failed save leaves no partial
+backup and that a retry restores the complete cells/heads state. Journal
+replay failure still aborts via `GGML_ASSERT`; it is never reported as
+success. `test-tp5-ubatch-pool` now reports
+`OK failures=0 allocs=24313 frees=23163`, exit 0, including those cases. The
+K-shift status test was not rerun after this backup-only hardening.
+
 Manifest: `src/llama-kv-cache.cpp`, `src/llama-kv-cache.h`,
 `src/llama-kv-cells.h` and `tests/test-tp5-ubatch-pool.cpp` were updated to
 their actual post-integration hashes. `tests/test-kv-cells-journal-ownership.cpp`

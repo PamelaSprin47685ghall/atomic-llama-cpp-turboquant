@@ -1115,6 +1115,45 @@ static mutation_fault_result run_mutation_fault(
 }
 
 
+// A failed shift_backup_save() must not commit a partially copied backup.
+// The retry must start from a complete snapshot and restore it exactly.
+static void test_shift_backup_strong_oom() {
+    test_kv_fixture f(0, LLAMA_SWA_TYPE_NONE);
+    llama_kv_cache * kv = make_test_cache(f, 0, LLAMA_SWA_TYPE_NONE, 8);
+    seed_test_cache(*kv, 4, ~0u, ~0u, 4);
+
+    auto & cells = llama_kv_cache_prepare_test_access::cells(*kv, 0);
+    bool threw = false;
+    {
+        fault_guard guard;
+        arm_fault_at(0, false);
+        try {
+            kv->shift_backup_save();
+        } catch (const std::bad_alloc &) {
+            threw = true;
+        }
+    }
+    check(threw, "shift backup: save allocation failure propagated");
+
+    cells.pos_set(0, 99);
+    kv->shift_backup_restore();
+    check(cells.pos_get(0) == 99, "shift backup: failed save leaves no partial backup");
+    kv->shift_backup_clear();
+
+    llama_kv_cells retry_before = cells;
+    const auto heads_before = llama_kv_cache_prepare_test_access::heads(*kv);
+    kv->shift_backup_save();
+    cells.pos_set(0, 77);
+    kv->shift_backup_restore();
+    // restore swaps v_cells, so the old reference is invalidated.
+    auto & restored = llama_kv_cache_prepare_test_access::cells(*kv, 0);
+    check(same_cells(restored, retry_before, restored.size()) &&
+          llama_kv_cache_prepare_test_access::heads(*kv) == heads_before,
+          "shift backup: retry saves and restores complete state");
+
+    delete kv;
+}
+
 // clear() is a synchronous C API: a retained memory-context object is not
 // native work and must not block a legal clear. The caller owns the ordering.
 static void test_clear_with_context() {
@@ -1786,6 +1825,7 @@ int main() {
     test_non_swa_reprepare();
     test_prepare_stream_trial_index();
     test_cell_journal_purge_then_reuse();
+    test_shift_backup_strong_oom();
     test_clear_with_context();
 
     std::printf("%s failures=%d allocs=%lld frees=%lld\n",

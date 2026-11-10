@@ -1967,18 +1967,28 @@ llama_memory_apply_status llama_kv_cache::update(llama_context * lctx, bool do_s
 }
 
 void llama_kv_cache::shift_backup_save() {
-    if (shift_cells_backup.empty()) {
-        shift_cells_backup = v_cells;
-        shift_heads_backup = v_heads;
+    if (!shift_cells_backup.empty()) {
+        return;
     }
+
+    // Copy into locals first: if either copy throws, the committed backup
+    // stays empty and the retry starts from a complete snapshot. Assigning
+    // v_cells directly could leave a partially built backup after an
+    // allocation failure.
+    std::vector<llama_kv_cells> cells_backup = v_cells;
+    std::vector<uint32_t>       heads_backup = v_heads;
+    shift_cells_backup.swap(cells_backup);
+    shift_heads_backup.swap(heads_backup);
 }
 
 void llama_kv_cache::shift_backup_restore() {
     if (shift_cells_backup.empty()) {
         return;
     }
-    v_cells = shift_cells_backup;
-    v_heads = shift_heads_backup;
+    // Swap is noexcept: the restore itself cannot fail halfway and leave a
+    // partially copied cache. The old live vectors are released by clear().
+    v_cells.swap(shift_cells_backup);
+    v_heads.swap(shift_heads_backup);
     shift_backup_clear();
 }
 
