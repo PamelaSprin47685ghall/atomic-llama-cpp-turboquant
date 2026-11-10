@@ -4479,7 +4479,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
         const void * data, size_t offset, size_t size) {
     ggml_backend_meta_buffer_set_tensor_impl(buffer, tensor, data, offset, size, nullptr,
-                                             /*allow_staging=*/ true, /*submit_gate_held=*/ false);
+                                             /*allow_staging=*/ false, /*submit_gate_held=*/ false);
 }
 
 // The scheduler's blocking input fallback reaches the Meta buffer through
@@ -4615,7 +4615,7 @@ static bool ggml_backend_meta_buffer_cpy_tensor(
         return false;
     }
     ggml_backend_meta_buffer_set_tensor_impl(buffer, dst, src->data, 0, nbytes, src,
-                                             /*allow_staging=*/ true, /*submit_gate_held=*/ false);
+                                             /*allow_staging=*/ false, /*submit_gate_held=*/ false);
     return true;
 }
 
@@ -5933,8 +5933,7 @@ bool ggml_backend_meta_set_submitted_hook(bool (*hook)(void *), void * userdata)
 // Optional backend capability: an unknown async submission makes every later
 // compute fail instead of running on a partially written destination.
 static int ggml_backend_meta_submission_error(ggml_backend_t backend) {
-    (void) backend;
-    const ggml_cuda_staging::api * st = staging_api();
+    const ggml_cuda_staging::api * st = provider_for_backend(backend);
     if (st == nullptr || st->configured == nullptr || !st->configured()) {
         return 0;
     }
@@ -5945,8 +5944,7 @@ static int ggml_backend_meta_submission_error(ggml_backend_t backend) {
 }
 
 static bool ggml_backend_meta_submission_pending(ggml_backend_t backend) {
-    (void) backend;
-    const ggml_cuda_staging::api * st = staging_api();
+    const ggml_cuda_staging::api * st = provider_for_backend(backend);
     if (st == nullptr || st->configured == nullptr || !st->configured()) {
         return false;
     }
