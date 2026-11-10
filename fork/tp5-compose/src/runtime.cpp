@@ -2260,6 +2260,9 @@ run_result run(const options & requested) {
                     std::uint64_t diag_first_count=0,diag_extra_count=0,diag_state_count=0;
                     std::uint64_t diag_state_only_count=0;
                     bool draft_pending = false;
+                    // Reused wide NextN scratch: the per-epoch 40 KiB draft hidden
+                    // buffer was allocated and freed on every committed row.
+                    std::vector<float> draft_h_scratch;
                     // LateBind Site 2 knob, resolved once per process
                     // (C++11 static local init is thread-safe and runs exactly
                     // once): one getenv and two direct char dereferences total,
@@ -2763,8 +2766,12 @@ run_result run(const options & requested) {
                         if (lb_draft1_enabled && mtp_draft_smoke && verify_mtp_this_epoch && local_rows.size() > 0) {
                             auto * dctx_pref = trained_mtp_contexts.at(wi).get();
                             const auto & req0 = result.requests[ids[local_rows[0]]];
-                            const float * h0 = llama_get_embeddings_nextn_ith(ctx, int32_t(local_rows[0]));
+                            // The logits getter performs the full synchronize this
+                            // epoch needs; the wide NextN row is then host-resident,
+                            // so resolving it with the no-sync accessor saves a
+                            // second scheduler-wide drain on five ranks.
                             const float * l0 = llama_get_logits_ith(ctx, 0);
+                            const float * h0 = llama_get_embeddings_nextn_ith_no_sync(ctx, int32_t(local_rows[0]));
                             if (lb_counters_enabled && (h0 == nullptr || l0 == nullptr)) ++lb_ctr_skip_null;
                             if (h0 != nullptr && l0 != nullptr) {
                                 bool h0_finite = true;
@@ -3138,8 +3145,10 @@ run_result run(const options & requested) {
                                 epoch_active=false;
                                 replay_spin.reset();
 
+                                // llama_synchronize above already drained this
+                                // context; the replay rows only need resolution.
                                 for(std::size_t j=0;j<replay_n;++j) {
-                                    const float * replay=llama_get_logits_ith(ctx,int(j));
+                                    const float * replay=llama_get_logits_ith_no_sync(ctx,int(j));
                                     require(replay!=nullptr,
                                         "MTP multi genuine replay missing original target logits");
                                     const auto greedy=tq::sampling::select_finite_greedy(replay,n_vocab);
@@ -3269,7 +3278,15 @@ run_result run(const options & requested) {
                                         "draft prompt rows must match the private prompt in order");
                                 const auto prompt_start=now_ns();
                                 constexpr int wide = mtp_nextn_width;
-                                const float * target_h=llama_get_embeddings_nextn_ith(ctx, int32_t(row));
+                                // Without the output-copy event barrier this epoch
+                                // drained the target before the commit loop (the
+                                // logits getter or llama_synchronize), so the wide
+                                // NextN row needs no second drain. With the barrier
+                                // only the logits copy is proven, so keep the syncing
+                                // getter there.
+                                const float * target_h = dw_output_barrier ?
+                                    llama_get_embeddings_nextn_ith(ctx, int32_t(row)) :
+                                    llama_get_embeddings_nextn_ith_no_sync(ctx, int32_t(row));
                                 require(target_h != nullptr, "prompt target hidden row is missing");
                                 for (int j=0;j<wide;++j)
                                     require(std::isfinite(target_h[j]), "prompt target hidden is nonfinite");
@@ -3370,7 +3387,13 @@ run_result run(const options & requested) {
                                 // This hidden row corresponds to the last real prompt
                                 // token; the newly target-sampled id is the NEXT token
                                 // to feed the trained MTP block (shift-by-one).
-                                const float * real_h = llama_get_embeddings_nextn_ith(ctx, int32_t(row));
+                                // Without the output-copy event barrier the logits
+                                // getter above drained this context, so the NextN row
+                                // needs no second drain. With the barrier only the
+                                // logits copy is proven, so the syncing getter stays.
+                                const float * real_h = dw_output_barrier ?
+                                    llama_get_embeddings_nextn_ith(ctx, int32_t(row)) :
+                                    llama_get_embeddings_nextn_ith_no_sync(ctx, int32_t(row));
                                 require(real_h != nullptr, "actual target did not export its wide NextN residual");
                                 constexpr int wide = mtp_nextn_width;
                                 double hnorm = 0;
@@ -3538,8 +3561,10 @@ run_result run(const options & requested) {
                                     diag_draft_first+=now_ns()-first_start; ++diag_first_count;
                                     ++diag_state_only_count;
                                 } else {
+                                    // The logits getter drains the draft context; the
+                                    // wide NextN row is read without a second drain.
                                     const auto * dl = llama_get_logits_ith(dctx, 0);
-                                    const auto * dh = llama_get_embeddings_nextn_ith(dctx, 0);
+                                    const auto * dh = llama_get_embeddings_nextn_ith_no_sync(dctx, 0);
                                     require(dl && dh, "actual MTP draft missing logits/wide output");
                                     draft_pending = false;
                                     if (lb_dump_enabled && row == 0) {
@@ -3681,7 +3706,7 @@ run_result run(const options & requested) {
                                             mtp_depth,remaining>1?remaining-1:0);
                                         if(n_propose>0){
                                             pending_mtp_tokens.push_back(dg.selected.id);
-                                            std::vector<float> prev_draft_h(dh,dh+wide);
+                                            draft_h_scratch.assign(dh, dh + wide);
                                             auto next_token=dg.selected.id;
                                             for(std::size_t extra=1;extra<n_propose;++extra){
                                                 const auto extra_start=now_ns();
@@ -3691,13 +3716,15 @@ run_result run(const options & requested) {
                                                         "MTP multi extra draft token input malloc failed");
                                                     mtp_lease.set(next_token,
                                                         static_cast<llama_pos>(consumed[local]+extra),
-                                                        1, prev_draft_h.data(), wide);
+                                                        1, draft_h_scratch.data(), wide);
                                                     const int extra_rc = llama_decode(dctx, mtp_lease.batch());
                                                     require(extra_rc == 0,
                                                         "real trained multi-draft MTP decode failed");
                                                 }
+                                                // The logits getter drains dctx; the NextN
+                                                // row needs no second drain.
                                                 const float * more=llama_get_logits_ith(dctx,0);
-                                                const float * h_more=llama_get_embeddings_nextn_ith(dctx,0);
+                                                const float * h_more=llama_get_embeddings_nextn_ith_no_sync(dctx,0);
                                                 require(more&&h_more,
                                                     "multi-draft NextN missing true logits/hidden");
                                                 const auto greedy_more=tq::sampling::select_finite_greedy(
@@ -3709,7 +3736,7 @@ run_result run(const options & requested) {
                                                         "multi-draft NextN hidden nonfinite");
                                                 pending_mtp_tokens.push_back(greedy_more.selected.id);
                                                 next_token=greedy_more.selected.id;
-                                                std::memcpy(prev_draft_h.data(),h_more,
+                                                std::memcpy(draft_h_scratch.data(),h_more,
                                                     wide*sizeof(float));
                                                 diag_draft_extra+=now_ns()-extra_start; ++diag_extra_count;
                                             }

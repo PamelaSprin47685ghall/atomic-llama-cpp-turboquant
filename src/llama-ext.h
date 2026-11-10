@@ -177,6 +177,12 @@ LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, bool value);
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
+// Same row resolution without the implicit synchronize. The caller must already
+// hold a FULL synchronize of this context (a stock syncing getter or
+// llama_synchronize); the recorded output-copy events cover only the logits D2H
+// copy, not the separate wide NextN copy.
+LLAMA_API float * llama_get_embeddings_nextn_ith_no_sync(struct llama_context * ctx, int32_t i);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

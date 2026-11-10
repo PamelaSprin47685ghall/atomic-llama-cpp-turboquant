@@ -1616,6 +1616,13 @@ extern "C" {
     // Mirrors llama_get_embeddings_ith(); returns NULL when unavailable.
     LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+    // Same row resolution without the implicit synchronize. The caller must already
+    // hold a FULL synchronize of this context (a stock syncing getter or
+    // llama_synchronize). The recorded output-copy events are NOT sufficient: they
+    // cover exactly the full-logits D2H copy, while the wide NextN rows are a
+    // separate asynchronous copy that only a full synchronize drains.
+    LLAMA_API float * llama_get_embeddings_nextn_ith_no_sync(struct llama_context * ctx, int32_t i);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config

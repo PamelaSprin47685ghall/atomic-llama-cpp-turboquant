@@ -10024,6 +10024,17 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     return ctx->get_embeddings_nextn_ith(i);
 }
 
+// Resolve one NextN row without synchronizing. The caller must already have
+// drained this context with a full synchronize: the wide NextN rows are copied
+// asynchronously and the output-copy events cover only the logits D2H copy.
+float * llama_get_embeddings_nextn_ith_no_sync(llama_context * ctx, int32_t i) {
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+
+    return ctx->get_embeddings_nextn_ith(i);
+}
+
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
 
