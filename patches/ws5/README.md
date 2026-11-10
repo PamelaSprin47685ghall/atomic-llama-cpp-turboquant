@@ -129,11 +129,40 @@ refused, and `clear(true)` recovers. `state_write` and `state_read_sinfo` guard
 `shift_failed` at their entry, so a `cell_count == 0` stream cannot bypass the
 meta guard. No production fault hook is added.
 
+After `apply()` and the status checks, `memory_update` waits on the main
+scheduler before `graph_reserve` so an asynchronous K-shift graph cannot still
+be in flight when the reserve resets or reuses the scheduler. This is a
+completion wait only; it is not proof that the asynchronous work succeeded.
+`has_unproven()` remains a staging/relay submission check, not a complete GPU
+completion proof. A null `init_update` or a catchable init exception maps to
+-2; a catchable exception from `apply()` or `get_update_status()` maps to -3;
+no exception path is treated as success.
+
 The isolated branch reports 20 checks passing; the main tree did not rerun
-that test. The composite status keeps the known recurrent default: a recurrent
-sub-context defaults to APPLIED, so a mixed composite is APPLIED even when the
-KV sub-context reports NO_UPDATE; only an all-NO_UPDATE composite avoids the
-graph reserve.
+that test. A pure no-update decode returns at `init_update` with NO_UPDATE
+before `apply`, so it does not reach the composite decision and does not add a
+reserve. The recurrent default APPLIED matters only when `init_update` returns
+SUCCESS (a K-shift or stream copy) and `apply` is reached: in the all-shared
+mirror case the KV apply can return NO_UPDATE, and without the recurrent
+override the composite was APPLIED and forced a graph reserve. The override
+makes that case NO_UPDATE; a K-shift or stream copy remains APPLIED and still
+reserves.
+
+Recurrent update contexts are always NO_UPDATE: `init_update()` constructs
+`llama_memory_recurrent_context` with `LLAMA_MEMORY_STATUS_NO_UPDATE` and no
+ubatches, and `apply()` is a documented no-op for that context. Its
+`get_update_status()` therefore returns NO_UPDATE; a batch context returns
+APPLIED. This lets hybrid/hybrid-iswa/hybrid-idx skip `graph_reserve` when the
+attention side's apply also has no work, specifically the all-shared mirror
+case above. DSV4 needs no extra override: its raw/base/swa/csa/hca/lid
+sub-contexts are KV contexts that already report their own status. A local
+narrow check constructed the exact NO_UPDATE update context and exercised the
+combine order (NO_UPDATE+NO_UPDATE=NO_UPDATE, NO_UPDATE+APPLIED=APPLIED,
+FAILED dominates) and passed; it is not committed as a test because it asserts
+internal enum/combine rather than consumer-visible graph-reserve behavior. No
+full hybrid/DSV4 model was run. This change modifies
+`src/llama-memory-recurrent.h` and this README; both remain expected red in the
+e7 manifest until its owner re-signs the e7 base.
 
 ## First catch-up output rows
 

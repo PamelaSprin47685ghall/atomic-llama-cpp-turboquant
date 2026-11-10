@@ -1067,10 +1067,21 @@ compute failure sets `shift_failed` until `clear(true)`. `state_write` and
 cannot bypass the meta guard. Composite status combines FAILED > APPLIED >
 NO_UPDATE.
 
-Known limitation: recurrent sub-contexts default to APPLIED, so a mixed
-composite is APPLIED even when the KV sub-context reports NO_UPDATE; only an
-all-NO_UPDATE composite avoids the graph reserve. This performance limitation
-is retained.
+A pure no-update decode returns at `init_update` with NO_UPDATE before
+`apply`, so it does not reach the composite decision and does not add a
+reserve. The recurrent default APPLIED mattered only when `init_update`
+returned SUCCESS (a K-shift or stream copy) and `apply` was reached: in the
+all-shared mirror case the KV apply can return NO_UPDATE, and the old
+composite APPLIED forced a graph reserve. E.13 removes that unnecessary
+reserve; a K-shift or stream copy remains APPLIED and still reserves.
+
+The manual adaptation initially missed c22's post-apply main-scheduler
+synchronize. It is now restored after apply/status and before
+`graph_reserve`: a completion wait only, not proof of asynchronous success.
+`has_unproven()` remains a staging/relay submission check, not a complete GPU
+completion proof. A null `init_update` or catchable init exception maps to
+-2; a catchable exception from `apply()` or `get_update_status()` maps to -3;
+no exception path is treated as success.
 
 The real CPU test `tests/test-kv-update-status.cpp` reports 20 checks passing
 on the isolated branch; it was not rerun in this main tree. No GPU, full suite
@@ -1081,6 +1092,38 @@ and `patches/ws5/README.md` matched their baseline digests and were reviewed;
 their hashes are updated, and `tests/test-kv-update-status.cpp` is added as a
 new entry. `src/llama-context.cpp`, `src/llama-context.h` and
 `tests/CMakeLists.txt` were already stale and remain unsigned red items.
+
+### E.13 Recurrent update NO_UPDATE and post-apply wait 2026-11-10
+
+Cherry-pick `198668702` (based on `c22ca654e`) and restore the c22 post-apply
+main-scheduler wait. Recurrent update contexts are always NO_UPDATE:
+`init_update()` constructs `llama_memory_recurrent_context` with
+`LLAMA_MEMORY_STATUS_NO_UPDATE` and no ubatches, and `apply()` is a documented
+no-op. The override returns NO_UPDATE for that context and APPLIED for a batch
+context, so hybrid/hybrid-iswa/hybrid-idx can skip `graph_reserve` when the
+attention side's apply also has no work, specifically the all-shared mirror
+case. DSV4 needs no extra override; its sub-contexts are KV contexts.
+
+Scope: a pure no-update decode exits at `init_update` NO_UPDATE before
+`apply`, so the recurrent default APPLIED never caused an extra reserve there.
+The override matters only when `init_update` SUCCESS reaches `apply`; a K-shift
+or stream copy remains APPLIED and still reserves. The local narrow check only
+constructed the update context and exercised `get_update_status` and the
+combine order; it did not run a hybrid end-to-end model, and no test was
+committed for it.
+
+Post-apply wait: `memory_update` synchronizes the main scheduler before
+`graph_reserve`, so an asynchronous K-shift graph cannot be reset/reused while
+in flight. The wait is completion-only, not an async-success claim;
+`has_unproven()` is not a complete GPU completion proof. Null `init_update`
+and catchable init exceptions map to -2; catchable `apply`/status exceptions
+map to -3.
+
+Manifest: `src/llama-memory-recurrent.h` and `patches/ws5/README.md` remain
+stale/unsigned after this follow-up; `src/llama-context.cpp/.h` and
+`tests/CMakeLists.txt` remain the existing red items. No digest was re-signed.
+No GPU, full suite or guard rerun. More complex staging receipts remain a
+separate line.
 
 ## F. Why this does not block the integration
 

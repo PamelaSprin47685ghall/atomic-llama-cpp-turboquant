@@ -2752,7 +2752,21 @@ bool llama_context::memory_update(bool optimize) {
     }
 
     {
-        const auto mctx = memory->init_update(this, optimize);
+        llama_memory_context_ptr mctx;
+        try {
+            mctx = memory->init_update(this, optimize);
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: failed to initialize memory update: %s\n", __func__, err.what());
+            memory_update_failed = true;
+            memory_update_error  = -2;
+            return false;
+        }
+        if (!mctx) {
+            LLAMA_LOG_ERROR("%s: failed to initialize memory update\n", __func__);
+            memory_update_failed = true;
+            memory_update_error  = -2;
+            return false;
+        }
         switch (mctx->get_status()) {
             case LLAMA_MEMORY_STATUS_SUCCESS:
                 {
@@ -2786,22 +2800,29 @@ bool llama_context::memory_update(bool optimize) {
         gf_res_prev->reset();
         union_record_invalidate();
 
-        if (!mctx->apply()) {
-            LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
-            memory_update_failed = true;
-            memory_update_error  = -3;
-            return false;
-        }
+        try {
+            if (!mctx->apply()) {
+                LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+                memory_update_failed = true;
+                memory_update_error  = -3;
+                return false;
+            }
 
-        const auto update_status = mctx->get_update_status();
-        if (update_status == LLAMA_MEMORY_APPLY_FAILED) {
-            LLAMA_LOG_ERROR("%s: memory update reported FAILED\n", __func__);
+            const auto update_status = mctx->get_update_status();
+            if (update_status == LLAMA_MEMORY_APPLY_FAILED) {
+                LLAMA_LOG_ERROR("%s: memory update reported FAILED\n", __func__);
+                memory_update_failed = true;
+                memory_update_error  = -3;
+                return false;
+            }
+            if (update_status == LLAMA_MEMORY_APPLY_NO_UPDATE) {
+                // no state change; no graph reserve is needed
+                return false;
+            }
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: memory update threw: %s\n", __func__, err.what());
             memory_update_failed = true;
             memory_update_error  = -3;
-            return false;
-        }
-        if (update_status == LLAMA_MEMORY_APPLY_NO_UPDATE) {
-            // no state change; no graph reserve is needed
             return false;
         }
         if (has_unproven()) {
@@ -2809,6 +2830,14 @@ bool llama_context::memory_update(bool optimize) {
             memory_update_failed = true;
             memory_update_error  = -3;
             return false;
+        }
+        // apply() may submit an asynchronous K-shift graph on the main
+        // scheduler. graph_reserve() below can reset/reuse it, so wait for
+        // the scheduler here. This is a completion wait only; it is not a
+        // proof of asynchronous success, and has_unproven() covers staging
+        // submission state, not ordinary async graph completion.
+        if (sched) {
+            ggml_backend_sched_synchronize(sched.get());
         }
     }
 

@@ -186,6 +186,14 @@ public:
     bool next()  override;
     bool apply() override;
 
+    llama_memory_apply_status get_update_status() const override {
+        // init_update() builds the update context with
+        // LLAMA_MEMORY_STATUS_NO_UPDATE and no ubatches; apply() is a no-op
+        // for that context (llama-memory-recurrent.cpp, apply()). A batch
+        // context has ubatches and does the find_slot work.
+        return ubatches.empty() ? LLAMA_MEMORY_APPLY_NO_UPDATE : LLAMA_MEMORY_APPLY_APPLIED;
+    }
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
