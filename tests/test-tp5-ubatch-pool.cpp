@@ -261,6 +261,27 @@ static void test_exhaustion_and_fallback() {
     check(copy.get() == heap.get(), "pool: heap fallback copies share the payload");
 }
 
+// shared_from_this() throws when the pool is not owned by a shared_ptr. The
+// slot must not be marked before that call, or a refused acquire would leave
+// it in_use with no handle left to release it.
+static void test_acquire_requires_shared_owner() {
+    ubatch_data_pool pool;
+    check(pool.configure(2), "owner: pool configured");
+
+    bool threw = false;
+    try {
+        auto handle = pool.acquire();
+        (void) handle;
+    } catch (const std::bad_weak_ptr &) {
+        threw = true;
+    }
+
+    check(threw, "owner: acquire refuses a pool without a shared owner");
+    check(pool.in_use() == 0, "owner: the refused acquire leaves no slot marked");
+    check(pool.stats().acquired == 0, "owner: the refused acquire is not counted");
+    check(pool.stats().exhausted == 0, "owner: the refusal is not an exhaustion");
+}
+
 static void test_steady_state() {
     auto pool = std::make_shared<ubatch_data_pool>();
     check(pool->configure(4), "steady: pool configured");
@@ -2104,6 +2125,7 @@ int main() {
     test_reuse_and_lifetime();
     test_pool_outlives_owner();
     test_exhaustion_and_fallback();
+    test_acquire_requires_shared_owner();
     test_steady_state();
     test_concurrency();
     test_decode_scratch_pool();

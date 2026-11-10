@@ -116,13 +116,19 @@ ubatch_data_handle ubatch_data_pool::acquire() {
             continue;
         }
 
+        // Take the owner reference before marking the slot. shared_from_this()
+        // throws when the pool is not owned by a shared_ptr; marking the slot
+        // first would leave it in_use with no handle left to release it, so
+        // the pool would silently lose one slot for the rest of its life.
+        std::shared_ptr<ubatch_data_pool> self = shared_from_this();
+
         slot.in_use = true;
         slot.refs.store(1, std::memory_order_release);
         ++slot.gen;
         ++in_use_;
         ++stats_.acquired;
 
-        return ubatch_data_handle(shared_from_this(), i, slot.gen);
+        return ubatch_data_handle(std::move(self), i, slot.gen);
     }
 
     ++stats_.exhausted;
