@@ -1603,7 +1603,12 @@ private:
 
         slots.clear();
 
-        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+        std::string rm_error;
+        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt, &rm_error);
+        if (!rm_error.empty()) {
+            SRV_ERR("%s: sequence-removal probe failed: %s\n", __func__, rm_error.c_str());
+            throw std::runtime_error("sequence-removal probe failed: " + rm_error);
+        }
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
@@ -1648,7 +1653,12 @@ private:
         }
 
         if (ctx_dft) {
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+            std::string rm_error_dft;
+            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft, &rm_error_dft);
+            if (!rm_error_dft.empty()) {
+                SRV_ERR("%s: sequence-removal probe failed: %s\n", __func__, rm_error_dft.c_str());
+                throw std::runtime_error("sequence-removal probe failed: " + rm_error_dft);
+            }
         }
 
         if (spec) {

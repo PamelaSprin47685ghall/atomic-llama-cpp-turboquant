@@ -29,6 +29,7 @@ struct results_perplexity {
     double                   ppl_value;
     std::vector<float>       logits;
     std::vector<float>       probs;
+    std::string              error;
 };
 
 struct results_log_softmax {
@@ -364,7 +365,13 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
         const auto t_start = std::chrono::high_resolution_clock::now();
 
         // clear the KV cache
-        llama_memory_clear(llama_get_memory(ctx), true);
+        if (!llama_memory_clear(llama_get_memory(ctx), true)) {
+            LOG_ERR("%s: failed to clear the KV cache\n", __func__);
+            results_perplexity out;
+            out.ppl_value = -1;
+            out.error = "failed to clear the KV cache";
+            return out;
+        }
 
         llama_batch batch = llama_batch_init(n_batch, 0, 1);
         if (!llama_batch_is_complete(&batch, n_batch, false, true)) {
@@ -562,7 +569,13 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         const auto t_start = std::chrono::high_resolution_clock::now();
 
         // clear the KV cache
-        llama_memory_clear(llama_get_memory(ctx), true);
+        if (!llama_memory_clear(llama_get_memory(ctx), true)) {
+            LOG_ERR("%s: failed to clear the KV cache\n", __func__);
+            results_perplexity out;
+            out.ppl_value = -1;
+            out.error = "failed to clear the KV cache";
+            return out;
+        }
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -753,7 +766,7 @@ static void compute_logprobs(const float * batch_logits, int n_vocab, std::vecto
     }
 }
 
-static void hellaswag_score(llama_context * ctx, const common_params & params) {
+static void hellaswag_score(llama_context * ctx, const common_params & params, std::string * error) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -945,7 +958,11 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
             return;
         }
 
-        llama_memory_clear(llama_get_memory(ctx), true);
+        if (!llama_memory_clear(llama_get_memory(ctx), true)) {
+            LOG_ERR("%s: failed to clear the KV cache; the context is unusable\n", __func__);
+            *error = "failed to clear the KV cache; the context is unusable";
+            return;
+        }
 
         // decode all tasks [i0, i1)
         if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
@@ -1116,7 +1133,7 @@ static std::vector<winogrande_entry> load_winogrande_from_csv(const std::string 
  *    0,Sarah was a much better surgeon than Maria so _ always got the easier cases.,Sarah,Maria,2
  *
  */
-static void winogrande_score(llama_context * ctx, const common_params & params) {
+static void winogrande_score(llama_context * ctx, const common_params & params, std::string * error) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -1244,7 +1261,11 @@ static void winogrande_score(llama_context * ctx, const common_params & params) 
             return;
         }
 
-        llama_memory_clear(llama_get_memory(ctx), true);
+        if (!llama_memory_clear(llama_get_memory(ctx), true)) {
+            LOG_ERR("%s: failed to clear the KV cache; the context is unusable\n", __func__);
+            *error = "failed to clear the KV cache; the context is unusable";
+            return;
+        }
 
         // decode all tasks [i0, i1)
         if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
@@ -1426,7 +1447,7 @@ static bool multiple_choice_prepare_one_task(llama_context * ctx, multiple_choic
 //     git@hf.co:datasets/Stevross/mmlu
 //     https://huggingface.co/datasets/truthful_qa
 //
-static void multiple_choice_score(llama_context * ctx, const common_params & params) {
+static void multiple_choice_score(llama_context * ctx, const common_params & params, std::string * error) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -1629,7 +1650,11 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
             return;
         }
 
-        llama_memory_clear(llama_get_memory(ctx), true);
+        if (!llama_memory_clear(llama_get_memory(ctx), true)) {
+            LOG_ERR("%s: failed to clear the KV cache; the context is unusable\n", __func__);
+            *error = "failed to clear the KV cache; the context is unusable";
+            return;
+        }
 
         // decode all tasks [i0, i1)
         if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
@@ -1722,7 +1747,7 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
     LOG_INF("\n");
 }
 
-static void kl_divergence(llama_context * ctx, const common_params & params) {
+static void kl_divergence(llama_context * ctx, const common_params & params, std::string * error) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -1836,7 +1861,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
         const auto t_start = std::chrono::high_resolution_clock::now();
 
         // clear the KV cache
-        llama_memory_clear(llama_get_memory(ctx), true);
+        if (!llama_memory_clear(llama_get_memory(ctx), true)) {
+            LOG_ERR("%s: failed to clear the KV cache; the context is unusable\n", __func__);
+            *error = "failed to clear the KV cache; the context is unusable";
+            return;
+        }
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -2113,21 +2142,33 @@ int llama_perplexity(int argc, char ** argv) {
     }
 
     struct results_perplexity results;
+    std::string score_error;
     if (params.hellaswag) {
-        hellaswag_score(ctx, params);
+        hellaswag_score(ctx, params, &score_error);
     } else if (params.winogrande) {
-        winogrande_score(ctx, params);
+        winogrande_score(ctx, params, &score_error);
     } else if (params.multiple_choice) {
-        multiple_choice_score(ctx, params);
+        multiple_choice_score(ctx, params, &score_error);
     } else if (params.kl_divergence) {
-        kl_divergence(ctx, params);
+        kl_divergence(ctx, params, &score_error);
     } else {
         results = perplexity(ctx, params, n_ctx);
+        if (!results.error.empty()) {
+            LOG_ERR("%s: %s\n", __func__, results.error.c_str());
+            llama_backend_free();
+            return 1;
+        }
         if (results.ppl_value < 0) {
             LOG_ERR("%s: perplexity failed\n", __func__);
             llama_backend_free();
             return 1;
         }
+    }
+
+    if (!score_error.empty()) {
+        LOG_ERR("%s: %s\n", __func__, score_error.c_str());
+        llama_backend_free();
+        return 1;
     }
 
     LOG("\n");

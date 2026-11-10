@@ -1419,9 +1419,11 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
     return false;
 }
 
-void llama_kv_cache_dsv4::clear(bool data) {
-    kv_raw->clear(data);
-    clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows
+bool llama_kv_cache_dsv4::clear(bool data) {
+    if (!kv_raw->clear(data)) {
+        return false;
+    }
+    return clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows
 }
 
 bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -1702,16 +1704,18 @@ void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubat
     }
 }
 
-void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
+bool llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
+    bool res = true;
+
     if (seq_id < 0) {
-        kv_csa->clear(data);
-        kv_hca->clear(data);
-        kv_lid->clear(data);
+        res = kv_csa->clear(data) && res;
+        res = kv_hca->clear(data) && res;
+        res = kv_lid->clear(data) && res;
     } else {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
 
-        const auto clear_seq = [seq_id, data](llama_kv_cache * kv) {
-            kv->seq_rm(seq_id, -1, -1);
+        const auto clear_seq = [seq_id, data, &res](llama_kv_cache * kv) {
+            res = kv->seq_rm(seq_id, -1, -1) && res;
 
             if (data) {
                 for (uint32_t il : kv->get_layer_ids()) {
@@ -1734,6 +1738,8 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
     } else {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
     }
+
+    return res;
 }
 
 //

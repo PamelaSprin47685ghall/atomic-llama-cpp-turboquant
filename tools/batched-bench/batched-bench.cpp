@@ -159,7 +159,10 @@ int llama_batched_bench(int argc, char ** argv) {
                     }
                 }
 
-                llama_memory_clear(mem, false);
+                if (!llama_memory_clear(mem, false)) {
+                    LOG_ERR("%s: failed to clear the KV cache\n", __func__);
+                    return 1;
+                }
 
                 const auto t_pp_start = ggml_time_us();
 

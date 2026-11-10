@@ -174,7 +174,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 }
 
-void llama_memory_recurrent::clear(bool data) {
+bool llama_memory_recurrent::clear(bool data) {
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;
         cells[i].seq_id.clear();
@@ -193,6 +193,8 @@ void llama_memory_recurrent::clear(bool data) {
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
     std::fill(replay_len.begin(), replay_len.end(), 0);
+
+    return true;
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

@@ -2223,9 +2223,15 @@ run_result run(const options & requested) {
                     if (svc_round > 0) {
                         svc_barrier();
                         llama_synchronize(contexts[wi].get());
-                        llama_memory_clear(llama_get_memory(contexts[wi].get()), true);
+                        if (!llama_memory_clear(llama_get_memory(contexts[wi].get()), true)) {
+                            failure.fail(std::make_exception_ptr(std::runtime_error("service round: KV cache clear failed")));
+                            break;
+                        }
                         llama_synchronize(trained_mtp_contexts.at(wi).get());
-                        llama_memory_clear(llama_get_memory(trained_mtp_contexts.at(wi).get()), true);
+                        if (!llama_memory_clear(llama_get_memory(trained_mtp_contexts.at(wi).get()), true)) {
+                            failure.fail(std::make_exception_ptr(std::runtime_error("service round: MTP KV cache clear failed")));
+                            break;
+                        }
                         for (auto id : assignments[wi]) {
                             auto & rq = result.requests[id];
                             rq.tokens.clear(); rq.text.clear(); rq.stop_reason.clear(); rq.finished_ns = 0;

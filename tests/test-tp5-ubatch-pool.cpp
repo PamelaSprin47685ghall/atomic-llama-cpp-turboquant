@@ -1273,7 +1273,7 @@ static void test_clear_with_context() {
     {
         auto mctx = kv->init_full();
         check(bool(mctx), "clear context: dummy context created");
-        llama_memory_clear(kv, false);
+        check(llama_memory_clear(kv, false), "clear context: the dummy context can clear the cache");
         check(llama_kv_cache_prepare_test_access::cells(*kv, 0).get_used() == 0,
               "clear context: clear works with a dummy context");
     }

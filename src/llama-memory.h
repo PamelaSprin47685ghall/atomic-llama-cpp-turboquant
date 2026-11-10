@@ -179,7 +179,9 @@ struct llama_memory_i {
     //
 
     // if data == true, the data buffers will also be cleared together with the metadata
-    virtual void clear(bool data) = 0;
+    // returns false when the implementation refused the clear; a refused clear
+    // leaves a state that still requires clear(true)
+    virtual bool clear(bool data) = 0;
 
     virtual bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)                              = 0;
     // Remove the recurrent state only. Attention-only memories have no such state.

@@ -123,7 +123,7 @@ public:
 
     bool get_can_shift() const override;
 
-    void clear(bool data) override;
+    bool clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
@@ -175,7 +175,7 @@ private:
     std::unique_ptr<llama_dsv4_comp_state> hca_state;
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
 
-    void clear_compressed(llama_seq_id seq_id, bool data);
+    bool clear_compressed(llama_seq_id seq_id, bool data);
 };
 
 // DSV4 raw attention only uses the SWA half of kv_raw. The base half is kept

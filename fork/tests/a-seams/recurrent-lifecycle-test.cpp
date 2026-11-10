@@ -137,7 +137,7 @@ public:
 
     void clear(bool data) {
         llama_synchronize(ctx.get());
-        llama_memory_clear(memory(), data);
+        require(llama_memory_clear(memory(), data), "clear failed");
         llama_synchronize(ctx.get());
         for (llama_seq_id id = 0; id < 3; ++id) {
             require(position(id) == -1, "clear left a live sequence");

@@ -142,15 +142,19 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
     return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
 }
 
-void llama_memory_hybrid_idx::clear(bool data) {
-    llama_memory_hybrid::clear(data);
+bool llama_memory_hybrid_idx::clear(bool data) {
+    if (!llama_memory_hybrid::clear(data)) {
+        return false;
+    }
 
-    if (mem_idx) {
-        mem_idx->clear(data);
+    if (mem_idx && !mem_idx->clear(data)) {
+        return false;
     }
 
     // [TAG_PLE_HISTORY] every sequence is gone, so no window is trusted any more
     ple_hist.clear();
+
+    return true;
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

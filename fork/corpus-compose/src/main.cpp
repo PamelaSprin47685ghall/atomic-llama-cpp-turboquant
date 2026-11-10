@@ -141,7 +141,11 @@ public:
         if (!context_) throw std::runtime_error("cannot create model context");
     }
 
-    void clear() { llama_memory_clear(llama_get_memory(context_.get()), true); }
+    void clear() {
+        if (!llama_memory_clear(llama_get_memory(context_.get()), true)) {
+            throw std::runtime_error("KV cache clear failed");
+        }
+    }
 
     void decode(int32_t token) {
         auto batch = llama_batch_get_one(&token, 1);

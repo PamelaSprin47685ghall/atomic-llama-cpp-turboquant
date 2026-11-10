@@ -1506,7 +1506,10 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         if (llama_model_has_decoder(model)) {
             llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
         }
-        llama_memory_clear(llama_get_memory(lctx), true);
+        if (!llama_memory_clear(llama_get_memory(lctx), true)) {
+            COM_ERR("%s", "failed to clear the KV cache after warmup; the context is not usable\n");
+            throw std::runtime_error("warmup KV cache clear failed");
+        }
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
 
@@ -1548,7 +1551,7 @@ char * common_get_model_or_exit(int argc, char * argv[]) {
     return path;
 }
 
-common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
+common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx, std::string * error) {
     auto * mem = llama_get_memory(ctx);
     if (mem == nullptr) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1556,7 +1559,13 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
 
     common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
 
-    llama_memory_clear(mem, true);
+    if (!llama_memory_clear(mem, true)) {
+        COM_ERR("%s", "failed to clear the KV cache before the sequence-removal probe\n");
+        if (error != nullptr) {
+            *error = "failed to clear the KV cache before the sequence-removal probe";
+        }
+        return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    }
 
     // eval 2 tokens to check if the context is compatible
     std::vector<llama_token> tmp;
@@ -1566,6 +1575,9 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
     if (ret != 0) {
         COM_ERR("llama_decode() failed: %d\n", ret);
+        if (error != nullptr) {
+            *error = "llama_decode() failed during the sequence-removal probe";
+        }
         res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
         goto done;
     }
@@ -1584,7 +1596,13 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     }
 
 done:
-    llama_memory_clear(mem, true);
+    if (!llama_memory_clear(mem, true)) {
+        COM_ERR("%s", "failed to clear the KV cache after the sequence-removal probe\n");
+        if (error != nullptr) {
+            *error = "failed to clear the KV cache after the sequence-removal probe";
+        }
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    }
     llama_synchronize(ctx);
 
     return res;

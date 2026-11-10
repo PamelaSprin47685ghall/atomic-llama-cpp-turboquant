@@ -373,7 +373,10 @@ int llama_completion(int argc, char ** argv) {
                 llama_pos pos = n_match > 0 ? (llama_pos)(n_match - 1) : 0;
                 if (!llama_memory_seq_rm(mem, -1, pos, -1)) {
                     LOG_WRN("%s: unable to reuse common prefix (for example, when the memory is recurrent)\n", __func__);
-                    llama_memory_clear(mem, true);
+                    if (!llama_memory_clear(mem, true)) {
+                        LOG_ERR("%s: failed to clear the KV cache\n", __func__);
+                        return 1;
+                    }
                     session_tokens.clear();
                     n_match = 0;
                 } else {

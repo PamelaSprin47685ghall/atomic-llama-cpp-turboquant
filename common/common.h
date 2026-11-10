@@ -1010,7 +1010,10 @@ enum common_context_seq_rm_type {
 
 // check if the llama_context can remove sequences
 // note: clears the memory of the context
-common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
+// if the probe itself fails (for example, the KV cache cannot be cleared), returns
+// COMMON_CONTEXT_SEQ_RM_TYPE_NO and sets *error; callers must report that error
+// instead of treating it as a missing capability
+common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx, std::string * error);
 
 struct common_memory {
     llama_context * ctx_tgt = nullptr;

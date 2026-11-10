@@ -2613,7 +2613,10 @@ int llama_bench(int argc, char ** argv) {
 
         test t(inst, mparams, cache_fit_selected, lmodel, ctx);
 
-        llama_memory_clear(llama_get_memory(ctx), false);
+        if (!llama_memory_clear(llama_get_memory(ctx), false)) {
+            LOG_ERR("%s: failed to clear the KV cache\n", __func__);
+            return 1;
+        }
 
         // cool off before the test
         if (params.delay) {
@@ -2673,7 +2676,10 @@ int llama_bench(int argc, char ** argv) {
         }
 
         for (int i = 0; i < params.reps; i++) {
-            llama_memory_clear(llama_get_memory(ctx), false);
+            if (!llama_memory_clear(llama_get_memory(ctx), false)) {
+                LOG_ERR("%s: failed to clear the KV cache\n", __func__);
+                return 1;
+            }
 
             if (t.n_depth > 0) {
                 bool is_cached = cstate.instance == &inst &&

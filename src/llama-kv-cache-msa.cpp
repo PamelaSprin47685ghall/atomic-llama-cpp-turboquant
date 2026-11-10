@@ -49,9 +49,11 @@ llama_kv_cache_msa::llama_kv_cache_msa(
             n_swa, swa_type, nullptr, filter_idx, reuse, nullptr);
 }
 
-void llama_kv_cache_msa::clear(bool data) {
-    kv_base->clear(data);
-    kv_idx ->clear(data);
+bool llama_kv_cache_msa::clear(bool data) {
+    if (!kv_base->clear(data)) {
+        return false;
+    }
+    return kv_idx->clear(data);
 }
 
 bool llama_kv_cache_msa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

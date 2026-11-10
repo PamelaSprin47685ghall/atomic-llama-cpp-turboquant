@@ -150,6 +150,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_systemInfo(JNIEnv *env, jobject
     return env->NewStringUTF(llama_print_system_info());
 }
 
+static void throw_java_error(JNIEnv * env, const char * message);
+
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject /*unused*/, jint pp, jint tg,
@@ -182,7 +184,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
         }
 
         g_batch.logits[g_batch.n_tokens - 1] = true;
-        llama_memory_clear(llama_get_memory(context), false);
+        if (!llama_memory_clear(llama_get_memory(context), false)) {
+            LOGe("%s: failed to clear the KV cache", __func__);
+            throw_java_error(env, "failed to clear the KV cache");
+            return nullptr;
+        }
 
         const auto t_pp_start = ggml_time_us();
         if (llama_decode(context, g_batch) != 0) {
@@ -194,7 +200,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
 
         LOGi("Benchmark text generation (tg = %d)", tg);
 
-        llama_memory_clear(llama_get_memory(context), false);
+        if (!llama_memory_clear(llama_get_memory(context), false)) {
+            LOGe("%s: failed to clear the KV cache", __func__);
+            throw_java_error(env, "failed to clear the KV cache");
+            return nullptr;
+        }
         const auto t_tg_start = ggml_time_us();
         for (i = 0; i < tg; i++) {
             common_batch_clear(g_batch);
@@ -208,7 +218,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
         }
         const auto t_tg_end = ggml_time_us();
 
-        llama_memory_clear(llama_get_memory(context), false);
+        if (!llama_memory_clear(llama_get_memory(context), false)) {
+            LOGe("%s: failed to clear the KV cache", __func__);
+            throw_java_error(env, "failed to clear the KV cache");
+            return nullptr;
+        }
 
         const auto t_pp = double(t_pp_end - t_pp_start) / 1000000.0;
         const auto t_tg = double(t_tg_end - t_tg_start) / 1000000.0;
@@ -270,13 +284,27 @@ static std::vector<common_chat_msg> chat_msgs;
 static llama_pos system_prompt_position;
 static llama_pos current_position;
 
-static void reset_long_term_states(const bool clear_kv_cache = true) {
+static bool reset_long_term_states(const bool clear_kv_cache = true) {
+    if (clear_kv_cache) {
+        if (!llama_memory_clear(llama_get_memory(g_context), false)) {
+            LOGe("%s: failed to clear the KV cache", __func__);
+            return false;
+        }
+    }
     chat_msgs.clear();
     system_prompt_position = 0;
     current_position = 0;
+    return true;
+}
 
-    if (clear_kv_cache)
-        llama_memory_clear(llama_get_memory(g_context), false);
+static void throw_java_error(JNIEnv * env, const char * message) {
+    if (env->ExceptionCheck()) {
+        return;
+    }
+    jclass cls = env->FindClass("java/lang/RuntimeException");
+    if (cls != nullptr) {
+        env->ThrowNew(cls, message);
+    }
 }
 
 /**
@@ -368,7 +396,10 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
         jstring jsystem_prompt
 ) {
     // Reset long-term & short-term states
-    reset_long_term_states();
+    if (!reset_long_term_states()) {
+        throw_java_error(env, "failed to clear the KV cache");
+        return 1;
+    }
     reset_short_term_states();
 
     // Obtain system prompt from JEnv
@@ -555,9 +586,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv * /*unused*/, jobject /*unused*/) {
+Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv * env, jobject /*unused*/) {
     // Reset long-term & short-term states
-    reset_long_term_states();
+    if (!reset_long_term_states()) {
+        throw_java_error(env, "failed to clear the KV cache");
+    }
     reset_short_term_states();
 
     // Free up resources

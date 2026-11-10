@@ -63,7 +63,10 @@ int main(int argc, char ** argv) {
 
     // warm-up
     llama_decode(ctx, batch);
-    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!llama_memory_clear(llama_get_memory(ctx), true)) {
+        LOG_ERR("%s: failed to clear the KV cache\n", __func__);
+        return 1;
+    }
     llama_synchronize(ctx);
 
     for (int64_t t_pause_ms = 0; t_pause_ms <= 4000; t_pause_ms += 800) {
@@ -92,7 +95,10 @@ int main(int argc, char ** argv) {
             t_sum_us  += t_cur_us;
             t_sum2_us += t_cur_us * t_cur_us;
 
-            llama_memory_clear(llama_get_memory(ctx), true);
+            if (!llama_memory_clear(llama_get_memory(ctx), true)) {
+                LOG_ERR("%s: failed to clear the KV cache\n", __func__);
+                return 1;
+            }
             llama_synchronize(ctx); // just in case
         }
 

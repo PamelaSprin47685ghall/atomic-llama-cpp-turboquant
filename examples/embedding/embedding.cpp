@@ -34,16 +34,20 @@ static void batch_add_seq(llama_batch & batch, const std::vector<int32_t> & toke
     }
 }
 
-static void batch_decode(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd_out, int embd_norm) {
+static bool batch_decode(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd_out, int embd_norm) {
     const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
 
     // clear previous kv_cache values (irrelevant for embeddings)
-    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!llama_memory_clear(llama_get_memory(ctx), true)) {
+        LOG_ERR("%s: failed to clear the KV cache; the context is unusable\n", __func__);
+        return false;
+    }
 
     // run model
     LOG_INF("%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
     if (llama_decode(ctx, batch) < 0) {
         LOG_ERR("%s : failed to process\n", __func__);
+        return false;
     }
 
     for (int i = 0; i < batch.n_tokens; i++) {
@@ -69,6 +73,7 @@ static void batch_decode(llama_context * ctx, llama_batch & batch, float * outpu
         float * out = output + embd_pos * n_embd_out;
         common_embd_normalize(embd, out, n_embd_out, embd_norm);
     }
+    return true;
 }
 
 // plain, pipe-friendly output: one embedding per line
@@ -277,7 +282,9 @@ int main(int argc, char ** argv) {
         // encode if at capacity
         if (batch.n_tokens + n_toks > n_batch || s >= n_seq_max) {
             float * out = emb + e * n_embd_out;
-            batch_decode(ctx, batch, out, s, n_embd_out, params.embd_normalize);
+            if (!batch_decode(ctx, batch, out, s, n_embd_out, params.embd_normalize)) {
+                return 1;
+            }
             e += pooling_type == LLAMA_POOLING_TYPE_NONE ? batch.n_tokens : s;
             s = 0;
             common_batch_clear(batch);
@@ -290,7 +297,9 @@ int main(int argc, char ** argv) {
 
     // final batch
     float * out = emb + e * n_embd_out;
-    batch_decode(ctx, batch, out, s, n_embd_out, params.embd_normalize);
+    if (!batch_decode(ctx, batch, out, s, n_embd_out, params.embd_normalize)) {
+        return 1;
+    }
 
     if (params.embd_out.empty()) {
         LOG("\n");

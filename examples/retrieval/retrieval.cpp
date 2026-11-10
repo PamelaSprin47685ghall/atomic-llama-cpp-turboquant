@@ -82,14 +82,18 @@ static void batch_add_seq(llama_batch & batch, const std::vector<int32_t> & toke
     }
 }
 
-static void batch_process(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd) {
+static bool batch_process(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd) {
     // clear previous kv_cache values (irrelevant for embeddings)
-    llama_memory_clear(llama_get_memory(ctx), false);
+    if (!llama_memory_clear(llama_get_memory(ctx), false)) {
+        LOG_ERR("%s: failed to clear the KV cache; the context is unusable\n", __func__);
+        return false;
+    }
 
     // run model
     LOG_INF("%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
     if (llama_decode(ctx, batch) < 0) {
         LOG_ERR("%s : failed to process\n", __func__);
+        return false;
     }
 
     for (int i = 0; i < batch.n_tokens; i++) {
@@ -110,6 +114,7 @@ static void batch_process(llama_context * ctx, llama_batch & batch, float * outp
         float * out = output + batch.seq_id[i][0] * n_embd;
         common_embd_normalize(embd, out, n_embd, 2);
     }
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -242,7 +247,9 @@ int main(int argc, char ** argv) {
         // encode if at capacity
         if (batch.n_tokens + n_toks > n_batch || s >= llama_n_seq_max(ctx)) {
             float * out = emb + p * n_embd_out;
-            batch_process(ctx, batch, out, s, n_embd_out);
+            if (!batch_process(ctx, batch, out, s, n_embd_out)) {
+                return 1;
+            }
             common_batch_clear(batch);
             p += s;
             s = 0;
@@ -255,7 +262,9 @@ int main(int argc, char ** argv) {
 
     // final batch
     float * out = emb + p * n_embd_out;
-    batch_process(ctx, batch, out, s, n_embd_out);
+    if (!batch_process(ctx, batch, out, s, n_embd_out)) {
+        return 1;
+    }
 
     // save embeddings to chunks
     for (int i = 0; i < n_chunks; i++) {
@@ -284,7 +293,9 @@ int main(int argc, char ** argv) {
         batch_add_seq(query_batch, query_tokens, 0);
 
         std::vector<float> query_emb(n_embd_out, 0);
-        batch_process(ctx, query_batch, query_emb.data(), 1, n_embd_out);
+        if (!batch_process(ctx, query_batch, query_emb.data(), 1, n_embd_out)) {
+            return 1;
+        }
 
         common_batch_clear(query_batch);
 

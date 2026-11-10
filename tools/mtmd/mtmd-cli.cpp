@@ -508,7 +508,10 @@ int main(int argc, char ** argv) {
             if (line == "/clear") {
                 ctx.n_past = 0;
                 ctx.chat_history.clear();
-                llama_memory_clear(llama_get_memory(ctx.lctx), true);
+                if (!llama_memory_clear(llama_get_memory(ctx.lctx), true)) {
+                    LOG_ERR("%s: failed to clear the KV cache\n", __func__);
+                    return 1;
+                }
                 if (eval_system_prompt_if_present()) {
                     return 1;
                 }

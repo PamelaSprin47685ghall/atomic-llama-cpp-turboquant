@@ -316,7 +316,7 @@ static void run_backend_failure(const char * model_path) {
     CHECK(llama_state_seq_set_data(ctx, empty_state.data(), empty_size, 1) == 0,
           "empty-stream state read refused after failed update");
 
-    llama_memory_clear(llama_get_memory(ctx), true);
+    CHECK(llama_memory_clear(llama_get_memory(ctx), true), "clear(true) recovers the KV state");
     g_mock_dev_state.fail_next_compute = false;
     CHECK(decode_one(ctx, 3), "decode recovers after clear(true)");
 

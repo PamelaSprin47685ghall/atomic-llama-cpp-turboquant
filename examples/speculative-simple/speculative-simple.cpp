@@ -100,8 +100,18 @@ int main(int argc, char ** argv) {
     }
 
     // check if the context supports partial sequence removal
-    const bool use_ckpt_tgt = (common_context_can_seq_rm(ctx_tgt)       == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
-    const bool use_ckpt_dft = (common_context_can_seq_rm(ctx_dft.get()) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+    std::string rm_error_tgt;
+    std::string rm_error_dft;
+    const bool use_ckpt_tgt = (common_context_can_seq_rm(ctx_tgt,       &rm_error_tgt) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+    const bool use_ckpt_dft = (common_context_can_seq_rm(ctx_dft.get(), &rm_error_dft) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+
+    if (!rm_error_tgt.empty() || !rm_error_dft.empty()) {
+        LOG_ERR("%s: sequence-removal probe failed: %s%s%s\n", __func__,
+                rm_error_tgt.c_str(),
+                (!rm_error_tgt.empty() && !rm_error_dft.empty()) ? "; " : "",
+                rm_error_dft.c_str());
+        return 1;
+    }
 
     if (use_ckpt_tgt) {
         LOG_INF("speculative decoding will use checkpoints (context does not support partial sequence removal)\n");

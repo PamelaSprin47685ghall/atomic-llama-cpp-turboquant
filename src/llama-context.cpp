@@ -9234,7 +9234,9 @@ void llama_context::opt_epoch_iter(ggml_opt_dataset_t               dataset,
     const uint32_t n_batch  = std::min(this->n_batch(), n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
 
-    memory->clear(true);
+    if (!memory->clear(true)) {
+        throw std::runtime_error("failed to clear the memory before training");
+    }
 
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
         batch.n_tokens = n_batch;
@@ -10185,12 +10187,12 @@ bool llama_memory_seq_rm_recurrent(llama_memory_t mem, llama_seq_id seq_id) {
     return mem && seq_id >= 0 && mem->seq_rm_recurrent(seq_id);
 }
 
-void llama_memory_clear(llama_memory_t mem, bool data) {
+bool llama_memory_clear(llama_memory_t mem, bool data) {
     if (!mem) {
-        return;
+        return true;
     }
 
-    mem->clear(data);
+    return mem->clear(data);
 }
 
 bool llama_memory_seq_rm(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

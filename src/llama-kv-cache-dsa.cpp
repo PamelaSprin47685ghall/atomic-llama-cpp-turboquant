@@ -53,9 +53,11 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
             n_swa, swa_type, nullptr, filter_lid, reuse, nullptr);
 }
 
-void llama_kv_cache_dsa::clear(bool data) {
-    kv_mla->clear(data);
-    kv_lid->clear(data);
+bool llama_kv_cache_dsa::clear(bool data) {
+    if (!kv_mla->clear(data)) {
+        return false;
+    }
+    return kv_lid->clear(data);
 }
 
 bool llama_kv_cache_dsa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

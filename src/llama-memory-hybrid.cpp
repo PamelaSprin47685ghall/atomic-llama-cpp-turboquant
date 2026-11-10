@@ -144,9 +144,11 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
-void llama_memory_hybrid::clear(bool data) {
-    mem_attn->clear(data);
-    mem_recr->clear(data);
+bool llama_memory_hybrid::clear(bool data) {
+    if (!mem_attn->clear(data)) {
+        return false;
+    }
+    return mem_recr->clear(data);
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

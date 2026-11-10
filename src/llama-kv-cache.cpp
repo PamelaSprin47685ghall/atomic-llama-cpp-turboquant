@@ -849,7 +849,7 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
-void llama_kv_cache::clear(bool data) {
+bool llama_kv_cache::clear(bool data) {
     shift_backup_clear();
     if (data) {
         shift_failed = false;
@@ -879,6 +879,7 @@ void llama_kv_cache::clear(bool data) {
         }
     }
 
+    return !shift_failed;
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

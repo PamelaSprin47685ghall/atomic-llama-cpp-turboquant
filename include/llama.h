@@ -1224,7 +1224,10 @@ extern "C" {
 
     // Clear the memory contents
     // If data == true, the data buffers will also be cleared together with the metadata
-    LLAMA_API void llama_memory_clear(
+    // Returns false when the memory refused the clear, for example after a
+    // failed K-shift until clear(true) recovers it. A null memory is a no-op
+    // and reports success.
+    LLAMA_API bool llama_memory_clear(
             llama_memory_t mem,
                       bool data);
 

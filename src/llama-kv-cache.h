@@ -347,7 +347,7 @@ public:
 
     bool get_can_shift() const override;
 
-    void clear(bool data) override;
+    bool clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     bool seq_rm_recurrent(llama_seq_id) override { return true; }

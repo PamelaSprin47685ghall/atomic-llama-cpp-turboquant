@@ -127,9 +127,11 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             swa_is_full_length ? kv_stream_maximum_pool_bytes : 0);
 }
 
-void llama_kv_cache_iswa::clear(bool data) {
-    kv_base->clear(data);
-    kv_swa ->clear(data);
+bool llama_kv_cache_iswa::clear(bool data) {
+    if (!kv_base->clear(data)) {
+        return false;
+    }
+    return kv_swa->clear(data);
 }
 
 bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

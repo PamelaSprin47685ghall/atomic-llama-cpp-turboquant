@@ -253,7 +253,10 @@ static bool test_seq_cp_host(struct llama_model * model, const struct common_par
         }
         LOG_TRC("%s: seq 0 copied, %zd bytes\n", __func__, ncopy);
 
-        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        if (!llama_memory_clear(llama_get_memory(ctx.get()), true)) {
+            LOG_ERR("%s: failed to clear the KV cache\n", __func__);
+            return false;
+        }
         LOG_TRC("%s: kv cache cleared\n", __func__);
 
         const size_t nset = llama_state_seq_set_data(ctx.get(), seq_store.data(), seq_store.size(), 1);
@@ -325,7 +328,10 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
         }
         LOG_TRC("%s: seq 0 copied, %zd bytes\n", __func__, ncopy);
 
-        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        if (!llama_memory_clear(llama_get_memory(ctx.get()), true)) {
+            LOG_ERR("%s: failed to clear the KV cache\n", __func__);
+            return false;
+        }
         LOG_TRC("%s: kv cache cleared\n", __func__);
 
         const size_t nset = llama_state_seq_set_data_ext(ctx.get(), seq_store.data(), seq_store.size(), 1, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
