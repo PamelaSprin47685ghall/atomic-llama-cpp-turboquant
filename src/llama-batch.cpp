@@ -194,8 +194,6 @@ bool llama_batch_allocr::init(
         n_outputs += batch.logits[i] != 0;
     }
 
-    has_cpl = false;
-
     // determine coupled sequences
     // these are pairs of sequences that have at least one token in the input batch that is assigned to both of them
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
@@ -208,7 +206,14 @@ bool llama_batch_allocr::init(
 
             if (s > 0) {
                 // mark that sequence s1 is coupled to s0
-                seq_cpl[s1][s0] = true;
+                if (!seq_cpl[s1][s0]) {
+                    // register the pair before setting the bit: emplace_back can
+                    // throw, and a bit without a recorded pair would never be
+                    // cleared. The vector<bool> assignment cannot throw, so the
+                    // pair and the bit stay in sync.
+                    seq_cpl_pairs.emplace_back(s1, s0);
+                    seq_cpl[s1][s0] = true;
+                }
 
                 // note: tracking the other way around is not necessary for now
                 //seq_cpl[s0][s1] = true;
@@ -358,7 +363,9 @@ bool llama_batch_allocr::init(
         }
     }
 
-    if (memory) {
+    // has_cpl is false iff no seq_cpl bit is set, so an uncoupled batch skips
+    // the full 256x256 scan
+    if (memory && has_cpl) {
         for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
             for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
                 if (seq_cpl[s0][s1]) {
@@ -560,7 +567,10 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
         return {};
     }
 
+    const uint32_t n_avail = (uint32_t) (used.size() - cur_idx);
+
     std::vector<int32_t> idxs;
+    idxs.reserve(std::min(n_ubatch, n_avail));
 
     while (true) {
         idxs.push_back(cur_idx);
@@ -807,17 +817,22 @@ void llama_batch_allocr::clear() {
     pos       .clear();
     n_seq_id  .clear();
     seq_id    .clear();
-    seq_id_unq.clear();
     output    .clear();
     decision_order.clear();
 
     for (auto & cur : seq_pos) {
         cur.clear();
     }
+    seq_id_unq.clear();
 
-    for (auto & cur : seq_cpl) {
-        std::fill(cur.begin(), cur.end(), false);
+    // Only the coupling bits that the previous batch recorded need a reset.
+    // A batch without coupling therefore leaves the full matrix untouched.
+    for (const auto & cpl : seq_cpl_pairs) {
+        seq_cpl[cpl.first][cpl.second] = false;
     }
+    seq_cpl_pairs.clear();
+
+    has_cpl = false;
 
     seq_set.clear();
 

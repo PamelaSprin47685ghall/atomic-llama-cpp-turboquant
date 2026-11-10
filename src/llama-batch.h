@@ -11,6 +11,7 @@
 #include <bitset>
 #include <memory>
 #include <unordered_map>
+#include <utility>
 
 // keep this struct lightweight
 struct llama_ubatch {
@@ -149,6 +150,11 @@ private:
 
     std::vector<pos_set_t> seq_pos; // seq_pos[s]: the set of positions in sequence s
     std::vector<seq_cpl_t> seq_cpl; // seq_cpl[s0][s1]: if sequence s0 is coupled to sequence s1
+
+    // the (dependent, primary) pairs whose seq_cpl bit is set in this batch,
+    // recorded once per pair. clear() resets only these bits, so an uncoupled
+    // batch does not touch the full matrix.
+    std::vector<std::pair<llama_seq_id, llama_seq_id>> seq_cpl_pairs;
 
     using idx_vec_t = std::vector<int32_t>;
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;

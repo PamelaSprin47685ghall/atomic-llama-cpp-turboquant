@@ -452,6 +452,66 @@ Verification: JSON is valid; the five actual file SHA256 values match the
 new entries; the diff is exactly five SHA256 lines. The guard was not
 rerun; no GPU or full suite was run.
 
+### B9. Batch allocr coupling cleanup and split reserve round 2026-11-10
+
+Scope: `src/llama-batch.cpp`, `src/llama-batch.h` and
+`tests/test-batch-alloc.cpp`. The three manifest entries are re-signed for
+this round; no other entry is rewritten.
+
+`llama_batch_allocr::clear()` used to clear all 256x256 coupling bits on every
+batch, and the memory divergence check scanned the full matrix even when the
+batch had no multi-sequence token. The allocator now records the
+`(dependent, primary)` pairs whose `seq_cpl` bit is set, clears only those
+bits, and resets `has_cpl` in `clear()`. The per-sequence position and index
+state is still cleared in full. The divergence check runs only when `has_cpl`
+is set. `split_simple()` reserves `min(n_ubatch, remaining tokens)`, the exact
+upper bound of its chunk.
+
+Invariants kept:
+
+- `seq_pos` is fully cleared at the start of `init()`; after it, sequence `s`
+  has entries iff it appears in the current batch.
+- Every `seq_cpl` bit is recorded exactly once in `seq_cpl_pairs`, and the
+  pair is recorded before its bit is set. A failed `emplace_back` therefore
+  leaves no untracked bit, and any pair recorded by a failed `init()` is
+  cleared by the next `clear()`.
+- `has_cpl` is false after `clear()` and true iff at least one pair was
+  recorded.
+- `split_simple()` behavior is unchanged; `used` is still required to be a
+  prefix of true entries, which its callers preserve.
+
+| path | old recorded | new signed sha256 |
+|---|---|---|
+| `src/llama-batch.cpp` | `42468b792b218a0ac33f2cfe7607a8d26d87979a8c107c070a38a32ae0e74bd7` | `e21f7dea65beba1cb980e69987d29f44b7917c2da202d127f3cd465efd4c2d19` |
+| `src/llama-batch.h` | `e0440479841dedd26b6e89878dc67fae0e9592955eaf50662981b5eb56c7f144` | `a8884a5b545bc235b3ee8a76f135d428182427237a469089cf49c17cc1f32e89` |
+| `tests/test-batch-alloc.cpp` | `061661c773d486eaa3ecc91f2a45e6a166656e489040ba6aa12eb7e46d85d190` | `af28ae435a5f6ec972e81c9e6d1ba6528780204d09b01ecbff04840537565475` |
+
+New tests: `init.coupled_bits_cleared_between_batches` (a stale pair from an
+accepted batch and from a rejected coupled batch must not reject a later
+uncoupled or differently coupled batch), and
+`split.split_equal_sequential_after_coupled_batch` (`has_cpl` does not leak
+across batches). `init.coupled_multiple_pairs_cleared_between_batches` records
+two different pairs in one batch and then makes both dependent sequences
+diverge, so a `clear()` that drops either recorded pair is rejected. The
+former `init.seq_pos_cleared_for_absent_sequences` test was dropped: `clear()`
+still resets `seq_pos` in full, but that path predates this round and the test
+exercised none of the changed code.
+
+Verification: the initial round built only `test-batch-alloc` in a fresh
+CPU-only Ninja build (`LLAMA_BUILD_TESTS=ON`, `LLAMA_BUILD_COMMON=ON`,
+CUDA/HIP off) and ran it once: 44 tests, 474 assertions, 0 failures,
+0 exceptions, exit 0. The exception-safety repair swaps one test, so the tree
+still registers 44 tests; the assertion total changes and was not re-measured.
+DevOps runs the single CPU verification of the repaired tree. No GPU, full
+suite, benchmark or speed claim. The guard was not rerun; all debt recorded in
+B5-B8 and Section A remains.
+
+Final repaired-tree verification: a fresh CPU-only build in
+`/tmp/tmp.Tpt83qyFof` ran `test-batch-alloc` once: 44 tests, 470 assertions,
+0 failures, exit 0. `bad_alloc` was not directly injected. No GPU. The four
+uncommitted staging files were not exercised; their runtime remains
+unverified.
+
 ## C. Pre-existing undeclared A paths
 
 172 paths remain undeclared after registering the WS2/WS3/WS4/WS5 paths.

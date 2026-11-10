@@ -736,24 +736,24 @@
     },
     {
       "path": "src/llama-batch.cpp",
-      "sha256": "42468b792b218a0ac33f2cfe7607a8d26d87979a8c107c070a38a32ae0e74bd7",
+      "sha256": "e21f7dea65beba1cb980e69987d29f44b7917c2da202d127f3cd465efd4c2d19",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose",
         "llama batch allocator tests"
       ],
-      "reason": "Acquire ubatch payloads from the fixed-slot pool and restore every caller-filled array on a reused slot. Check every llama_batch_init allocation, including the outer seq_id array, and return a partial batch with null fields on failure instead of dereferencing it. The test injects failures with an LD_PRELOAD malloc/calloc interposer; production has no hook.",
+      "reason": "Acquire ubatch payloads from the fixed-slot pool and restore every caller-filled array on a reused slot. Check every llama_batch_init allocation, including the outer seq_id array, and return a partial batch with null fields on failure instead of dereferencing it. The test injects failures with an LD_PRELOAD malloc/calloc interposer; production has no hook. Reset only the coupling bits that the previous batch recorded, reset has_cpl there, skip the 256x256 divergence scan when the batch has no coupled sequence, and reserve the exact split_simple chunk size. Record each coupling pair before setting its bit so an allocation failure cannot leave an untracked bit.",
       "removal_condition": "Remove when the pool is unconditional and upstream provides a reusable ubatch payload allocator."
     },
     {
       "path": "src/llama-batch.h",
-      "sha256": "e0440479841dedd26b6e89878dc67fae0e9592955eaf50662981b5eb56c7f144",
+      "sha256": "a8884a5b545bc235b3ee8a76f135d428182427237a469089cf49c17cc1f32e89",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose",
         "llama batch allocator tests"
       ],
-      "reason": "Store the ubatch payload in the pooled handle and keep the allocr pool beside the split state.",
+      "reason": "Store the ubatch payload in the pooled handle and keep the allocr pool beside the split state. Record the coupling pairs set by the current batch so clear() resets only those bits.",
       "removal_condition": "Remove when the pool is unconditional and upstream owns the ubatch payload type."
     },
     {
@@ -811,12 +811,12 @@
     },
     {
       "path": "tests/test-batch-alloc.cpp",
-      "sha256": "061661c773d486eaa3ecc91f2a45e6a166656e489040ba6aa12eb7e46d85d190",
+      "sha256": "af28ae435a5f6ec972e81c9e6d1ba6528780204d09b01ecbff04840537565475",
       "mode": "100644",
       "consumers": [
         "llama batch allocator tests"
       ],
-      "reason": "Check that pooled and heap ubatch splits carry identical values and that reserve resets a reused slot.",
+      "reason": "Check that pooled and heap ubatch splits carry identical values and that reserve resets a reused slot. Check cross-batch coupling-bit cleanup for one pair and for several pairs recorded in the same batch, and has_cpl reset.",
       "removal_condition": "Remove when the pool is unconditional and the equivalent checks live in the upstream test suite."
     },
     {

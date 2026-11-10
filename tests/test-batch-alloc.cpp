@@ -281,6 +281,73 @@ static void test_init(testing & t) {
         mem.ranges[1] = {0, 5};
         t.assert_true(ba.init(bb.make(), vocab, &mem, bb.n_embd, 4, false));
     });
+
+    t.test("coupled_bits_cleared_between_batches", [&](testing & t) {
+        llama_batch_allocr ba(1);
+
+        mock_memory mem;
+        mem.ranges[0] = {0, 5};
+        mem.ranges[1] = {0, 5};
+        mem.ranges[2] = {0, 5};
+        mem.ranges[3] = {0, 5};
+
+        {
+            batch_builder bb;
+            bb.add(6, {0, 1}, true);
+            t.assert_true("coupled batch accepted", ba.init(bb.make(), vocab, &mem, bb.n_embd, 4, false));
+        }
+
+        // the next batch couples a different pair; the stale (1, 0) bit must
+        // not make the divergence of seqs 0 and 1 matter
+        mem.ranges[1] = {2, 5};
+
+        {
+            batch_builder bb;
+            bb.add(6, {2, 3}, true);
+            t.assert_true("stale coupling bit does not leak", ba.init(bb.make(), vocab, &mem, bb.n_embd, 4, false));
+        }
+
+        // a failed coupled batch must also leave no bits behind
+        {
+            batch_builder bb;
+            bb.add(6, {0, 1}, true);
+            t.assert_true("diverged coupled batch rejected", !ba.init(bb.make(), vocab, &mem, bb.n_embd, 4, false));
+        }
+        {
+            batch_builder bb;
+            bb.add(6, {2, 3}, true);
+            t.assert_true("failed batch does not leak coupling bits", ba.init(bb.make(), vocab, &mem, bb.n_embd, 4, false));
+        }
+    });
+
+    t.test("coupled_multiple_pairs_cleared_between_batches", [&](testing & t) {
+        llama_batch_allocr ba(1);
+
+        mock_memory mem;
+        mem.ranges[0] = {0, 5};
+        mem.ranges[1] = {0, 5};
+        mem.ranges[2] = {0, 5};
+        mem.ranges[3] = {0, 5};
+
+        // one batch records two different pairs: (1, 0) and (2, 0)
+        {
+            batch_builder bb;
+            bb.add(6, {0, 1}, true);
+            bb.add(6, {0, 2}, true);
+            t.assert_true("batch with two coupled pairs accepted", ba.init(bb.make(), vocab, &mem, bb.n_embd, 4, false));
+        }
+
+        // both bits must be gone: either stale bit would reject this batch,
+        // because seqs 1 and 2 now diverge from seq 0
+        mem.ranges[1] = {2, 5};
+        mem.ranges[2] = {2, 5};
+
+        {
+            batch_builder bb;
+            bb.add(6, {0, 3}, true);
+            t.assert_true("every recorded pair is cleared", ba.init(bb.make(), vocab, &mem, bb.n_embd, 4, false));
+        }
+    });
 }
 
 static void test_split(testing & t) {
@@ -407,6 +474,29 @@ static void test_split(testing & t) {
         t.assert_equal(2, ub.n_seq_id[0]);
         t.assert_equal(0, ub.seq_idx[0]);
         t.assert_equal(1, ub.seq_idx[1]);
+    });
+
+    t.test("split_equal_sequential_after_coupled_batch", [&](testing & t) {
+        llama_batch_allocr ba(1);
+
+        {
+            batch_builder bb;
+            bb.add(0, {0, 1}, true);
+            t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+        }
+
+        {
+            batch_builder bb;
+            bb.add(0, {0}, false);
+            bb.add(1, {0}, false);
+            bb.add(0, {1}, false);
+            bb.add(1, {1}, true);
+            t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+            llama_ubatch ub = ba.split_equal(8, true, 0);
+            t.assert_equal("has_cpl is reset between batches", 4u, ub.n_tokens);
+            t.assert_equal(2u, ub.n_seqs);
+        }
     });
 
     t.test("split_seq_per_sequence", [&](testing & t) {
