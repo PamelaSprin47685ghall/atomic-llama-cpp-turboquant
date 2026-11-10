@@ -1056,10 +1056,6 @@ ggml_backend_reg_t ggml_backend_dev_backend_reg(ggml_backend_dev_t device) {
 
 ggml_backend_t ggml_backend_dev_init(ggml_backend_dev_t device, const char * params) {
     GGML_ASSERT(device);
-    // A test may call a built-in backend reg directly without first walking
-    // the registry. Construct get_reg() here so every built-in static backend
-    // is registered in the module table before the pin lookup below.
-    (void) ggml_backend_reg_count();
     const ggml_backend_reg_t reg = device->reg;
     ggml_backend_module::ggml_backend_pin pin;
     if (!ggml_backend_module::hold_user(reg, &pin)) {

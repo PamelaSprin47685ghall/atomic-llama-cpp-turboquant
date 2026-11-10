@@ -2062,6 +2062,16 @@ ggml_backend_dev_t ggml_backend_meta_device(
         std::shared_ptr<void> none;
         (void) ggml_backend_module::attach(&ggml_backend_meta_reg, none, false);
     });
+    // A caller may pass built-in child registries that have not been walked
+    // through get_reg() yet. Publish only an unknown module record; never
+    // touch an unloading or unloaded one.
+    for (size_t i = 0; i < n_devs; ++i) {
+        if (devs[i] != nullptr && devs[i]->reg != nullptr &&
+                ggml_backend_module::state(devs[i]->reg) == ggml_backend_module_state::unknown) {
+            std::shared_ptr<void> none;
+            (void) ggml_backend_module::attach(devs[i]->reg, none, false);
+        }
+    }
     // TODO: this is not thread-safe - needs to be fixed
     static std::vector<std::unique_ptr<ggml_backend_meta_device_context>>         ctxs;
     static std::map<ggml_backend_meta_device_context, struct ggml_backend_device> meta_devs;

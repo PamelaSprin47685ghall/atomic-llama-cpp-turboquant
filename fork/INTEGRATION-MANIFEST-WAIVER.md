@@ -49,7 +49,7 @@ Newly registered paths in this round:
 `fork/mtp-progress-20261031` archive. Source and test files are not exempted.
 
 Guard result: `changed_upstream_paths=340`, `extension_paths=366`,
-`exception_manifest_sha256=c768ef406b4d9c619c618c0f4eaf1315a62d11904b3a04c77003959f354c44ec`.
+`exception_manifest_sha256=c19e3a9ebf74800c2fd4d187d05f70c2219fec492f54961988c2011c9efbc3e6`.
 No source or test file was modified, added, or removed by the manifest round.
 
 ## A. Pre-existing mismatches (historical)
