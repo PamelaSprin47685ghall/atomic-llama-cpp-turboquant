@@ -4085,7 +4085,8 @@ static void ggml_backend_meta_copy_range_axis01(
 }
 
 static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
-        const void * data, size_t offset, size_t size, const ggml_tensor * staging_meta) {
+        const void * data, size_t offset, size_t size, const ggml_tensor * staging_meta,
+        bool allow_staging, bool submit_gate_held) {
     if (size == 0) {
         return;
     }
@@ -4239,7 +4240,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
             ggml_cuda_staging::lease staged_lease;
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
             bool staged = false;
-            if (st != nullptr && st->enabled() && staging_eligible(tensor, size, &staging_kind) &&
+            if (allow_staging && st != nullptr && st->enabled() && staging_eligible(tensor, size, &staging_kind) &&
                     st->acquire(staging_window(), staging_kind, size, &staged_lease)) {
                 const int upload_result = st->upload(&staged_lease, data, size);
                 if (upload_result == int(ggml_cuda_staging::submit_result::fatal)) {
@@ -4253,7 +4254,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
                 }
             }
             const uint8_t * src_base = staged ? staged_lease.host : static_cast<const uint8_t *>(data);
-            if (staging_gate) {
+            if (!submit_gate_held && staging_gate) {
                 if (!st->enter_submit()) {
                     if (staged) {
                         st->release(&staged_lease);
@@ -4273,7 +4274,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
                 ggml_backend_tensor_set_2d(simple_tensor, (const char *) src_base + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
                 offset_j += chunk_size_j;
             }
-            if (staging_gate) {
+            if (!submit_gate_held && staging_gate) {
                 st->leave_submit();
             }
             if (staged) {
@@ -4295,7 +4296,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
             // configured(), not enabled(): a faulted pool must keep the gate.
             const bool staging_gate = st != nullptr && (st->configured == nullptr || st->configured());
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
-            const bool staging_on = st != nullptr && st->enabled();
+            const bool staging_on = allow_staging && st != nullptr && st->enabled();
             // The blocking copy path passes the original source as
             // staging_meta; the direct set path passes nullptr and keeps the
             // destination-based behavior. Without a source identity the sync
@@ -4313,7 +4314,9 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
             const bool staging_hit = staging_on && staging_shape_ok &&
                 staging_eligible(staging_src, size, &staging_kind);
             if (diag) {
-                if (st == nullptr) {
+                if (!allow_staging) {
+                    // Intentional no-staging fallback for an owner-aware copy.
+                } else if (st == nullptr) {
                     g_staging_meta_diag.api_null.fetch_add(1, std::memory_order_relaxed);
                 } else if (!staging_on) {
                     g_staging_meta_diag.disabled.fetch_add(1, std::memory_order_relaxed);
@@ -4402,7 +4405,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
                             // Reached only when nothing was submitted. The
                             // fallback copy shares the submit gate with the
                             // fatal publication.
-                            if (!st->enter_submit()) {
+                            if (!submit_gate_held && !st->enter_submit()) {
                                 st->release(&staged_lease);
                                 staging_record_fatal("sync-fallback-disabled", st);
                                 return;
@@ -4411,7 +4414,9 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
                                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                                 ggml_backend_tensor_set(simple_tensor, staged_lease.host, offset, size);
                             }
-                            st->leave_submit();
+                            if (!submit_gate_held) {
+                                st->leave_submit();
+                            }
                             if (!st->wait(&staged_lease)) {
                                 st->release(&staged_lease);
                                 staging_record_fatal("sync-fallback-wait", st);
@@ -4428,7 +4433,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
                     }
                 }
             }
-            if (staging_gate) {
+            if (!submit_gate_held && staging_gate) {
                 if (!st->enter_submit()) {
                     staging_record_fatal("sync-disabled", st);
                     return;
@@ -4438,7 +4443,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);
             }
-            if (staging_gate) {
+            if (!submit_gate_held && staging_gate) {
                 st->leave_submit();
             }
         } break;
@@ -4463,7 +4468,8 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
 
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
         const void * data, size_t offset, size_t size) {
-    ggml_backend_meta_buffer_set_tensor_impl(buffer, tensor, data, offset, size, nullptr);
+    ggml_backend_meta_buffer_set_tensor_impl(buffer, tensor, data, offset, size, nullptr,
+                                             /*allow_staging=*/ true, /*submit_gate_held=*/ false);
 }
 
 // The scheduler's blocking input fallback reaches the Meta buffer through
@@ -4598,7 +4604,8 @@ static bool ggml_backend_meta_buffer_cpy_tensor(
             split_state.n_segments != 1 || split_state.nr[0] != 1) {
         return false;
     }
-    ggml_backend_meta_buffer_set_tensor_impl(buffer, dst, src->data, 0, nbytes, src);
+    ggml_backend_meta_buffer_set_tensor_impl(buffer, dst, src->data, 0, nbytes, src,
+                                             /*allow_staging=*/ true, /*submit_gate_held=*/ false);
     return true;
 }
 
