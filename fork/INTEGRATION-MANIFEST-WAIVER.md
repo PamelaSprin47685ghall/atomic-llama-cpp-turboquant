@@ -1140,12 +1140,36 @@ receipt. `has_unproven()` remains a staging/relay submission check, not a
 complete GPU completion proof. Staging completion receipts remain a separate
 contract and are not faked here.
 
-Narrow verification: built `test-kv-update-status` in this isolated worktree
-and ran it once with `tests/test-models/llama-dense.gguf`:
-`KV_UPDATE_STATUS_TEST PASS checks=20`. An initial attempt with the tiny
-qwen4exp fixture failed at baseline state get because that fixture's state
-size did not match the test buffer; it is discarded as fixture mismatch, not
-code evidence.
+Narrow verification (CPU, isolated worktree, not the main tree): built
+`test-kv-update-status` and ran it once with
+`/tmp/tmp.xRCpsZ1lzq/build/tests/test-models/llama-dense.gguf`:
+`KV_UPDATE_STATUS_TEST PASS checks=20`, exit 0. The 20 checks are the
+llama-dense CPU result; they are not a main-tree, GPU or end-to-end result.
+
+Retained failed run (not rerun, not counted as pass): command
+`/tmp/tmp.35y02xHpoy/build/bin/test-kv-update-status
+/home/kunweiz/work/r28b-f3-draftonly-20261109/build-f3-fixtures/tiny-target.gguf`,
+exit 1. Actual captured error/check lines:
+
+```
+state_seq_get_data: error saving state: unexpectedly reached end of buffer
+state_seq_set_data: error loading state: unexpectedly reached end of buffer
+graph_compute: ggml_backend_sched_graph_compute_async failed with error -1
+process_ubatch: failed to compute graph, compute status: -1
+decode: removing memory module entries for seq_id = 0, pos = [2, +inf)
+llama_decode: failed to decode, ret = -3
+FAIL .../tests/test-kv-update-status.cpp:255: baseline state get
+FAIL .../tests/test-kv-update-status.cpp:269: cells restored after K-shift compute failure
+FAIL .../tests/test-kv-update-status.cpp:281: empty-stream state write refused after failed update
+FAIL .../tests/test-kv-update-status.cpp:283: empty-stream state read refused after failed update
+KV_UPDATE_STATUS_TEST FAIL checks=20 failures=4
+```
+
+The complete terminal output was not saved to a file; the lines above are the
+actual captured failure output. The specific root cause is unknown/not
+proven: the failure first appears at baseline state get, but this record does
+not assert fixture mismatch or a code regression. This failed run is not
+evidence of success.
 
 Manifest: no digest was re-signed. `src/llama-context.cpp/.h`,
 `src/llama-memory-recurrent.h` and `patches/ws5/README.md` remain red/unsigned.
