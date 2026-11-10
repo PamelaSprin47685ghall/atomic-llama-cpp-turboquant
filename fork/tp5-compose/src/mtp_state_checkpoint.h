@@ -12,18 +12,23 @@
 // context, restoring older metadata after a second ON_DEVICE capture for the
 // same seq, or passing truncated/corrupt metadata returns 0 from
 // llama_state_seq_set_data_ext instead of silently copying the wrong tensors
-// or aborting. The context API commits a device capture after the buffer
-// cpy_tensor/blocking fallback copy returns (CUDA/CPU); a Meta destination is
-// split into its real child buffers and copied child by child after a full
-// preflight (split state, view, buffer/data, type/shape/nbytes); false leaves
-// the destination untouched, the ON_DEVICE call returns 0 and does not mark
-// unproven; the caller explicitly requests the host format for a host blob.
-// The ON_DEVICE blob is a device metadata handle, not the full host state; the
-// host blob is a separate format with tensor bytes. True means all child
-// copies completed; a started copy that throws is partial/unknown: the
-// ON_DEVICE restore returns 0 and marks/retains, the capture returns 0 with
-// the old snapshot, no fallback runs and unproven is not cleared. A
-// CUDA_CHECK abort is not a returned status.
+// or aborting. A buffer cpy_tensor true only means the backend accepted or
+// enqueued the copy; it is not a completion receipt. The capture and restore
+// finalize paths synchronize the scheduler backends before publishing the new
+// snapshot or returning the restore. A Meta destination is split into its real
+// child buffers and copied child by child after a full preflight (split state,
+// view, buffer/data, type/shape/nbytes); false leaves the destination
+// untouched, the ON_DEVICE call returns 0 and does not mark unproven; the
+// caller explicitly requests the host format for a host blob. The ON_DEVICE
+// blob is a device metadata handle, not the full host state; the host blob is a
+// separate format with tensor bytes. A transposed v/s state writes a
+// row-interior range; that range is copied through a host buffer instead of a
+// Meta view. A copy that throws after it started is partial/unknown: the
+// ON_DEVICE restore returns 0 and retains the snapshot, its view contexts and
+// the destination cells; the capture returns 0 with the old snapshot and
+// retains the new staging owner. Both are fail-stop: llama_free retains the
+// context, no fallback runs and unproven is not cleared. A CUDA_CHECK abort is
+// not a returned status.
 // A failed capture leaves the previous device snapshot valid. An unproven
 // device copy is fail-stop: the context retains the source, destination,
 // backends and model, and llama_free retains the context. Non-Meta device

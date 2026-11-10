@@ -93,6 +93,7 @@ extern "C" {
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
     // Pure Meta-to-Meta preflight. IMPOSSIBLE leaves both tensors untouched;
     // EXACT uses the child fast copy; SLOW uses the host-staging tensor copy.
+    // A copy true is a submission, not a device-completion proof.
     typedef enum ggml_backend_meta_copy_kind {
         GGML_BACKEND_META_COPY_IMPOSSIBLE = 0,
         GGML_BACKEND_META_COPY_EXACT      = 1,

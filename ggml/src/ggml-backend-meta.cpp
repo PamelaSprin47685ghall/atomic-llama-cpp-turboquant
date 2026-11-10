@@ -2370,9 +2370,10 @@ static bool ggml_backend_meta_buffer_cpy_tensor(
 
     // Device-to-device Meta copy: split both tensors into their real child
     // buffers and copy each child segment with the child buffer's cpy_tensor.
-    // The child cpy_tensor is the actual backend copy (CUDA synchronizes its
-    // per-thread stream; CPU blocks); a false child result falls back to the
-    // blocking tensor copy. The Meta staging owner is not involved.
+    // A child cpy_tensor true is a submission, not a completion proof; the
+    // state capture/restore finalize path synchronizes the backends. A false
+    // child result falls back to the blocking tensor copy. The Meta staging
+    // owner is not involved.
     if (ggml_backend_buffer_is_meta(src_buf)) {
         if (!ggml_backend_meta_buffer_can_copy(const_cast<ggml_tensor *>(src), dst)) {
             return false;

@@ -703,24 +703,29 @@ context identity and a generation; restoring metadata from another context,
 older metadata after a later capture, or truncated or corrupt metadata returns
 0. A device capture is prepared in a fresh buffer map. Each tensor copy uses
 the buffer `cpy_tensor` (bool) and falls back to `ggml_backend_tensor_copy`.
-CUDA/CPU buffers block or synchronize at return; normal async streams are not
-disabled. A Meta destination is split into its real child buffers and each
-child is copied with the child buffer's `cpy_tensor` (with the blocking
-fallback); the staging owner is not used. The child split preflights every
-child (split state, simple view, buffer/data, type/shape/nbytes) before any
-side effect: false means preflight/unsupported with the destination untouched,
-true means all child blocking copies completed. A false preflight is
-no-side-effect unsupported: the ON_DEVICE call returns 0 and does not mark
+A `cpy_tensor` true only means the backend accepted or enqueued the copy; it is
+not a completion receipt. The capture and restore finalize paths synchronize
+the scheduler backends before the new snapshot is published or the restore
+returns, so the previous snapshot is not released while a copy can still write
+it. A Meta destination is split into its real child buffers and each child is
+copied with the child buffer's `cpy_tensor` (with the blocking fallback); the
+staging owner is not used. The child split preflights every child (split state,
+simple view, buffer/data, type/shape/nbytes) before any side effect: false
+means preflight/unsupported with the destination untouched. A false preflight
+is no-side-effect unsupported: the ON_DEVICE call returns 0 and does not mark
 unproven; the caller must explicitly request the host format (host flags) for a
 host blob. The ON_DEVICE blob is a device metadata handle, not the full host
 state; the host blob is a separate format whose size includes the tensor bytes.
-A started copy that throws is partial/unknown: the ON_DEVICE restore returns 0
-and marks/retains; the capture returns 0 with the old snapshot; no fallback is
-attempted and unproven is not cleared. A cross-context device blob is rejected
-by its context id. A legal Meta child copy completes the ON_DEVICE
-capture/restore. Non-Meta device errors keep the existing clear-on-failure. A
-CUDA_CHECK abort is not a returned status. The previous snapshot remains in the
-context.
+A transposed v/s state writes a row-interior range; that range is copied
+through a host buffer instead of a Meta view, because the view cannot map its
+split offset. A copy that throws after it started is partial/unknown: the
+ON_DEVICE restore returns 0 and retains the snapshot, its view contexts and the
+destination cells; the capture returns 0 with the old snapshot and retains the
+new staging owner. Both are fail-stop and `llama_free` retains the context; no
+fallback is attempted and unproven is not cleared. A cross-context device blob
+is rejected by its context id. Non-Meta device errors keep the existing
+clear-on-failure. A CUDA_CHECK abort is not a returned status. The previous
+snapshot remains in the context.
 Host-flag and file restores follow the memory clear-on-failure policy; they are
 not rolled back and do not allocate a full host backup. An invalid destination
 seq id (below -1 or at least n_seq_max) returns 0; -1 addresses all sequences.

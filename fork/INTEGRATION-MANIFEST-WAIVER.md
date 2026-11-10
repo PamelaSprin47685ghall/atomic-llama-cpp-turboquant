@@ -1439,39 +1439,48 @@ Boundaries and transactions:
 - A single-sequence KV restore clears the destination seq first, so an empty or
   shorter source cannot leave stale attention.
 - Device state copies try the destination buffer `cpy_tensor` (bool) and fall
-  back to `ggml_backend_tensor_copy`. The CUDA buffer `cpy_tensor` synchronizes
-  the per-thread stream and the CPU buffer blocks; these are complete at return
-  and normal async streams are not disabled. A Meta destination is split into
-  its real child buffers and each child is copied with the child buffer's
-  `cpy_tensor` (blocking fallback); the staging owner is not used. The Meta
-  child copy preflights every child (exact split state, simple view,
-  buffer/data, type/shape/nbytes) before any side effect: false means
-  preflight/unsupported with the destination untouched; true means all child
-  blocking copies completed. A false preflight is no-side-effect unsupported:
-  the ON_DEVICE call returns 0 and does not mark unproven; the caller must
-  explicitly request the host format (host flags) for a host blob. The
-  ON_DEVICE blob is a device metadata handle, not the full host state; the host
-  blob is a separate format whose size includes the tensor bytes. A started
-  copy that throws is partial/unknown: the ON_DEVICE restore returns 0 and
-  marks/retains; the capture returns 0 with the old snapshot; no fallback runs
-  and unproven is not cleared. Non-Meta device errors keep clear-on-failure; a
-  cross-context device blob is rejected by its context id. A legal Meta child
-  copy completes the ON_DEVICE capture/restore. A CUDA_CHECK abort is not a
-  returned status. The generic `ggml_backend_tensor_copy` fallback checks its
-  malloc. The staging map/copy contexts are retired on a partial restore copy;
-  the capture's new staging is discarded with no unproven; a partial restore
-  sets `state_copy_unproven` and marks the memory unproven.
+  back to `ggml_backend_tensor_copy`. A `cpy_tensor` true only means the
+  backend accepted or enqueued the copy; it is not a device-completion
+  receipt. The capture and restore `finalize` paths synchronize the scheduler
+  backends before the new snapshot is published or the restore returns, so the
+  previous snapshot is not released while a copy can still write it. A Meta
+  destination is split into its real child buffers and each child is copied
+  with the child buffer's `cpy_tensor` (blocking fallback); the staging owner
+  is not used. The Meta child copy preflights every child (exact split state,
+  simple view, buffer/data, type/shape/nbytes) before any side effect: false
+  means preflight/unsupported with the destination untouched. A false
+  preflight is no-side-effect unsupported: the ON_DEVICE call returns 0 and
+  does not mark unproven; the caller must explicitly request the host format
+  (host flags) for a host blob. The ON_DEVICE blob is a device metadata handle,
+  not the full host state; the host blob is a separate format whose size
+  includes the tensor bytes. A transposed v/s state writes a row-interior
+  range; the range is copied through a host buffer instead of a Meta view,
+  because `init_tensor_impl` scales a view offset by the child split and would
+  address the wrong element. Meta get/set also gained an arbitrary axis-0/1
+  byte-range path that walks the segment/child blocks and copies only the
+  requested overlap. A copy that throws after it started is partial/unknown:
+  the ON_DEVICE restore returns 0 and retains the snapshot, its view contexts
+  and the destination cells; the capture returns 0 with the old snapshot and
+  retains the new staging owner in `mem_storage_retired`. Both are fail-stop;
+  no fallback runs and unproven is not cleared. Non-Meta device errors keep
+  clear-on-failure; a cross-context device blob is rejected by its context id.
+  A CUDA_CHECK abort is not a returned status. The generic
+  `ggml_backend_tensor_copy` fallback checks its malloc. A partial restore sets
+  `state_copy_unproven` and marks the memory unproven; the outer catch keys on
+  the reader's unproven state, including the non-row-aligned host path.
   `has_unproven()` makes `llama_free` retain the whole context (source,
   destination, backends, model); the state API returns 0. The memory modules
   and the outer state catch check `llama_state_copy_unproven()` and skip
   `seq_rm`/`clear`, so the destination cells remain owned by the retained
   context. Public memory mutators refuse while the memory is unproven.
 - A device capture builds a fresh buffer map and swaps it in after the
-  CUDA/CPU/Meta child blocking copy returns. A failed capture leaves the
-  previous snapshot and generation intact; the new staging is discarded and no
-  unproven state is set. The old and new buffers coexist until the swap, so peak device
-  memory is about twice the snapshot size; the 512 MiB cap is gone and no
-  fixed cap replaces it.
+  CUDA/CPU/Meta child copy and the completion synchronization return. A
+  failed preflight leaves the previous snapshot and generation intact and
+  discards the new staging with no side effect. A capture that throws after a
+  copy started leaves the previous snapshot intact, retains the new staging
+  and marks the context fail-stop. The old and new buffers coexist until the
+  swap, so peak device memory is about twice the snapshot size; the 512 MiB
+  cap is gone and no fixed cap replaces it.
 - `llama_tp5_context_staging_drain` from `/home/kunweiz/work/r28b-pillar5-sync-owner-v4-e123`
   @7fac3140f is not used. Static comparison: with no relay backend it returns
   DRAINED without querying the memory backend, while an ordinary checkpoint
@@ -1530,7 +1539,7 @@ Not covered: GPU/HIP Meta child copy completion and the CUDA_CHECK fatal abort
 (a backend fatal, not a returned status), the Meta partial-copy mark/retention
 (the child throw is not triggered), different buft/quantized child layouts,
 the staging owner's receipt (not used; staging candidate pending), allocation,
-a real TP5 MTP run, split-axis or strided quantized views, the recurrent
+a real TP5 MTP run, strided non-contiguous source views, the recurrent
 multi-range guard (code-reviewed only), host/file target preservation
 (clear-on-failure, no rollback), the staging owner's ordinary-copy receipt (the
 staging candidate is pending review and its drain is not used), old device
@@ -1539,6 +1548,20 @@ rejected), `common_prompt_checkpoint`'s bool API/`empty()`/`data_spec` and its
 callers (owned by the context-lifecycle branch; integration must use that bool
 API), ASan/LSan, the full suite and the manifest guard (not rerun), and the
 existing model file/generation tests (not rerun).
+
+Follow-up repair (static only): the three review gaps are addressed. A
+row-interior `v_trans`/`s_trans` range no longer builds a Meta view; Meta
+get/set gained an arbitrary axis-0/1 byte-range path and the state copy moves
+that range through a host buffer. A `cpy_tensor` true is treated as an accepted
+submission, and both finalize paths synchronize the scheduler backends before
+the snapshot is published or the restore returns. A capture that throws after
+a copy started retains its staging owner and marks the context fail-stop; a
+restore that throws after a copy started retains the snapshot, view contexts
+and destination cells, with the outer catch keyed on the reader's unproven
+state. The new Meta range test covers a 20-element window starting inside the
+first child and spanning into the second. None of this follow-up was compiled
+or run here: the CPU/Meta test, the state test and the real TP5 MTP path remain
+for safe-devops. The manifest digests are unchanged.
 
 Manifest: `src/llama-io.h`, `src/llama-impl.h`, `src/llama-memory-hybrid.cpp`,
 `src/llama-memory-hybrid-idx.cpp`, `tests/test-save-load-state.cpp` and
