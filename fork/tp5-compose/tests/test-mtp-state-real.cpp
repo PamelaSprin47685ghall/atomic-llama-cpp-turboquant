@@ -176,6 +176,24 @@ static bool run_meta_buffer_copy_test() {
     const bool imp_cap = ggml_backend_buffer_copy_tensor(src, bad_type);
     check(!imp_cap, "meta: impossible fast copy rejected");
 
+    // A transposed v/s state writes a row-interior byte range. That range is
+    // not row-aligned and spans the split children; get/set must copy exactly
+    // the requested bytes without a view.
+    std::vector<float> range_got(20, 0.0f);
+    ggml_backend_tensor_get(src, range_got.data(), 25*sizeof(float), 20*sizeof(float));
+    check(std::memcmp(range_got.data(), orig.data() + 25, 20*sizeof(float)) == 0,
+          "meta: non-row-aligned get spans children");
+
+    std::vector<float> range_set(20);
+    for (int i = 0; i < 20; ++i) {
+        range_set[i] = float(500 + i);
+    }
+    ggml_backend_tensor_set(src, range_set.data(), 25*sizeof(float), 20*sizeof(float));
+    std::vector<float> range_back(20, 0.0f);
+    ggml_backend_tensor_get(src, range_back.data(), 25*sizeof(float), 20*sizeof(float));
+    check(std::memcmp(range_back.data(), range_set.data(), 20*sizeof(float)) == 0,
+          "meta: non-row-aligned set spans children");
+
     ggml_backend_buffer_free(buf);
     ggml_free(gctx);
     return fails == 0;

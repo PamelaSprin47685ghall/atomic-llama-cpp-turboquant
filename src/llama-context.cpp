@@ -8657,9 +8657,20 @@ class llama_io_write_device : public llama_io_write_i {
 
             auto & mbuf = mbufs_new[buft];
 
-            ggml_tensor * org = ggml_view_1d(mbuf.ctx.get(), winfo.tensor, n, winfo.offset);
-            ggml_set_name(org, winfo.tensor->name);
-            mbuf.org.push_back(org);
+            // A transposed v/s state writes a row-interior range. A Meta view
+            // of that range cannot map its split offset, so copy those ranges
+            // through host staging instead of a view.
+            const size_t row = winfo.tensor->nb[1];
+            const bool row_aligned = row > 0 &&
+                winfo.offset % row == 0 && winfo.size % row == 0;
+            if (row_aligned) {
+                ggml_tensor * org = ggml_view_1d(mbuf.ctx.get(), winfo.tensor, n, winfo.offset);
+                ggml_set_name(org, winfo.tensor->name);
+                mbuf.org.push_back(org);
+            } else {
+                mbuf.org.push_back(nullptr);
+                host_ranges[buft].push_back(&winfo);
+            }
             mbuf.cpy.push_back(ggml_new_tensor_1d(mbuf.ctx.get(), winfo.tensor->type, n));
         }
 
@@ -8690,6 +8701,9 @@ class llama_io_write_device : public llama_io_write_i {
                 continue;
             }
             for (size_t i = 0; i < mbuf.org.size(); ++i) {
+                if (mbuf.org[i] == nullptr) {
+                    continue;
+                }
                 if (ggml_backend_meta_buffer_copy_kind(mbuf.org[i], mbuf.cpy[i]) ==
                     GGML_BACKEND_META_COPY_IMPOSSIBLE) {
                     return false;
@@ -8698,7 +8712,17 @@ class llama_io_write_device : public llama_io_write_i {
         }
 
         for (const auto & [buft, mbuf] : mbufs) {
+            const auto hit = host_ranges.find(buft);
+            size_t host_i = 0;
             for (size_t i = 0; i < mbuf.org.size(); ++i) {
+                if (mbuf.org[i] == nullptr) {
+                    GGML_ASSERT(hit != host_ranges.end() && host_i < hit->second.size());
+                    const write_info & winfo = *hit->second[host_i++];
+                    std::vector<char> host(winfo.size);
+                    ggml_backend_tensor_get(winfo.tensor, host.data(), winfo.offset, winfo.size);
+                    ggml_backend_tensor_set(mbuf.cpy[i], host.data(), 0, winfo.size);
+                    continue;
+                }
                 if (ggml_backend_buffer_is_meta(mbuf.buf.get())) {
                     const ggml_backend_meta_copy_kind kind =
                         ggml_backend_meta_buffer_copy_kind(mbuf.org[i], mbuf.cpy[i]);
@@ -8751,6 +8775,8 @@ class llama_io_write_device : public llama_io_write_i {
     std::vector<write_info> winfos;
 
     llama_memory_buffers & mbufs;
+    // non-row-aligned ranges, grouped by buffer type in winfos order
+    std::map<ggml_backend_buffer_type_t, std::vector<const write_info *>> host_ranges;
     bool finalized = false;
 };
 
@@ -8885,6 +8911,19 @@ class llama_io_read_device : public llama_io_read_i {
             if (!copy.ctx) {
                 throw std::runtime_error("failed to allocate device state context");
             }
+        }
+
+        // A transposed v/s state range starts inside a row. A Meta view cannot
+        // map that split offset, so move it through a host buffer instead.
+        const size_t row = tensor->nb[1];
+        const bool row_aligned = row > 0 &&
+            offset % row == 0 && size % row == 0;
+        if (!row_aligned) {
+            std::vector<char> host(size);
+            ggml_backend_tensor_get(cpy, host.data(), 0, size);
+            ggml_backend_tensor_set(tensor, host.data(), offset, size);
+            ++copy.next;
+            return;
         }
 
         ggml_tensor * view = ggml_view_1d(copy.ctx.get(), tensor, n, offset);

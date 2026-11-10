@@ -1837,6 +1837,97 @@ static void ggml_backend_meta_buffer_memset_tensor(
 // copy destination is an internal tensor without the input flag or build-time
 // name, so staging must classify the source instead. A direct set passes
 // nullptr and keeps the destination-based behavior.
+// Copy an arbitrary type-aligned byte range between host data and a Meta
+// tensor split on axis 0 or 1. The range may start and end inside a row, as
+// the transposed recurrent/KV state writes do. The row-aligned fast paths
+// below still handle whole rows; this helper only covers the interior range.
+static void ggml_backend_meta_copy_range_axis01(
+        const ggml_tensor * tensor, void * data, size_t offset, size_t size,
+        size_t n_bufs, const ggml_backend_meta_split_state & split_state, bool to_host) {
+    GGML_ASSERT(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ||
+                split_state.axis == GGML_BACKEND_SPLIT_AXIS_1);
+    GGML_ASSERT(tensor->ne[2] == 1 && tensor->ne[3] == 1);
+    GGML_ASSERT(size > 0);
+
+    const int64_t blck_size = ggml_blck_size(tensor->type);
+    const size_t  type_size = tensor->nb[0];
+    GGML_ASSERT(blck_size > 0 && type_size > 0);
+    GGML_ASSERT(offset % type_size == 0 && size % type_size == 0);
+
+    const size_t row_stride = tensor->nb[1];
+    GGML_ASSERT(row_stride > 0);
+
+    size_t pos       = offset;
+    size_t remaining = size;
+    while (remaining > 0) {
+        const size_t row     = pos / row_stride;
+        const size_t row_off = pos % row_stride;
+        const size_t n       = std::min(remaining, row_stride - row_off);
+
+        if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            // The split is inside the row. Walk the segment/child blocks in
+            // the same order the fast path writes them and copy the overlap.
+            size_t col_pos = 0;
+            std::vector<size_t> simple_pos(n_bufs, 0);
+            for (size_t s = 0; s < split_state.n_segments; s++) {
+                for (size_t r = 0; r < split_state.nr[s]; r++) {
+                    for (size_t j = 0; j < n_bufs; j++) {
+                        const size_t n_el = split_state.ne[s*n_bufs + j];
+                        GGML_ASSERT(n_el % blck_size == 0);
+                        const size_t block = n_el/blck_size*type_size;
+                        const size_t begin = std::max(col_pos, row_off);
+                        const size_t end   = std::min(col_pos + block, row_off + n);
+                        if (begin < end) {
+                            const ggml_tensor * simple = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                            GGML_ASSERT(simple != nullptr);
+                            const size_t simple_off = row*simple->nb[1] + simple_pos[j] + (begin - col_pos);
+                            const size_t host_off   = (pos - offset) + (begin - row_off);
+                            if (to_host) {
+                                ggml_backend_tensor_get(simple, (char *) data + host_off, simple_off, end - begin);
+                            } else {
+                                ggml_backend_tensor_set(simple, (const char *) data + host_off, simple_off, end - begin);
+                            }
+                        }
+                        col_pos += block;
+                        simple_pos[j] += block;
+                    }
+                }
+            }
+            GGML_ASSERT(col_pos == row_stride);
+        } else {
+            // The split is between rows. Find the child that owns this row
+            // and copy the row-local range into its simple tensor.
+            size_t row_base = 0;
+            bool found = false;
+            for (size_t s = 0; s < split_state.n_segments && !found; s++) {
+                for (size_t r = 0; r < split_state.nr[s] && !found; r++) {
+                    for (size_t j = 0; j < n_bufs; j++) {
+                        const size_t child_rows = split_state.ne[s*n_bufs + j];
+                        if (row >= row_base && row < row_base + child_rows) {
+                            const ggml_tensor * simple = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                            GGML_ASSERT(simple != nullptr);
+                            const size_t simple_off = (row - row_base)*simple->nb[1] + row_off;
+                            const size_t host_off   = pos - offset;
+                            if (to_host) {
+                                ggml_backend_tensor_get(simple, (char *) data + host_off, simple_off, n);
+                            } else {
+                                ggml_backend_tensor_set(simple, (const char *) data + host_off, simple_off, n);
+                            }
+                            found = true;
+                            break;
+                        }
+                        row_base += child_rows;
+                    }
+                }
+            }
+            GGML_ASSERT(found);
+        }
+
+        pos       += n;
+        remaining -= n;
+    }
+}
+
 static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
         const void * data, size_t offset, size_t size, const ggml_tensor * staging_meta) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
@@ -1857,6 +1948,11 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
             GGML_ASSERT(tensor->ne[2] == 1);
 
             const size_t row_stride = tensor->nb[1];
+            if (offset % row_stride != 0 || size % row_stride != 0) {
+                ggml_backend_meta_copy_range_axis01(tensor, const_cast<void *>(data), offset, size,
+                        n_bufs, split_state, /*to_host =*/ false);
+                return;
+            }
             GGML_ASSERT(offset % row_stride == 0);
             GGML_ASSERT(size   % row_stride == 0);
             const int64_t row_start = offset / row_stride;
@@ -1901,6 +1997,12 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
         GGML_ASSERT(split_state.axis == GGML_BACKEND_SPLIT_AXIS_1);
 
         const size_t row_stride = tensor->nb[2];
+        if (tensor->ne[2] == 1 && (offset % row_stride != 0 || size % row_stride != 0)) {
+            // The axis-1 row is a ne[0] row, not a ne[2] plane.
+            ggml_backend_meta_copy_range_axis01(tensor, const_cast<void *>(data), offset, size,
+                    n_bufs, split_state, /*to_host =*/ false);
+            return;
+        }
         GGML_ASSERT(offset % row_stride == 0);
         GGML_ASSERT(size   % row_stride == 0);
         const int64_t row_start = offset / row_stride;
@@ -2323,6 +2425,11 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             GGML_ASSERT(tensor->ne[2] == 1);
 
             const size_t row_stride = tensor->nb[1];
+        if (offset % row_stride != 0 || size % row_stride != 0) {
+            ggml_backend_meta_copy_range_axis01(tensor, data, offset, size,
+                    n_bufs, split_state, /*to_host =*/ true);
+            return;
+        }
             GGML_ASSERT(offset % row_stride == 0);
             GGML_ASSERT(size   % row_stride == 0);
             const int64_t row_start = offset / row_stride;
@@ -2367,6 +2474,11 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         GGML_ASSERT(split_state.axis == GGML_BACKEND_SPLIT_AXIS_1);
 
         const size_t row_stride = tensor->nb[2];
+        if (tensor->ne[2] == 1 && (offset % row_stride != 0 || size % row_stride != 0)) {
+            ggml_backend_meta_copy_range_axis01(tensor, data, offset, size,
+                    n_bufs, split_state, /*to_host =*/ true);
+            return;
+        }
         GGML_ASSERT(offset % row_stride == 0);
         GGML_ASSERT(size   % row_stride == 0);
         const int64_t row_start = offset / row_stride;
