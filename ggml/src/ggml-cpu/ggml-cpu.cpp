@@ -813,7 +813,10 @@ static const ggml_backend_completion_api ggml_backend_cpu_completion_api = {
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_completion_v1") == 0) {
-        return (void *) &ggml_backend_cpu_completion_api;
+        // The proc-address API returns void *, but the table is immutable.
+        // Use const_cast explicitly instead of a C-style cast so -Wcast-qual
+        // does not flag the read-only function table.
+        return const_cast<void *>(static_cast<const void *>(&ggml_backend_cpu_completion_api));
     }
     if (strcmp(name, "ggml_backend_supports_ordered_attention") == 0) {
         return (void *) ggml_backend_cpu_device_supports_op;
