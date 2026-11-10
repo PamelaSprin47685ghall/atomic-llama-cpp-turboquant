@@ -316,6 +316,8 @@ static void run_backend_failure(const char * model_path) {
     CHECK(llama_state_seq_set_data(ctx, empty_state.data(), empty_size, 1) == 0,
           "empty-stream state read refused after failed update");
 
+    CHECK(!llama_memory_clear(llama_get_memory(ctx), false),
+          "clear(data=false) reports the failed K-shift state");
     CHECK(llama_memory_clear(llama_get_memory(ctx), true), "clear(true) recovers the KV state");
     g_mock_dev_state.fail_next_compute = false;
     CHECK(decode_one(ctx, 3), "decode recovers after clear(true)");
@@ -351,12 +353,22 @@ static void run_no_update_and_applied(llama_model * model) {
     llama_free(ctx);
 }
 
+// A null memory has nothing to clear, so the operation succeeds. Callers use
+// the result to decide whether the context is usable; null must not look like
+// a refused clear.
+static void run_null_memory_contract() {
+    CHECK(llama_memory_clear(nullptr, true),  "null memory clear reports success");
+    CHECK(llama_memory_clear(nullptr, false), "null memory clear(data=false) reports success");
+}
+
 
 int main(int argc, char ** argv) {
     if (argc != 2) {
         std::fprintf(stderr, "usage: %s <dense-llama.gguf>\n", argv[0]);
         return 2;
     }
+
+    run_null_memory_contract();
 
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
