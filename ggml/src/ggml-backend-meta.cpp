@@ -2767,12 +2767,20 @@ struct ggml_backend_meta_context {
             auto get_interface = (ggml_backend_relay_get_interface_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_relay_get_interface");
             relay_i = get_interface != nullptr ? get_interface() : nullptr;
-            // ABI 3 appends prepare_ex/plan_snapshot; ABI 4 appends
-            // borrow_snapshot. Accept an older provider (ABI 2) and only call
-            // the fields it actually has.
+            // ABI 5 is the single unified table: token trio plus cpu_snapshot.
+            // ABI 4 is ambiguous (two incompatible candidates used it for
+            // borrow_snapshot and for the token trio), so it is rejected
+            // rather than guessed. ABI 2/3 are accepted as base providers and
+            // leave the ABI 5 fields absent.
+            if (relay_i != nullptr && relay_i->abi_version == 4) {
+                GGML_LOG_ERROR("%s: relay ABI 4 is ambiguous (borrow vs token); rebuild with ABI 5\n", __func__);
+                return;
+            }
             if (relay_i == nullptr || relay_i->abi_version < 2 ||
                 relay_i->abi_version > GGML_RELAY_PROVIDER_ABI_VERSION ||
-                (relay_i->abi_version >= 4 && !relay_i->borrow_snapshot) ||
+                (relay_i->abi_version >= 5 &&
+                 (!relay_i->submit_token || !relay_i->wait_token ||
+                  !relay_i->release_token || !relay_i->cpu_snapshot)) ||
                 !relay_i->create || !relay_i->destroy || !relay_i->prepare || !relay_i->submit ||
                 !relay_i->poll || !relay_i->publish || !relay_i->snapshot || !relay_i->abort) {
                 GGML_LOG_ERROR("%s: HIP tp5-relay capability is unavailable or incompatible\n", __func__);
@@ -5600,9 +5608,11 @@ bool ggml_backend_relay_plan_snapshot(ggml_backend_t backend, ggml_relay_plan_sn
            ctx->relay_i->plan_snapshot(ctx->relay, snapshot);
 }
 
-bool ggml_backend_relay_borrow_snapshot(ggml_backend_t backend, ggml_relay_borrow_status * status) {
+int ggml_backend_relay_cpu_snapshot(ggml_backend_t backend, ggml_relay_cpu_status * status) {
     auto * ctx = ggml_backend_relay_meta_context(backend);
-    return ctx != nullptr && status != nullptr && ctx->relay_i->abi_version >= 4 &&
-           ctx->relay_i->borrow_snapshot != nullptr &&
-           ctx->relay_i->borrow_snapshot(ctx->relay, status);
+    if (ctx == nullptr || status == nullptr || ctx->relay_i->abi_version < 5 ||
+        ctx->relay_i->cpu_snapshot == nullptr) {
+        return -1;
+    }
+    return ctx->relay_i->cpu_snapshot(ctx->relay, status) ? 1 : 0;
 }

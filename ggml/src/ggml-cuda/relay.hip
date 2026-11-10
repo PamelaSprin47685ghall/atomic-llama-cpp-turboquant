@@ -18,6 +18,7 @@
 #include <new>
 #include <system_error>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -470,6 +471,15 @@ struct provider {
     // The current error text is only the host abort. The first real error
     // after it may append its operation text without changing the code.
     bool                                  abort_attributed    = false;
+    // Per-submission completion tokens. begin() creates one record when
+    // submit_token asked for it; finish() attaches the native tails; only
+    // release_token retires the record.
+    uint64_t                              next_token          = 0;
+    uint64_t                              active_token        = 0;
+    bool                                  request_token       = false;
+    // token -> {state: 0 active, 1 success, 2 failed, error}
+    std::unordered_map<uint64_t, std::pair<int, int>> token_state;
+    std::unordered_map<uint64_t, std::array<hipEvent_t, ranks * lanes_per_rank>> token_tails;
     bool                                  active              = false;
     bool                                  tails_attempted     = false;
     size_t                                next_channel        = 0;
@@ -576,6 +586,28 @@ void fail(provider & p, int code, const char * message) {
     if (p.abort_host) {
         store(p.abort_host, 1);
     }
+}
+
+// Local ordering/lifecycle failures are real, but they are not the first
+// native operation error. Record one only when it is first; otherwise keep
+// the existing code/text and log the secondary reason.
+void fail_local(provider & p, int code, const char * message) {
+    p.event_status.store(-1, std::memory_order_release);
+    if (!p.status.failed) {
+        record_failure(p, code, message);
+        p.abort_attributed = false;
+    } else {
+        GGML_LOG_ERROR("HIP relay secondary failure: %s\n", message);
+    }
+    if (p.abort_host) {
+        store(p.abort_host, 1);
+    }
+}
+
+// A retryable local rejection. No provider state changed, so do not poison
+// the epoch or consume the first-failure slot. The message is diagnostic.
+void reject_local(const char * message) {
+    GGML_LOG_ERROR("HIP relay rejected: %s\n", message);
 }
 
 void consume_abort(provider & p) {
@@ -755,7 +787,7 @@ bool release_owners(provider & p) {
     // Destroy them only after native/CPU drain and before freeing any storage.
     for (const auto & r : p.rank) {
         if (r.capturing) {
-            fail(p, EBUSY, "relay stream capture termination is unproved; retaining owners");
+            fail_local(p, EBUSY, "relay stream capture termination is unproved; retaining owners");
             return false;
         }
     }
@@ -848,7 +880,7 @@ void observe(provider & p, bool query_native = true) {
                     kind = "abort";
                     code = ECANCELED;
                 } else if (error == 2) {
-                    kind = "future generation";
+                    kind = "generation mismatch";
                     code = EPROTO;
                 } else if (error == 3) {
                     kind = "wait timeout";
@@ -1448,7 +1480,7 @@ void log_plan_stats(provider & p, const char * where) {
 bool queue_retirement(provider & p, uint64_t generation) {
     const size_t count = p.retired_count.load(std::memory_order_relaxed);
     if (count == p.retired_plans.size()) {
-        fail(p, ENOSPC, "relay retirement queue overflow: the runtime did not drain PLAN_RETIRED");
+        fail_local(p, ENOSPC, "relay retirement queue overflow: the runtime did not drain PLAN_RETIRED");
         return false;
     }
     p.retired_plans[count] = generation;
@@ -1492,7 +1524,7 @@ bool flush_all_plans(provider & p, bool emit_events) {
         }
     }
     if (!p.plan_cache.flush_all()) {
-        fail(p, EBUSY, "relay plan flush refused: a plan is pinned");
+        fail_local(p, EBUSY, "relay plan flush refused: a plan is pinned");
         return false;
     }
     for (size_t i = 0; i < count; ++i) {
@@ -1577,11 +1609,10 @@ bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, 
         return false;
     }
     if (!idle(p)) {
-        fail(p, EBUSY, "relay prepare requires an idle provider");
-        return false;
+        return false; // Busy is transient; the caller may retry after draining.
     }
     if (!terminals || count == 0 || count > channel_capacity) {
-        fail(p, ENOTSUP, "relay plan exceeds reserved 256-channel channel capacity or is empty");
+        fail_local(p, ENOTSUP, "relay plan exceeds reserved 256-channel channel capacity or is empty");
         return false;
     }
     // Reject a contradictory key before touching the exact pool, the computed
@@ -1591,7 +1622,7 @@ bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, 
         char detail[sizeof(p.status.error)];
         std::snprintf(detail, sizeof(detail), "relay plan key channel count %u differs from prepared channels %zu",
                       key->channels, count);
-        fail(p, EPROTO, detail);
+        fail_local(p, EPROTO, detail);
         return false;
     }
     p.wire_frozen = true; // Format is immutable before any captured graph can exist.
@@ -1610,7 +1641,7 @@ bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, 
     for (size_t c = 0; c < count; ++c) {
         const auto * first = terminals[c * ranks];
         if (!first || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first) || ggml_nelements(first) <= 0) {
-            fail(p, ENOTSUP, "relay requires nonempty contiguous F32 terminals");
+            fail_local(p, ENOTSUP, "relay requires nonempty contiguous F32 terminals");
             return false;
         }
         if (uint64_t(ggml_nelements(first)) > element_capacity) {
@@ -1618,7 +1649,7 @@ bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, 
             std::snprintf(detail, sizeof(detail), "relay channel=%zu tensor=%s shape=%lld,%lld,%lld,%lld exceeds %zu-F32 capacity",
                           c, first->name, static_cast<long long>(first->ne[0]), static_cast<long long>(first->ne[1]),
                           static_cast<long long>(first->ne[2]), static_cast<long long>(first->ne[3]), element_capacity);
-            fail(p, ENOTSUP, detail);
+            fail_local(p, ENOTSUP, detail);
             return false;
         }
         elements[c] = size_t(ggml_nelements(first));
@@ -1626,7 +1657,7 @@ bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, 
             const auto * t = terminals[c * ranks + r];
             if (!t || !t->data || t->type != first->type || !ggml_is_contiguous(t) ||
                 memcmp(t->ne, first->ne, sizeof(t->ne)) || memcmp(t->nb, first->nb, sizeof(t->nb))) {
-                fail(p, EINVAL, "relay rank terminal shapes/types/strides differ");
+                fail_local(p, EINVAL, "relay rank terminal shapes/types/strides differ");
                 return false;
             }
             const bool unchanged = p.status.channels == count && same_binding(p.channels[c], r, t);
@@ -1638,7 +1669,7 @@ bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, 
             if (!select(p, r) ||
                 !checked(p, hipPointerGetAttributes(&attributes, t->data), "hipPointerGetAttributes terminal") ||
                 attributes.device != p.rank[r].physical || attributes.type != hipMemoryTypeDevice) {
-                fail(p, EINVAL, "relay terminal is not rank-local native device memory");
+                fail_local(p, EINVAL, "relay terminal is not rank-local native device memory");
                 return false;
             }
         }
@@ -1706,6 +1737,8 @@ bool prepare_ex(void * opaque, ggml_tensor * const * terminals, size_t count, co
 }
 
 bool begin(provider & p) {
+    const bool want_token = p.request_token;
+    p.request_token = false;
     if (abort_requested(p)) {
         return false;
     }
@@ -1713,11 +1746,17 @@ bool begin(provider & p) {
         return false;
     }
     if (!idle(p)) {
-        fail(p, EBUSY, "relay begin requires an idle provider");
-        return false;
+        return false; // Busy is transient; the caller may retry after draining.
     }
     if (p.status.channels == 0) {
-        fail(p, EINVAL, "relay begin has no prepared channels");
+        fail_local(p, EINVAL, "relay begin has no prepared channels");
+        return false;
+    }
+    // A token record owns the lane tail event handles. Re-recording those
+    // events for a new epoch would silently retarget wait_token, so every
+    // token must be released before the next begin.
+    if (!p.token_tails.empty()) {
+        reject_local("relay begin requires every completion token released");
         return false;
     }
     if (p.status.epoch == UINT64_MAX) {
@@ -1726,12 +1765,31 @@ bool begin(provider & p) {
     }
     if (p.plan_cache_enabled && p.plan_cache_generation && p.status.plan_generation != 0) {
         if (!p.plan_cache.pin(p.status.plan_generation)) {
-            fail(p, EPROTO, "relay begin could not pin its plan generation");
+            fail_local(p, EPROTO, "relay begin could not pin its plan generation");
             return false;
         }
         p.plan_pinned = true;
     }
+    // Create the token record before mutating the epoch. A failed allocation
+    // must not leave a half-begun epoch or a pinned plan behind.
+    uint64_t token = 0;
+    if (want_token) {
+        token = ++p.next_token;
+        try {
+            p.token_state[token] = {0, 0};
+        } catch (const std::bad_alloc &) {
+            if (p.plan_pinned) {
+                p.plan_pinned = false;
+                if (!p.plan_cache.release(p.status.plan_generation)) {
+                    fail_local(p, EPROTO, "relay begin could not release its plan pin after token allocation failed");
+                }
+            }
+            fail(p, ENOMEM, "relay begin could not record its completion token");
+            return false;
+        }
+    }
     ++p.status.epoch;
+    p.active_token = token;
     // idle proved prior native tails and CPU readers ended. Captured kernels
     // dereference this immutable activation, never a captured scalar epoch.
     store(p.activation_host, p.status.epoch);
@@ -1769,7 +1827,7 @@ void graph_begin(provider & p, uint32_t r, uint64_t compute_nodes) {
         return;
     }
     if (!p.active || p.tails_attempted || p.status.failed || r >= ranks || p.rank[r].graph_pending) {
-        fail(p, EINVAL, "invalid relay graph_begin ordering");
+        fail_local(p, EINVAL, "invalid relay graph_begin ordering");
         return;
     }
     if (p.mode == submission::direct) {
@@ -1785,7 +1843,7 @@ void graph_accepted(provider & p, uint32_t r) {
         return;
     }
     if (!p.active || p.tails_attempted || r >= ranks || !p.rank[r].graph_pending) {
-        fail(p, EINVAL, "invalid relay graph_accepted ordering");
+        fail_local(p, EINVAL, "invalid relay graph_accepted ordering");
         return;
     }
     p.rank[r].graph_pending = false;
@@ -1804,7 +1862,7 @@ bool enqueue(provider & p, uint32_t index) {
         return false;
     }
     if (!p.active || p.tails_attempted || p.status.failed || index != p.next_channel || index >= p.status.channels) {
-        fail(p, EINVAL, "invalid relay channel enqueue ordering");
+        fail_local(p, EINVAL, "invalid relay channel enqueue ordering");
         return false;
     }
     auto &         c      = p.channels[index];
@@ -1813,12 +1871,12 @@ bool enqueue(provider & p, uint32_t index) {
             return false;
         }
         if (p.rank[r].graph_pending || p.rank[r].accepted_graphs != p.next_channel + 1 || !select(p, r)) {
-            fail(p, EINVAL, "relay enqueue before accepted rank graph");
+            fail_local(p, EINVAL, "relay enqueue before accepted rank graph");
             return false;
         }
         auto * ctx = p.rank[r].context;
         if (ctx->curr_stream_no != 0) {
-            fail(p, EINVAL, "relay rank must use its owned stream zero");
+            fail_local(p, EINVAL, "relay rank must use its owned stream zero");
             return false;
         }
         const auto stream   = p.rank[r].lanes[0].stream;
@@ -1878,7 +1936,7 @@ bool finish(provider & p) {
     // Captures and tails must still be drained.
     abort_requested(p);
     if (!p.active || p.tails_attempted) {
-        fail(p, EINVAL, "relay finish without an active unsealed epoch");
+        fail_local(p, EINVAL, "relay finish without an active unsealed epoch");
         return false;
     }
     if (p.mode == submission::capture) {
@@ -1900,7 +1958,7 @@ bool finish(provider & p) {
         abort_requested(p);
         for (uint32_t r = 0; r < ranks; ++r) {
             if (p.rank[r].accepted_graphs != p.status.channels + 1 || p.rank[r].graph_pending) {
-                fail(p, EIO, "relay capture is missing stages");
+                fail_local(p, EIO, "relay capture is missing stages");
             }
         }
         // No launch until all five complete executables exist. Failure leaves
@@ -1945,7 +2003,7 @@ bool finish(provider & p) {
     }
     if (p.mode != submission::direct && !p.status.failed) {
         for (uint32_t r = 0; r < ranks; ++r) {
-            if (abort_requested(p) || p.status.failed || !select(p, r)) {
+            if (abort_visible(p) || p.status.failed || !select(p, r)) {
                 break;
             }
             const uint32_t bit = 1u << r;
@@ -1966,7 +2024,7 @@ bool finish(provider & p) {
     p.tails_attempted = true;
     for (uint32_t r = 0; r < ranks; ++r) {
         if (p.rank[r].accepted_graphs != p.status.channels + 1 || p.rank[r].graph_pending) {
-            fail(p, EIO, "relay frame is missing accepted stage or final rank graphs");
+            fail_local(p, EIO, "relay frame is missing accepted stage or final rank graphs");
         }
         if (!(p.status.attempted_mask & (1u << r))) {
             continue;
@@ -1980,17 +2038,33 @@ bool finish(provider & p) {
         }
     }
     if (p.next_channel != p.status.channels || p.status.accepted_mask != all_ranks || p.status.unknown_mask) {
-        fail(p, EIO, "relay frame has incomplete or unknown submissions");
+        fail_local(p, EIO, "relay frame has incomplete or unknown submissions");
     }
     p.active = false;
     abort_requested(p);
     if (p.plan_pinned) {
         p.plan_pinned = false;
         if (!p.plan_cache.release(p.status.plan_generation)) {
-            fail(p, EPROTO, "relay finish could not release its plan pin");
+            fail_local(p, EPROTO, "relay finish could not release its plan pin");
         }
     }
     observe(p);
+    // Attach this epoch's native tails to its completion token. A failed
+    // token may still have native work in flight; wait_token synchronizes
+    // these events before it reports FAILED.
+    if (p.active_token != 0) {
+        std::array<hipEvent_t, ranks * lanes_per_rank> tails = {};
+        for (uint32_t r = 0; r < ranks; ++r) {
+            for (uint32_t l = 0; l < lanes_per_rank; ++l) {
+                tails[r * lanes_per_rank + l] = p.rank[r].lanes[l].tail;
+            }
+        }
+        try {
+            p.token_tails[p.active_token] = tails;
+        } catch (const std::bad_alloc &) {
+            fail(p, ENOMEM, "recording relay token tails failed");
+        }
+    }
     // The abort claim CAS is the host success linearization point. If abort
     // set the sticky bit first, this CAS reads it and fails; if this CAS
     // increments first, a later abort sets the bit after this success. A true
@@ -2090,7 +2164,7 @@ bool describe_frame(provider & p, ggml_cgraph * const * graphs, size_t stages, u
     for (uint32_t r = 0; r < ranks; ++r) {
         const auto * ctx = p.rank[r].context;
         if (ctx->curr_stream_no != 0 || !ctx->tp5_relay || ctx->tp5_relay_owner != &p) {
-            fail(p, EINVAL, "relay replay requires its owned stream zero");
+            fail_local(p, EINVAL, "relay replay requires its owned stream zero");
             return false;
         }
         describe(p, p.rank[r].physical, p.rank[r].scratch, p.rank[r].lanes[0].stream, ctx->quantized_matmul_f32);
@@ -2099,14 +2173,14 @@ bool describe_frame(provider & p, ggml_cgraph * const * graphs, size_t stages, u
         for (uint32_t r = 0; r < ranks; ++r) {
             const auto * g = graphs[stage * ranks + r];
             if (!g || g->n_nodes < 0 || g->n_leafs < 0 || g->grads || g->grad_accs) {
-                fail(p, EINVAL, "relay replay requires complete inference graphs");
+                fail_local(p, EINVAL, "relay replay requires complete inference graphs");
                 return false;
             }
             describe(p, g->n_nodes, g->n_leafs, g->order);
             for (int i = 0; i < g->n_nodes; ++i) {
                 const auto * t = g->nodes[i];
                 if (!t) {
-                    fail(p, EINVAL, "relay graph contains a null node");
+                    fail_local(p, EINVAL, "relay graph contains a null node");
                     return false;
                 }
                 const int32_t uses = g->use_counts ? g->use_counts[ggml_hash_find(&g->visited_hash_set, t)] : 0;
@@ -2122,7 +2196,7 @@ bool describe_frame(provider & p, ggml_cgraph * const * graphs, size_t stages, u
             for (int i = 0; i < g->n_leafs; ++i) {
                 describe(p, g->leafs[i]);
                 if (!g->leafs[i]) {
-                    fail(p, EINVAL, "relay graph contains a null leaf");
+                    fail_local(p, EINVAL, "relay graph contains a null leaf");
                     return false;
                 }
                 add_tensor(g->leafs[i]);
@@ -2145,8 +2219,12 @@ bool describe_frame(provider & p, ggml_cgraph * const * graphs, size_t stages, u
     return true;
 }
 
-bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
+bool submit_internal(void * opaque, ggml_cgraph * const * graphs, size_t stages, bool request_token,
+                     uint64_t * created_token = nullptr) {
     auto & p = *static_cast<provider *>(opaque);
+    if (created_token != nullptr) {
+        *created_token = 0;
+    }
     const int64_t d0=ggml_time_us();
     std::lock_guard<std::mutex> lock(p.mutex);
     const int64_t dlock=ggml_time_us();
@@ -2157,11 +2235,10 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
         return false;
     }
     if (!idle(p)) {
-        fail(p, EBUSY, "relay submit requires an idle provider");
-        return false;
+        return false; // Busy is transient; the caller may retry after draining.
     }
     if (!graphs || stages != p.status.channels + 1) {
-        fail(p, EINVAL, "relay submit stage count does not match the prepared plan");
+        fail_local(p, EINVAL, "relay submit stage count does not match the prepared plan");
         return false;
     }
     const uint64_t uid = graphs[0] ? graphs[0]->uid : 0;
@@ -2259,8 +2336,12 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
     p.mode = p.current->exec[0] ? submission::replay :
         (p.current->warmed ? submission::capture : submission::direct);
     const int64_t dkey=ggml_time_us();
+    p.request_token = request_token;
     if (!begin(p)) {
         return false;
+    }
+    if (created_token != nullptr) {
+        *created_token = p.active_token;
     }
     const int64_t dbegin=ggml_time_us();
     auto diag_finish=[&]() {
@@ -2305,6 +2386,141 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
         }
     }
     return diag_finish(); // Also terminates partial captures and records failed tails.
+}
+
+bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
+    return submit_internal(opaque, graphs, stages, false);
+}
+
+void settle_token(provider & p);
+
+bool submit_token(void * opaque, ggml_cgraph * const * graphs, size_t stages, uint64_t * token) {
+    if (opaque == nullptr || token == nullptr) {
+        return false;
+    }
+    *token = 0;
+    auto & p = *static_cast<provider *>(opaque);
+    uint64_t created = 0;
+    const bool ok = submit_internal(opaque, graphs, stages, true, &created);
+    std::lock_guard<std::mutex> lock(p.mutex);
+    if (!ok) {
+        // begin() may have created a record before a later stage failed. Erase
+        // only that record; a previous epoch's unreleased token must stay.
+        if (created != 0) {
+            p.token_state.erase(created);
+            p.token_tails.erase(created);
+            if (p.active_token == created) {
+                p.active_token = 0;
+            }
+        }
+        return false;
+    }
+    *token = created;
+    return *token != 0;
+}
+
+int wait_token(void * opaque, uint64_t token, int * error) {
+    if (opaque == nullptr || token == 0) {
+        return GGML_RELAY_TOKEN_UNKNOWN;
+    }
+    auto & p = *static_cast<provider *>(opaque);
+    std::unique_lock<std::mutex> lock(p.mutex);
+    auto it = p.token_state.find(token);
+    if (it == p.token_state.end()) {
+        return GGML_RELAY_TOKEN_UNKNOWN;
+    }
+    if (it->second.first == 1) {
+        if (error != nullptr) *error = 0;
+        return GGML_RELAY_TOKEN_SUCCESS;
+    }
+    const bool was_failed = it->second.first == 2;
+    const int prior_error = it->second.second;
+    if (p.active_token != token && !was_failed) {
+        return GGML_RELAY_TOKEN_UNKNOWN;
+    }
+    // Block on the exact native tails. A failed token may still have native
+    // work in flight; only report FAILED after these tails synchronize.
+    auto tails_it = p.token_tails.find(token);
+    if (tails_it == p.token_tails.end()) {
+        return GGML_RELAY_TOKEN_UNKNOWN;
+    }
+    const auto tails = tails_it->second;
+    lock.unlock();
+    int native_error = 0;
+    bool have_tail = false;
+    for (uint32_t r = 0; r < ranks; ++r) {
+        if (hipSetDevice(p.rank[r].physical) != hipSuccess) {
+            native_error = EIO;
+            break;
+        }
+        for (uint32_t l = 0; l < lanes_per_rank; ++l) {
+            const hipEvent_t tail = tails[r * lanes_per_rank + l];
+            if (tail == nullptr) continue;
+            have_tail = true;
+            if (hipEventSynchronize(tail) != hipSuccess) {
+                native_error = EIO;
+                break;
+            }
+        }
+        if (native_error != 0) break;
+    }
+    lock.lock();
+    if (!have_tail || native_error != 0) {
+        if (error != nullptr) *error = native_error != 0 ? native_error : -1;
+        return GGML_RELAY_TOKEN_UNKNOWN;
+    }
+    observe(p);
+    // This token's own tails have drained. Do not let a newer active token's
+    // global status settle this token; record this token's result explicitly.
+    // Success also needs the full CPU drain: every output released and no
+    // outstanding work borrow.
+    const bool plan_complete = p.status.finished &&
+        p.event_status.load(std::memory_order_acquire) == 0 &&
+        p.outputs_released == p.status.channels &&
+        p.borrowed == std::numeric_limits<size_t>::max();
+    it = p.token_state.find(token);
+    if (it == p.token_state.end()) {
+        return GGML_RELAY_TOKEN_UNKNOWN;
+    }
+    if (was_failed || p.status.failed) {
+        it->second = {2, was_failed ? prior_error : p.status.error_code};
+    } else if (plan_complete) {
+        it->second = {1, 0};
+    } else {
+        if (error != nullptr) *error = -1;
+        return GGML_RELAY_TOKEN_UNKNOWN;
+    }
+    if (p.active_token == token) {
+        p.active_token = 0;
+    }
+    settle_token(p);
+    it = p.token_state.find(token);
+    if (it == p.token_state.end()) {
+        return GGML_RELAY_TOKEN_UNKNOWN;
+    }
+    if (it->second.first == 2 || was_failed) {
+        if (error != nullptr) *error = was_failed ? prior_error : it->second.second;
+        return GGML_RELAY_TOKEN_FAILED;
+    }
+    if (it->second.first == 1) {
+        if (error != nullptr) *error = 0;
+        return GGML_RELAY_TOKEN_SUCCESS;
+    }
+    if (error != nullptr) *error = -1;
+    return GGML_RELAY_TOKEN_UNKNOWN;
+}
+
+void release_token(void * opaque, uint64_t token) {
+    if (opaque == nullptr || token == 0) {
+        return;
+    }
+    auto & p = *static_cast<provider *>(opaque);
+    std::lock_guard<std::mutex> lock(p.mutex);
+    p.token_state.erase(token);
+    p.token_tails.erase(token);
+    if (p.active_token == token) {
+        p.active_token = 0;
+    }
 }
 
 void fill_event(provider & p, size_t index, ggml_relay_event_kind kind, ggml_relay_event & event) {
@@ -2490,7 +2706,7 @@ bool publish_event(void * opaque, const Event * event) {
         matches = matches && event->inputs[r] == c.inbox[r];
     }
     if (!matches) {
-        fail(p, EINVAL, "relay publish view identity mismatch");
+        reject_local("relay publish view identity mismatch");
         return false;
     }
     // Matching publish always returns the CPU borrow, including after abort.
@@ -2530,6 +2746,27 @@ bool publish_v2(void * opaque, const ggml_relay_event_v2 * event, size_t event_s
     return publish_event(opaque, event);
 }
 
+void settle_token(provider & p) {
+    if (p.active_token == 0) {
+        return;
+    }
+    auto it = p.token_state.find(p.active_token);
+    if (it == p.token_state.end()) {
+        p.active_token = 0;
+        return;
+    }
+    if (p.status.failed) {
+        it->second = {2, p.status.error_code};
+        p.active_token = 0;
+    } else if (p.status.finished &&
+               p.event_status.load(std::memory_order_acquire) == 0 &&
+               p.outputs_released == p.status.channels &&
+               p.borrowed == std::numeric_limits<size_t>::max()) {
+        it->second = {1, 0};
+        p.active_token = 0;
+    }
+}
+
 bool snapshot(void * opaque, ggml_relay_status * status) {
     if (!opaque || !status) {
         return false;
@@ -2552,17 +2789,21 @@ bool snapshot(void * opaque, ggml_relay_status * status) {
         // not publish a success. This lets finished/borrow advance so a later
         // destroy can prove completion instead of retaining forever.
         observe(p);
+        settle_token(p);
         *status = p.status;
         return true;
     }
     if (p.status.failed) {
         // Same rule for a non-abort failure: observe the tails, do not publish.
         observe(p);
+        settle_token(p);
         *status = p.status;
         return true;
     }
     if (p.status.finished && p.event_status.load(std::memory_order_acquire) == 0 &&
-        p.outputs_released == p.status.channels) {
+        p.outputs_released == p.status.channels &&
+        p.borrowed == std::numeric_limits<size_t>::max()) {
+        settle_token(p);
         *status = p.status;
         return true;
     }
@@ -2570,6 +2811,7 @@ bool snapshot(void * opaque, ggml_relay_status * status) {
     // A pending abort published during observe() must not leave this snapshot
     // looking healthy while poll() already returns -1.
     abort_requested(p);
+    settle_token(p);
     *status = p.status;
     return true;
 }
@@ -2605,7 +2847,7 @@ bool plan_snapshot(void * opaque, ggml_relay_plan_snapshot * snapshot) {
     return true;
 }
 
-bool borrow_snapshot(void * opaque, ggml_relay_borrow_status * status) {
+bool cpu_snapshot(void * opaque, ggml_relay_cpu_status * status) {
     if (!opaque || !status) {
         return false;
     }
@@ -2614,10 +2856,13 @@ bool borrow_snapshot(void * opaque, ggml_relay_borrow_status * status) {
     if (!lock.owns_lock()) {
         return false;
     }
-    status->borrowed_channel = p.borrowed == std::numeric_limits<size_t>::max()
+    status->epoch             = p.status.epoch;
+    status->channels          = uint64_t(p.status.channels);
+    status->outputs_released  = uint64_t(p.outputs_released);
+    status->active_token      = p.active_token;
+    status->tokens_outstanding = uint64_t(p.token_state.size());
+    status->borrowed_channel  = p.borrowed == std::numeric_limits<size_t>::max()
         ? UINT32_MAX : uint32_t(p.borrowed);
-    status->outputs_released = uint64_t(p.outputs_released);
-    status->channels         = p.status.channels;
     return true;
 }
 
@@ -2643,6 +2888,7 @@ void abort(void * opaque, int32_t error) {
     std::unique_lock<std::mutex> lock(p.mutex, std::try_to_lock);
     if (lock.owns_lock()) {
         consume_abort(p);
+        settle_token(p);
     }
 }
 
@@ -2656,7 +2902,7 @@ bool destroy(void * opaque) {
         return false;
     }
     if (p->active) {
-        fail(*p, EBUSY, "relay destroy during an active epoch; retaining owners");
+        reject_local("relay destroy during an active epoch; retaining owners");
         return false;
     }
     if (!idle(*p)) {
@@ -2672,8 +2918,15 @@ bool destroy(void * opaque) {
             std::snprintf(detail, sizeof(detail),
                           "relay destroy has unreleased outputs; retaining owners");
         }
-        GGML_LOG_ERROR("HIP relay destroy refused: %s\n", detail);
-        fail(*p, EBUSY, detail);
+        reject_local(detail);
+        return false;
+    }
+    if (!p->token_state.empty()) {
+        char detail[sizeof(p->status.error)];
+        std::snprintf(detail, sizeof(detail),
+                      "relay destroy has %zu unreleased completion token(s); wait and release them or retain owners",
+                      p->token_state.size());
+        reject_local(detail);
         return false;
     }
     // Snapshot before the teardown flush: live plans and frames are the
@@ -2702,7 +2955,10 @@ const ggml_relay_provider_i interface = {
     abort,
     prepare_ex,
     plan_snapshot,
-    borrow_snapshot,
+    submit_token,
+    wait_token,
+    release_token,
+    cpu_snapshot,
 };
 
 const ggml_relay_wire_provider_i wire_interface = {

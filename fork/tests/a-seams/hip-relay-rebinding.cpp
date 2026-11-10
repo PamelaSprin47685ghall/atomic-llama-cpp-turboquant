@@ -139,7 +139,8 @@ struct fixture {
         require(count == ranks, "this opt-in A test requires five qualified HIP devices");
         require(api && api->create && api->prepare && api->submit && api->poll &&
                 api->publish && api->snapshot && api->abort && api->destroy &&
-                api->borrow_snapshot, "incomplete provider interface");
+                api->submit_token && api->wait_token && api->release_token &&
+                api->cpu_snapshot, "incomplete provider interface");
 
         for (size_t i = 0; i < ranks; ++i) {
             auto & r = rank[i];
@@ -297,10 +298,11 @@ struct fixture {
         require(api->snapshot(provider, &status) && status.failed && status.finished &&
                 status.completed_mask == all_ranks && status.unknown_mask == 0,
                 "idle abort lost the existing native drain proof");
-        ggml_relay_borrow_status borrow_status{};
-        require(api->borrow_snapshot(provider, &borrow_status) &&
-                borrow_status.borrowed_channel == UINT32_MAX &&
-                borrow_status.outputs_released == borrow_status.channels,
+        ggml_relay_cpu_status cpu{};
+        require(api->cpu_snapshot(provider, &cpu) == 1 &&
+                cpu.borrowed_channel == UINT32_MAX &&
+                cpu.outputs_released == cpu.channels &&
+                cpu.active_token == 0 && cpu.tokens_outstanding == 0,
                 "idle abort lost the CPU drain proof");
         require(api->destroy(provider), "provider refused completed destruction");
         provider = nullptr;
@@ -318,7 +320,9 @@ struct fixture {
         }
         prepare(false);
         std::cerr << "phase abort_borrow submit\n";
-        require(api->submit(provider, graphs.data(), 2), "submitting the abort-borrow epoch failed");
+        uint64_t token = 0;
+        require(api->submit_token(provider, graphs.data(), 2, &token) && token != 0,
+                "submitting the abort-borrow token epoch failed");
 
         ggml_relay_event event{};
         for (;;) {
@@ -341,23 +345,34 @@ struct fixture {
         require(api->snapshot(provider, &status), "snapshot after abort failed");
         require(status.failed && status.error_code == ECANCELED,
                 "abort code was not visible through snapshot");
-        ggml_relay_borrow_status borrow_status{};
-        require(api->borrow_snapshot(provider, &borrow_status) &&
-                borrow_status.borrowed_channel == borrow.channel,
-                "borrow snapshot did not report the outstanding CPU borrow");
+        ggml_relay_cpu_status cpu{};
+        require(api->cpu_snapshot(provider, &cpu) == 1 &&
+                cpu.borrowed_channel == borrow.channel,
+                "cpu snapshot did not report the outstanding borrow");
 
         ggml_relay_event mismatched{};
         require(!api->publish(provider, &mismatched), "mismatched publish succeeded");
-        require(api->borrow_snapshot(provider, &borrow_status) &&
-                borrow_status.borrowed_channel == borrow.channel,
+        require(api->cpu_snapshot(provider, &cpu) == 1 &&
+                cpu.borrowed_channel == borrow.channel,
                 "mismatched publish released a live CPU borrow");
-        require(!api->destroy(provider), "destroy accepted a live CPU borrow");
+        require(api->snapshot(provider, &status) && status.error_code == ECANCELED &&
+                std::strstr(status.error, "relay aborted by host") != nullptr,
+                "mismatched publish replaced the abort code or text");
+        require(std::strstr(status.error, "publish view identity mismatch") == nullptr,
+                "local publish error consumed the first-failure slot");
+        const bool destroyed = api->destroy(provider);
+        if (destroyed) {
+            // destroy() deleted the provider. Never let fail_cleanup touch it.
+            provider = nullptr;
+            borrowed = false;
+            throw std::runtime_error("destroy accepted a live CPU borrow");
+        }
 
         std::cerr << "phase abort_borrow return\n";
         require(!api->publish(provider, &borrow), "abort publish reported success");
         borrowed = false;
-        require(api->borrow_snapshot(provider, &borrow_status) &&
-                borrow_status.borrowed_channel == UINT32_MAX,
+        require(api->cpu_snapshot(provider, &cpu) == 1 &&
+                cpu.borrowed_channel == UINT32_MAX,
                 "matching publish did not return the CPU borrow");
 
         for (;;) {
@@ -367,6 +382,10 @@ struct fixture {
             }
             std::this_thread::yield();
         }
+        int token_error = 0;
+        require(api->wait_token(provider, token, &token_error) == GGML_RELAY_TOKEN_FAILED,
+                "aborted token did not report failure");
+        api->release_token(provider, token);
         require(api->destroy(provider), "provider refused destruction after the borrow returned");
         provider = nullptr;
     }

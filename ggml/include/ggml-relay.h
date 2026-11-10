@@ -107,6 +107,9 @@ struct ggml_relay_event_v2 {
 // sets the sticky bit first makes the success CAS fail. snapshot() reads the
 // claim with a no-op CAS. The claim orders abort against host success
 // publication; general fail() is provider-mutex ordered.
+// error_code is the value passed to abort() when a host abort claimed the
+// failure; otherwise it is a POSIX errno from the provider. Callers must not
+// interpret one space as the other.
 struct ggml_relay_status {
     uint32_t abi_version;
     uint32_t ranks;
@@ -204,20 +207,35 @@ GGML_API void ggml_backend_meta_set_plan_key(
 GGML_API bool ggml_backend_relay_plan_snapshot(
         ggml_backend_t backend, struct ggml_relay_plan_snapshot * snapshot);
 
-// Optional CPU borrow/drain facts for the current provider epoch. Returns
-// false when the backend is not a relay, the provider predates this query, or
-// the provider mutex is temporarily contended; retry without holding a view.
+// Per-submission provider token result. The numeric values match the generic
+// backend completion result, so a Meta consumer can translate without
+// inventing a second success code.
+enum ggml_relay_token_result {
+    GGML_RELAY_TOKEN_SUCCESS = 0,
+    GGML_RELAY_TOKEN_FAILED  = 1,
+    GGML_RELAY_TOKEN_UNKNOWN = 2,
+};
+
+// CPU-side facts for the current provider epoch: the single work borrow, the
+// output-release drain, and the provider completion tokens. Returns 1 on
+// success, 0 when the provider mutex is temporarily contended, and -1 when the
+// backend is not a relay or the provider predates this query (ABI < 5).
 // This does not extend ggml_relay_status. borrowed_channel is UINT32_MAX when
 // no work view is outstanding. A borrow survives abort: the CPU reader may
 // still own the mapped payload. Publish the saved INPUT_READY view to return
 // it, or retain the owner. The provider never revokes a borrow on its own.
-struct ggml_relay_borrow_status {
-    uint32_t borrowed_channel;
-    uint64_t outputs_released;
+// tokens_outstanding counts every token record that release_token has not
+// retired, including settled records; active_token is the current record or 0.
+struct ggml_relay_cpu_status {
+    uint64_t epoch;
     uint64_t channels;
+    uint64_t outputs_released;
+    uint64_t active_token;
+    uint64_t tokens_outstanding;
+    uint32_t borrowed_channel;
 };
-GGML_API bool ggml_backend_relay_borrow_snapshot(
-        ggml_backend_t backend, struct ggml_relay_borrow_status * status);
+GGML_API int ggml_backend_relay_cpu_snapshot(
+        ggml_backend_t backend, struct ggml_relay_cpu_status * status);
 
 #ifdef __cplusplus
 }

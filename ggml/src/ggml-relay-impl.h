@@ -2,7 +2,12 @@
 
 #include "ggml-relay.h"
 
-#define GGML_RELAY_PROVIDER_ABI_VERSION 4
+// ABI 5 is the single unified table. The token trio occupies the first three
+// appended slots and the CPU borrow/drain query is appended last. ABI 4 is
+// ambiguous: two incompatible candidates used it for borrow_snapshot and for
+// the token trio, so no ABI 4 provider is accepted. ABI 5 requires all four
+// fields below.
+#define GGML_RELAY_PROVIDER_ABI_VERSION 5
 
 // Internal backend capability. No model, request or B-library types cross it.
 // HIP owns buffers, queues, system-scope flags and completion observations.
@@ -39,9 +44,20 @@ struct ggml_relay_provider_i {
                        const ggml_relay_plan_key * key);
     // ABI 3: optional plan-cache diagnostic. Returns false when unavailable.
     bool (*plan_snapshot)(void * provider, ggml_relay_plan_snapshot * snapshot);
-    // ABI 4: optional CPU borrow/drain facts. False on contention or when the
-    // provider predates this query.
-    bool (*borrow_snapshot)(void * provider, ggml_relay_borrow_status * status);
+    // ABI 5: atomically submit and return a provider-owned per-plan completion
+    // token. wait_token blocks on the provider completion event and reports
+    // success/failure for exactly that token; it never polls or substitutes a
+    // global epoch. release_token retires the token record. The token result
+    // uses ggml_relay_token_result. Every token must be released before the
+    // next begin: the record owns the lane tail events, and re-recording them
+    // for a new epoch would retarget a later wait_token.
+    bool (*submit_token)(void * provider, ggml_cgraph * const * graphs, size_t stages,
+                         uint64_t * token);
+    int  (*wait_token)(void * provider, uint64_t token, int * error);
+    void (*release_token)(void * provider, uint64_t token);
+    // ABI 5: CPU borrow/drain/token facts. False on provider-mutex contention;
+    // the consumer retries and treats persistent contention as unproven.
+    bool (*cpu_snapshot)(void * provider, ggml_relay_cpu_status * status);
 };
 
 typedef const ggml_relay_provider_i * (*ggml_backend_relay_get_interface_t)(void);

@@ -10101,21 +10101,50 @@ void llama_free(llama_context * ctx) {
             LLAMA_LOG_ERROR("%s: relay failed before free: code=%d detail=%s\n",
                             __func__, status.error_code, status.error);
         }
-        // The borrow query is optional (an ABI 3 provider lacks it). Retry
-        // ordinary mutex contention; if it stays unavailable, keep the
-        // snapshot-only decision and let destroy retain on an unproved borrow.
-        ggml_relay_borrow_status borrow = {};
-        bool have_borrow = false;
+        // The unified CPU query is optional only for ABI 2/3 providers. It
+        // returns 1 filled, 0 contended, -1 unsupported. Never treat an
+        // unsupported query as a contention retry.
+        ggml_relay_cpu_status cpu = {};
+        int cpu_result = -1;
         if (have_snapshot) {
-            const int64_t borrow_deadline_us = ggml_time_us() + 100000;
+            const int64_t cpu_deadline_us = ggml_time_us() + 100000;
             do {
-                have_borrow = ggml_backend_relay_borrow_snapshot(backend, &borrow);
-            } while (!have_borrow && ggml_time_us() < borrow_deadline_us);
+                cpu_result = ggml_backend_relay_cpu_snapshot(backend, &cpu);
+                if (cpu_result != 0) {
+                    break;
+                }
+            } while (ggml_time_us() < cpu_deadline_us);
         }
-        const bool borrow_outstanding = have_borrow && borrow.borrowed_channel != UINT32_MAX;
-        if (!have_snapshot || (status.epoch != 0 && !status.finished) || borrow_outstanding) {
+        bool borrow_outstanding = false;
+        bool tokens_outstanding = false;
+        bool releases_outstanding = false;
+        bool cpu_unproven = false;
+        if (cpu_result == 1) {
+            if (have_snapshot && cpu.epoch == status.epoch && cpu.channels == status.channels) {
+                borrow_outstanding  = cpu.borrowed_channel != UINT32_MAX;
+                tokens_outstanding  = cpu.active_token != 0 || cpu.tokens_outstanding != 0;
+                // A failed provider's destroy does not require output release.
+                releases_outstanding = !status.failed && cpu.outputs_released != cpu.channels;
+            } else {
+                // The provider moved between the two queries, or a prepare
+                // changed the channel count. Do not compare stale facts.
+                cpu_unproven = true;
+            }
+        } else if (cpu_result == 0) {
+            // The provider mutex stayed contended for the whole window; the
+            // CPU facts are unproven, so retain instead of failing open.
+            cpu_unproven = true;
+        }
+        if (!have_snapshot || (status.epoch != 0 && !status.finished) ||
+            borrow_outstanding || tokens_outstanding || releases_outstanding || cpu_unproven) {
             if (borrow_outstanding) {
                 retain_reason = "a relay CPU borrow is still outstanding";
+            } else if (tokens_outstanding) {
+                retain_reason = "relay completion tokens are still outstanding";
+            } else if (releases_outstanding) {
+                retain_reason = "relay output releases are still outstanding";
+            } else if (cpu_unproven) {
+                retain_reason = "relay CPU state could not be proven";
             }
             ggml_backend_relay_abort(backend, GGML_STATUS_ABORTED);
             // Scheduler buffers and memory are also native readers' owners.
