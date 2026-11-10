@@ -1125,6 +1125,31 @@ stale/unsigned after this follow-up; `src/llama-context.cpp/.h` and
 No GPU, full suite or guard rerun. More complex staging receipts remain a
 separate line.
 
+### E.14 Unified memory_update failure wait 2026-11-10
+
+Implemented in an isolated worktree based on `69a2871c0`. Every `apply()`
+exit — false, FAILED, std/non-std throw, post-apply unproven, or NO_UPDATE —
+now goes through the main-scheduler wait before returning or entering
+`graph_reserve`. Failure paths return -3 without a reserve and leave the
+context/owner alive; a null `init_update`, `init_full` or `graph_reserve`
+maps to -2 and returns false. Catch handlers cover both `std::exception` and
+unknown exceptions.
+
+The wait is a void completion barrier only; it is not an async-success
+receipt. `has_unproven()` remains a staging/relay submission check, not a
+complete GPU completion proof. Staging completion receipts remain a separate
+contract and are not faked here.
+
+Narrow verification: built `test-kv-update-status` in this isolated worktree
+and ran it once with `tests/test-models/llama-dense.gguf`:
+`KV_UPDATE_STATUS_TEST PASS checks=20`. An initial attempt with the tiny
+qwen4exp fixture failed at baseline state get because that fixture's state
+size did not match the test buffer; it is discarded as fixture mismatch, not
+code evidence.
+
+Manifest: no digest was re-signed. `src/llama-context.cpp/.h`,
+`src/llama-memory-recurrent.h` and `patches/ws5/README.md` remain red/unsigned.
+
 ## F. Why this does not block the integration
 
 - The guard is a manifest boundary check, not a compiler or runtime test. Its failure

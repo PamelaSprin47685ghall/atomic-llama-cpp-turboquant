@@ -2760,6 +2760,11 @@ bool llama_context::memory_update(bool optimize) {
             memory_update_failed = true;
             memory_update_error  = -2;
             return false;
+        } catch (...) {
+            LLAMA_LOG_ERROR("%s: failed to initialize memory update: unknown exception\n", __func__);
+            memory_update_failed = true;
+            memory_update_error  = -2;
+            return false;
         }
         if (!mctx) {
             LLAMA_LOG_ERROR("%s: failed to initialize memory update\n", __func__);
@@ -2800,50 +2805,69 @@ bool llama_context::memory_update(bool optimize) {
         gf_res_prev->reset();
         union_record_invalidate();
 
+        bool apply_attempted = false;
+        bool apply_failed    = false;
+        bool no_update       = false;
+        apply_attempted = true;
         try {
             if (!mctx->apply()) {
                 LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
-                memory_update_failed = true;
-                memory_update_error  = -3;
-                return false;
-            }
-
-            const auto update_status = mctx->get_update_status();
-            if (update_status == LLAMA_MEMORY_APPLY_FAILED) {
-                LLAMA_LOG_ERROR("%s: memory update reported FAILED\n", __func__);
-                memory_update_failed = true;
-                memory_update_error  = -3;
-                return false;
-            }
-            if (update_status == LLAMA_MEMORY_APPLY_NO_UPDATE) {
-                // no state change; no graph reserve is needed
-                return false;
+                apply_failed = true;
+            } else {
+                const auto update_status = mctx->get_update_status();
+                if (update_status == LLAMA_MEMORY_APPLY_FAILED) {
+                    LLAMA_LOG_ERROR("%s: memory update reported FAILED\n", __func__);
+                    apply_failed = true;
+                } else if (update_status == LLAMA_MEMORY_APPLY_NO_UPDATE) {
+                    // no state change; no graph reserve is needed
+                    no_update = true;
+                } else if (has_unproven()) {
+                    LLAMA_LOG_ERROR("%s: memory update left an unproven submission\n", __func__);
+                    apply_failed = true;
+                }
             }
         } catch (const std::exception & err) {
             LLAMA_LOG_ERROR("%s: memory update threw: %s\n", __func__, err.what());
-            memory_update_failed = true;
-            memory_update_error  = -3;
-            return false;
+            apply_failed = true;
+        } catch (...) {
+            LLAMA_LOG_ERROR("%s: memory update threw: unknown exception\n", __func__);
+            apply_failed = true;
         }
-        if (has_unproven()) {
-            LLAMA_LOG_ERROR("%s: memory update left an unproven submission\n", __func__);
-            memory_update_failed = true;
-            memory_update_error  = -3;
-            return false;
-        }
-        // apply() may submit an asynchronous K-shift graph on the main
-        // scheduler. graph_reserve() below can reset/reuse it, so wait for
-        // the scheduler here. This is a completion wait only; it is not a
-        // proof of asynchronous success, and has_unproven() covers staging
-        // submission state, not ordinary async graph completion.
-        if (sched) {
+
+        // A failed apply can already have submitted an async K-shift graph.
+        // Wait on the main scheduler on every apply exit, before returning or
+        // entering graph_reserve. The void wait is a completion barrier only:
+        // it is not an async-success receipt, and has_unproven() is not a
+        // complete GPU completion proof.
+        if (apply_attempted && sched) {
             ggml_backend_sched_synchronize(sched.get());
+        }
+        if (apply_failed) {
+            memory_update_failed = true;
+            memory_update_error  = -3;
+            return false;
+        }
+        if (no_update) {
+            return false;
         }
     }
 
     // if the memory module did any computation, we have to reserve a new worst-case graph
     {
-        const auto mctx = memory->init_full();
+        llama_memory_context_ptr mctx;
+        try {
+            mctx = memory->init_full();
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: failed to initialize memory context for reserve: %s\n", __func__, err.what());
+            memory_update_failed = true;
+            memory_update_error  = -2;
+            return false;
+        } catch (...) {
+            LLAMA_LOG_ERROR("%s: failed to initialize memory context for reserve: unknown exception\n", __func__);
+            memory_update_failed = true;
+            memory_update_error  = -2;
+            return false;
+        }
         if (!mctx) {
             LLAMA_LOG_ERROR("%s: failed to initialize memory context for reserve\n", __func__);
             memory_update_failed = true;
@@ -2859,6 +2883,9 @@ bool llama_context::memory_update(bool optimize) {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
+            memory_update_failed = true;
+            memory_update_error  = -2;
+            return false;
         }
     }
 

@@ -129,14 +129,15 @@ refused, and `clear(true)` recovers. `state_write` and `state_read_sinfo` guard
 `shift_failed` at their entry, so a `cell_count == 0` stream cannot bypass the
 meta guard. No production fault hook is added.
 
-After `apply()` and the status checks, `memory_update` waits on the main
-scheduler before `graph_reserve` so an asynchronous K-shift graph cannot still
-be in flight when the reserve resets or reuses the scheduler. This is a
-completion wait only; it is not proof that the asynchronous work succeeded.
+Every `apply()` exit — false, FAILED, std or non-std throw, post-apply
+unproven, or NO_UPDATE — goes through the main-scheduler wait before the
+function returns or enters `graph_reserve`. Failure paths return -3 without a
+reserve and keep the context/owner alive; a null `init_update`/`init_full` or
+a null `graph_reserve` maps to -2 and returns false. The wait is a void
+completion barrier only: it is not an async-success receipt, and
 `has_unproven()` remains a staging/relay submission check, not a complete GPU
-completion proof. A null `init_update` or a catchable init exception maps to
--2; a catchable exception from `apply()` or `get_update_status()` maps to -3;
-no exception path is treated as success.
+completion proof. No exception path is treated as success. Staging completion
+receipts remain a separate contract.
 
 The isolated branch reports 20 checks passing; the main tree did not rerun
 that test. A pure no-update decode returns at `init_update` with NO_UPDATE
