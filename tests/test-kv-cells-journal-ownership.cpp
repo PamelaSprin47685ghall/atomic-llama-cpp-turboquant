@@ -390,6 +390,25 @@ static void test_bound_destination_assignment_aborts() {
 }
 #endif
 
+// The old 18-bit packed entry index aborted at 262144 distinct cells. The
+// index is now a 32-bit field; this boundary is bounded by the entries vector
+// and real memory, not an artificial bit width.
+static void test_entry_index_boundary() {
+    cell_journal j;
+    const uint32_t n = (1u << 18) + 1;
+    j.begin(n);
+
+    llama_kv_cell_ext ext {};
+    std::bitset<LLAMA_MAX_SEQ> seq;
+    for (uint32_t i = 0; i < n; ++i) {
+        j.record(i, static_cast<llama_pos>(i), ext, 0, seq);
+    }
+
+    CHECK(j.size() == n);
+    CHECK(j.find(0) != nullptr);
+    CHECK(j.find(n - 1) != nullptr);
+}
+
 int main() {
     test_copy_ctor_drops_journal();
     test_copy_assign_does_not_inherit_journal();
@@ -400,6 +419,7 @@ int main() {
     test_restore_real_cell_state();
     test_copy_assign_oom_keeps_destination();
     test_bound_destination_assignment_aborts();
+    test_entry_index_boundary();
 
     if (failures != 0) {
         std::fprintf(stderr, "KV_CELLS_JOURNAL_OWNERSHIP_TEST FAIL %d\n", failures);

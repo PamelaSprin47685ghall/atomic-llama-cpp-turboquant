@@ -156,7 +156,7 @@ remaining per-mutation record and replay are close to the old allocating
 restore. `prepare()` runs once per ubatch in the decode loop for both SWA and
 non-SWA, so the cost is per ubatch (amortized over the ubatch's tokens), not
 per token, but it is on the decode path. The non-SWA journal uses the same
-8 B/cell marks and the same per-trial entries as the SWA journal.
+12 B/cell seen/trial arrays and the same per-trial entries as the SWA journal.
 The fallback increments an existing map entry
 through an iterator, never through `operator[]`, and `seq_pos_dec` checks its
 entry with `GGML_ASSERT`; a missing entry aborts instead of dereferencing
@@ -173,15 +173,16 @@ failure still uses the explicit `shift_failed` fail-stop path, and
 `clear(true)` recovers it. `clear()` is synchronous, never throws, and does not
 block on a retained context object; the caller owns the ordering. With SWA,
 `prepare()` runs on the decode path, so the journal marks, the flat
-trial entries and the source scan are part of the SWA decode cost. The marks
-are two 4 B arrays per cell per stream (8 B/cell, 2 MiB per stream for 262144
-cells); the entries, the flat trial entries and the ranges hold the distinct
+`seen_` is one 8 B word per cell (32-bit generation + 32-bit entry index) and
+`trial_seen_` is 4 B per cell; together 12 B/cell, 3 MiB per stream for 262144
+cells. The entries, the flat trial entries and the ranges hold the distinct
 nodes. The source search is O(1) for the cell's own entry and the newest trial
 entries; the worst case is a linear scan over the flat trial entries. The `bytes()` ledger covers the journal marks, the global entries, the flat
 trial entries, the ranges and the discard; the recovery snapshots
 (`states`/`v_cells`), the non-SWA snapshot nodes and the flat trial index
 block are separate prepare storage and are not included. The retired capacity
-test reported about 2.2 MiB for the journal ledger and printed
+test's 2.2 MiB/1,105,920-byte figures predate the 32-bit index widening and
+were not rerun; they remain historical observations. It printed
 single-observation record/replay/trial/scan microbenchmarks; those remain
 historical observations, not stable performance claims, and the long-term
 suite no longer contains that microbenchmark.

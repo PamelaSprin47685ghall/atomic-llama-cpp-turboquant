@@ -1247,6 +1247,26 @@ success. `test-tp5-ubatch-pool` now reports
 `OK failures=0 allocs=24313 frees=23163`, exit 0, including those cases. The
 K-shift status test was not rerun after this backup-only hardening.
 
+The cell-journal entry index is no longer an 18-bit field. `seen_` is one
+64-bit word per cell: 32-bit generation in the high half and a 32-bit entry
+index in the low half; `trial_seen_` remains a 4 B generation word. The
+generation wrap clears at 2^32; the entry count is bounded by the actual
+entries vector and the 32-bit index, not an artificial 262144 limit. The hot
+path is one 64-bit load; the public `bytes()` budget counts 8 B for `seen_`
+and 4 B for `trial_seen_` (12 B/cell, 3 MiB/stream at 262144 cells). The old
+2.2 MiB/1,105,920-byte capacity figures predate the widening and were not
+rerun.
+
+`prepare_journal_begin()` now asserts that `v_cells[s]` is not already
+journal-bound, so a reentrant prepare fails loudly instead of silently
+resetting another writer's trial. The journal replay still aborts via
+`GGML_ASSERT` on a failed restore; it never reports success.
+
+`test-kv-cells-journal-ownership` includes a 262145-distinct-cell boundary
+case (one past the old limit) and passed once; its bound-destination death
+tests intentionally print child abort messages. The 12 B/cell budget is the
+current public number; the old capacity/microbench observations are historical.
+
 Manifest: `src/llama-kv-cache.cpp`, `src/llama-kv-cache.h`,
 `src/llama-kv-cells.h` and `tests/test-tp5-ubatch-pool.cpp` were updated to
 their actual post-integration hashes. `tests/test-kv-cells-journal-ownership.cpp`

@@ -510,7 +510,7 @@
     },
     {
       "path": "src/llama-kv-cache.cpp",
-      "sha256": "7f7b4833e8b7c93023ccb7ca774e18e7054f177fd9ce250eee25bf5281658a34",
+      "sha256": "950c1cd0e868c4c0465c47b541fa5a1c2541bd1f9edfbb75a17fe249500b21ad",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
@@ -758,7 +758,7 @@
     },
     {
       "path": "src/llama-kv-cells.h",
-      "sha256": "2b0a07aa5177a9f959fbb678160d0c9ae2220a2e2317e2fb7943e78cda404b27",
+      "sha256": "d699c3a7c99d6c5f00a800b4c3cf475ab28b4f73dbad98fe8a8b8b38142059e6",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose",

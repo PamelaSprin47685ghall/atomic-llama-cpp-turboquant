@@ -168,7 +168,7 @@ public:
         }
 
         ++gen_;
-        if (gen_ == (1u << 14)) {
+        if (gen_ == 0) {
             std::fill(seen_.begin(), seen_.end(), 0);
             gen_ = 1;
         }
@@ -221,10 +221,10 @@ public:
     }
 
     entry * find(uint32_t i) {
-        if (i >= seen_.size() || (seen_[i] >> 18) != gen_) {
+        if (i >= seen_.size() || (seen_[i] >> 32) != gen_) {
             return nullptr;
         }
-        return &entries_[seen_[i] & 0x3FFFF];
+        return &entries_[seen_[i] & 0xFFFFFFFFu];
     }
 
     // Find the entry that still owns the node for the used set of cell i with
@@ -298,7 +298,7 @@ public:
     // a mutation that only adds to used/seq_pos (pos_set, seq_add, ext_set)
     void record(uint32_t i, llama_pos pos, const llama_kv_cell_ext & ext, llama_pos shift,
                 const std::bitset<LLAMA_MAX_SEQ> & seq) {
-        if (i < seen_.size() && (seen_[i] >> 18) == gen_) {
+        if (i < seen_.size() && (seen_[i] >> 32) == gen_) {
             if (trial_seen(i)) {
                 return;
             }
@@ -317,8 +317,8 @@ public:
         ent.shift = shift;
         ent.seq = seq;
 
-        assert(entries_.size() < (1u << 18));
-        seen_[i] = (gen_ << 18) | entries_.size();
+        GGML_ASSERT(entries_.size() < (1ull << 32));
+        seen_[i] = (uint64_t(gen_) << 32) | uint32_t(entries_.size());
         entries_.push_back(std::move(ent));
         mark_trial(i);
     }
@@ -326,7 +326,7 @@ public:
     void record_rm(uint32_t i, llama_pos pos, const llama_kv_cell_ext & ext, llama_pos shift,
                    const std::bitset<LLAMA_MAX_SEQ> & seq,
                    std::set<uint32_t> & used, std::map<llama_pos, int> (&seq_pos)[LLAMA_MAX_SEQ]) {
-        const bool g_seen = i < seen_.size() && (seen_[i] >> 18) == gen_;
+        const bool g_seen = i < seen_.size() && (seen_[i] >> 32) == gen_;
 
         if (g_seen && trial_seen(i)) {
             trial_entry * te = find_trial(current_trial(), i);
@@ -399,8 +399,8 @@ public:
                 }
             });
 
-            assert(entries_.size() < (1u << 18));
-            seen_[i] = (gen_ << 18) | entries_.size();
+            GGML_ASSERT(entries_.size() < (1ull << 32));
+            seen_[i] = (uint64_t(gen_) << 32) | uint32_t(entries_.size());
             entries_.push_back(std::move(ent));
             mark_trial(i);
             return;
@@ -433,7 +433,7 @@ public:
                        const std::bitset<LLAMA_MAX_SEQ> & seq, llama_seq_id seq_id,
                        std::set<uint32_t> & used, std::map<llama_pos, int> (&seq_pos)[LLAMA_MAX_SEQ]) {
         const bool last = seq.count() == 1;
-        const bool g_seen = i < seen_.size() && (seen_[i] >> 18) == gen_;
+        const bool g_seen = i < seen_.size() && (seen_[i] >> 32) == gen_;
 
         if (g_seen && trial_seen(i)) {
             trial_entry * te = find_trial(current_trial(), i);
@@ -497,8 +497,8 @@ public:
             }
             if (last) ent.used_node = used.extract(i);
 
-            assert(entries_.size() < (1u << 18));
-            seen_[i] = (gen_ << 18) | entries_.size();
+            GGML_ASSERT(entries_.size() < (1ull << 32));
+            seen_[i] = (uint64_t(gen_) << 32) | uint32_t(entries_.size());
             entries_.push_back(std::move(ent));
             mark_trial(i);
             return;
@@ -551,7 +551,7 @@ public:
     size_t seen_size()      const { return seen_.size(); }
 
     size_t bytes() const {
-        size_t n = seen_.capacity()*sizeof(uint32_t) + trial_seen_.capacity()*sizeof(uint32_t) +
+        size_t n = seen_.capacity()*sizeof(uint64_t) + trial_seen_.capacity()*sizeof(uint32_t) +
                    entries_.capacity()*sizeof(entry) +
                    trial_entries_.capacity()*sizeof(trial_entry) +
                    trial_ranges_.capacity()*sizeof(std::pair<size_t, size_t>) +
@@ -641,7 +641,7 @@ private:
     std::vector<std::pair<size_t, size_t>> trial_ranges_;
     std::vector<used_node_t> discard_used_;
     std::vector<seq_pos_node_t> discard_seq_;
-    std::vector<uint32_t> seen_;
+    std::vector<uint64_t> seen_;
     std::vector<uint32_t> trial_seen_;
     uint32_t strm_ = 0;
     uint32_t gen_ = 0;
@@ -723,6 +723,10 @@ public:
 
     void set_journal(cell_journal * journal) {
         journal_ = journal;
+    }
+
+    bool is_journal_bound() const {
+        return journal_ != nullptr;
     }
 
     // Restore one cell from the prepare journal. This is the only writer used

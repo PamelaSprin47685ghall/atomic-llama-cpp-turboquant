@@ -1395,6 +1395,7 @@ bool llama_kv_cache::prepare_journal_begin() {
         heads_before.resize(n_stream);
     }
     for (uint32_t s = 0; s < n_stream; ++s) {
+        GGML_ASSERT(!v_cells[s].is_journal_bound());
         cell_journals[s].begin(v_cells[s].size(), s);
         v_cells[s].set_journal(&cell_journals[s]);
     }
