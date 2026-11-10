@@ -1171,6 +1171,13 @@ proven: the failure first appears at baseline state get, but this record does
 not assert fixture mismatch or a code regression. This failed run is not
 evidence of success.
 
+An intermediate corrected attempt (state buffers sized by
+`llama_state_seq_get_size`, before the no-shift skip) ran qwen4exp and still
+reported `KV_UPDATE_STATUS_TEST FAIL checks=22 failures=4`: the failed-ubatch
+position check, nonempty state read, and both empty-stream state checks. That
+run showed `seq_add` was ignored and the mock failure hit decode, not the
+K-shift update. It is retained as diagnosis evidence, not a pass.
+
 Follow-up correction (test-only): state buffers are now sized by
 `llama_state_seq_get_size`. qwen4exp's attention cache refuses `seq_add`
 ("cannot shift its K/V"), so the mock failure would hit the main decode graph,
