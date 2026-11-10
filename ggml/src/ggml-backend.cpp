@@ -747,10 +747,12 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 
     ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
-    // Meta buffers report is_host=true when all children are host buffers, but
-    // src/dst->data are logical sentinels, not host addresses. Do not take the
-    // direct host paths below for Meta; route them through the blocking
-    // get/set fallback so the real simple-tensor bytes move.
+    // A CPU Meta buffer reports is_host=true when every child is host, but the
+    // top-level tensor data is a virtual sentinel. Only the source sentinel
+    // matters for the source host fast path, and only the destination sentinel
+    // matters for the destination host fast path. A Meta buffer on the other
+    // side is safe because that fast path calls the Meta get/set hook, not the
+    // sentinel pointer.
     const bool src_meta = ggml_backend_buffer_is_meta(src_buf);
     const bool dst_meta = ggml_backend_buffer_is_meta(dst_buf);
     // A Meta destination needs the source tensor identity for staging slot
@@ -762,13 +764,13 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
             ggml_backend_buffer_copy_tensor(src, dst)) {
         return;
     }
-    if (ggml_backend_buffer_is_host(src_buf) && !src_meta && !dst_meta) {
+    if (ggml_backend_buffer_is_host(src_buf) && !src_meta) {
         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
-    } else if (ggml_backend_buffer_is_host(dst_buf) && !src_meta && !dst_meta) {
+    } else if (ggml_backend_buffer_is_host(dst_buf) && !dst_meta) {
         ggml_backend_moe_cache_invalidate_buffer(
                 dst_buf, dst->data, ggml_nbytes(dst));
         ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
-    } else if (src_meta || dst_meta || !ggml_backend_buffer_copy_tensor(src, dst)) {
+    } else if (!ggml_backend_buffer_copy_tensor(src, dst)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));
 #endif // NDEBUG

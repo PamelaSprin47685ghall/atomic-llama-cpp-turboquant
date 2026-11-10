@@ -25,19 +25,22 @@ no GPU path were changed.
 4. A 1-D partial view hit the row-stride assertions in `set_tensor`/`get_tensor`
    before any 1-D special handling (`nb[1]` is the parent row size, not the
    view size).
-5. `ggml_backend_meta_alloc_ctx_tensors_from_buft` initialized the simple
-   tensors before assigning the Meta base, so the root simple-tensor data
-   offset was computed from the post-init sentinel.
 
 ## Fix
 
 - `ggml/src/ggml-backend.cpp`
   - Empty copies are a no-op.
-  - Meta buffers are detected before the host fast paths; the host fast paths
-    are skipped when either side is Meta. The host->Meta staging identity fast
-    path (`ggml_backend_buffer_copy_tensor`) is still tried first.
-  - Meta copies use the blocking `get`/`set` fallback; a failed fallback
-    allocation aborts instead of dereferencing null.
+  - The host fast paths exclude only the source Meta sentinel for a source-host
+    copy, and only the destination Meta sentinel for a destination-host copy.
+    A Meta buffer on the other side is safe because the fast path calls the
+    Meta get/set hook, not the sentinel pointer. This keeps the original
+    Meta->host and host->Meta direct get/set paths instead of adding an extra
+    malloc round trip.
+  - The host->Meta staging identity fast path
+    (`ggml_backend_buffer_copy_tensor`) is still tried first. Remaining cases
+    try the destination buffer cpy hook, then the blocking `get`/`set`
+    fallback; a failed fallback allocation aborts instead of dereferencing
+    null.
 - `ggml/src/ggml-backend-meta.cpp`
   - Added `ggml_backend_meta_view_simple_split`: for a contiguous view of a
     simply split parent, intersect the view's absolute range along the split
@@ -49,10 +52,14 @@ no GPU path were changed.
     `view_offs`, so widths and offsets cannot drift.
   - `set_tensor`/`get_tensor` use a 1-D logical range mapping for
     `ne[1] == 1`, before the row-stride assertions. It supports non-zero
-    offsets and segmented/repeated split states.
+    offsets for the exact view state. Segmented/repeated parent views are not
+    covered by the exact helper and keep the existing heuristic.
   - Empty set/get/memset are no-ops.
   - The Meta allocation assigns `t->data = get_base(meta_buf)` before
-    `init_tensor_impl`, then restores the sentinel.
+    `init_tensor_impl`, then restores the sentinel. This is a defensive
+    ordering change, not a proven root cause: on the first CPU Meta allocation
+    round the simple buffers are still null, so the old code did not execute
+    the child-base calculation on that round.
 - `tests/CMakeLists.txt`
   - Registered `test-meta-host-view-copy`.
 
@@ -102,4 +109,7 @@ the two ranges explicitly. No test was deleted and no assertion was relaxed.
   the same as the candidate and was not exercised.
 - The exact helper handles contiguous, simply split parents. Segmented,
   repeated, mirrored, unaligned and non-contiguous views keep the existing
-  heuristic.
+  heuristic; that heuristic is not claimed exact. The reviewer's
+  segmented/repeated exact-mapping request is not yet implemented.
+- The asymmetric host fast-path guard was verified only by the narrow CPU
+  target below; no timing/performance measurement was made.
