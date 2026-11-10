@@ -382,3 +382,20 @@ copy/move construction ownership, copy/move assignment into an unbound
 destination with the real `restore_from_journal` state, the strong exception
 guarantee under an injected allocation failure, and (on POSIX) that assigning
 over a bound destination aborts.
+
+## Position upper bound in the cell lookup
+
+`llama_kv_cells` keeps `pos_max_`, a conservative upper bound over the
+positions of its used cells. `find_cell_by_pos(p)` returns `-1` immediately
+when `p > pos_max_`; that covers the common new-token miss without walking the
+`used` set. Every write to `pos` goes through `write_pos()`, so the bound is
+raised by incremental updates, cross-stream copies, state restore and journal
+replay. Only `reset()` lowers it, after `used` has been cleared.
+
+The bound is allowed to be stale high: a removal or a downward shift can leave
+it above the real maximum. That is safe because every in-range query still
+scans the used set, so hits and in-range misses keep the original first-cell
+order, including when several cells share a position. The lookup is read-only;
+the cache's existing single-writer discipline covers the bound. The boundary
+cases and a randomized differential comparison against a brute-force scan live
+in `tests/test-kv-cells-pos-lookup.cpp`.

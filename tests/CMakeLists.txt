@@ -654,6 +654,22 @@ add_test(NAME test-kv-cells-journal-ownership COMMAND test-kv-cells-journal-owne
 set_property(TEST test-kv-cells-journal-ownership PROPERTY LABELS "cpu;tp5")
 set_property(TEST test-kv-cells-journal-ownership PROPERTY PASS_REGULAR_EXPRESSION "KV_CELLS_JOURNAL_OWNERSHIP_TEST PASS")
 
+# llama_kv_cells position lookup. Header-only, no model/backend: the
+# conservative pos_max_ fast path must never turn a hit into a miss, and every
+# non-hit must keep the original scan semantics after removals, shifts,
+# snapshots, copies and journal replay.
+add_executable(test-kv-cells-pos-lookup test-kv-cells-pos-lookup.cpp)
+target_compile_features(test-kv-cells-pos-lookup PRIVATE cxx_std_17)
+target_include_directories(test-kv-cells-pos-lookup PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include)
+# ggml supplies ggml_abort for the GGML_ASSERTs in the header.
+target_link_libraries(test-kv-cells-pos-lookup PRIVATE ggml)
+add_test(NAME test-kv-cells-pos-lookup COMMAND test-kv-cells-pos-lookup)
+set_property(TEST test-kv-cells-pos-lookup PROPERTY LABELS "cpu;tp5")
+set_property(TEST test-kv-cells-pos-lookup PROPERTY PASS_REGULAR_EXPRESSION "KV_CELLS_POS_LOOKUP_TEST PASS")
+
 if (UNIX)
     add_executable(test-ntok-onegraph test-ntok-onegraph.cpp)
     target_link_libraries(test-ntok-onegraph PRIVATE llama)

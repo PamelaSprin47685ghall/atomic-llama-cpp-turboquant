@@ -663,6 +663,7 @@ public:
         : has_shift(other.has_shift),
           used(other.used),
           pos(other.pos),
+          pos_max_(other.pos_max_),
           ext(other.ext),
           shift(other.shift),
           seq(other.seq),
@@ -696,6 +697,7 @@ public:
         : has_shift(other.has_shift),
           used(std::move(other.used)),
           pos(std::move(other.pos)),
+          pos_max_(other.pos_max_),
           ext(std::move(other.ext)),
           shift(std::move(other.shift)),
           seq(std::move(other.seq)),
@@ -768,7 +770,7 @@ public:
             used.insert(i);
         }
 
-        pos[i]   = p;
+        write_pos(i, p);
         ext[i]   = e;
         seq[i]   = s;
         shift[i] = sh;
@@ -780,7 +782,7 @@ public:
 
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {
-            pos[i]   = -1;
+            write_pos(i, -1);
             ext[i].reset();
             shift[i] =  0;
             seq[i].reset();
@@ -789,6 +791,8 @@ public:
         has_shift = false;
 
         used.clear();
+
+        pos_max_ = -1;
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
@@ -868,10 +872,23 @@ public:
     }
 
     // the index of a cell that holds position p, or -1 when no cell does.
-    // A unified cache has one cell per position; the caller shares that cell
-    // instead of appending a second one for a position that already has a
-    // slot (see llama_kv_cache::find_slot).
+    // The caller shares a hit instead of appending a second cell for a
+    // position that already has a slot (see llama_kv_cache::find_slot). A
+    // position can still map to more than one cell: a batch may introduce
+    // duplicates before apply, and a restored state is not deduplicated.
+    //
+    // pos_max_ is a conservative upper bound over the positions of used
+    // cells. It is monotone between resets: removals and downward shifts may
+    // leave it above the real maximum, which only skips the fast path. A
+    // position above the bound cannot be present, so the common "new token"
+    // miss returns without walking the used set. A hit or an in-range miss
+    // keeps the original scan, including its first-cell order when several
+    // cells share a position.
     int64_t find_cell_by_pos(llama_pos p) const {
+        if (p > pos_max_) {
+            return -1;
+        }
+
         for (const uint32_t i : used) {
             if (pos[i] == p) {
                 return i;
@@ -920,7 +937,7 @@ public:
         for (uint32_t j = 0; j < n; ++j) {
             const auto idx = i + j;
 
-            res.pos[j]   = pos[idx];
+            res.write_pos(j, pos[idx]);
             res.ext[j]   = ext[idx];
             res.seq[j]   = seq[idx];
             res.shift[j] = shift[idx];
@@ -940,7 +957,7 @@ public:
         for (uint32_t j = 0; j < idxs.size(); ++j) {
             const auto idx = idxs[j];
 
-            res.pos[j]   = pos[idx];
+            res.write_pos(j, pos[idx]);
             res.ext[j]   = ext[idx];
             res.seq[j]   = seq[idx];
             res.shift[j] = shift[idx];
@@ -957,7 +974,7 @@ public:
         for (uint32_t j = 0; j < idxs.size(); ++j) {
             const auto idx = idxs[j];
 
-            out.pos[j]   = pos[idx];
+            out.write_pos(j, pos[idx]);
             out.ext[j]   = ext[idx];
             out.seq[j]   = seq[idx];
             out.shift[j] = shift[idx];
@@ -984,7 +1001,7 @@ public:
                 seq_pos_rm(i + j);
             }
 
-            pos[idx]   = other.pos[j];
+            write_pos(idx, other.pos[j]);
             ext[idx]   = other.ext[j];
             seq[idx]   = other.seq[j];
             shift[idx] = other.shift[j];
@@ -1015,7 +1032,7 @@ public:
                 seq_pos_rm(idx);
             }
 
-            pos[idx]   = other.pos[j];
+            write_pos(idx, other.pos[j]);
             ext[idx]   = other.ext[j];
             seq[idx]   = other.seq[j];
             shift[idx] = other.shift[j];
@@ -1041,7 +1058,7 @@ public:
 
         seq[i].reset();
 
-        pos[i] = -1;
+        write_pos(i, -1);
         ext[i].reset();
         shift[i] = 0;
     }
@@ -1063,7 +1080,7 @@ public:
         seq[i].reset(seq_id);
 
         if (seq[i].none()) {
-            pos[i] = -1;
+            write_pos(i, -1);
             ext[i].reset();
             shift[i] = 0;
 
@@ -1112,7 +1129,7 @@ public:
             }
         }
 
-        pos[i]   = e.pos;
+        write_pos(i, e.pos);
         ext[i]   = e.ext;
         seq[i]   = e.seq;
         shift[i] = e.shift;
@@ -1183,7 +1200,7 @@ public:
             }
         }
 
-        pos[i]   = te.pos;
+        write_pos(i, te.pos);
         ext[i]   = te.ext;
         seq[i]   = te.seq;
         shift[i] = te.shift;
@@ -1253,7 +1270,7 @@ public:
             }
         }
 
-        pos[i]   = old_pos;
+        write_pos(i, old_pos);
         ext[i]   = snap.ext[j];
         seq[i]   = old_seq;
         shift[i] = snap.shift[j];
@@ -1307,7 +1324,7 @@ public:
             seq_pos_rm(i);
             seq[i].reset();
 
-            pos[i] = -1;
+            write_pos(i, -1);
             ext[i].reset();
             shift[i] = 0;
 
@@ -1446,7 +1463,7 @@ public:
         // failure leaves the cell empty and matches the journal's old state.
         used.insert(i);
 
-        pos[i] = p;
+        write_pos(i, p);
     }
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
@@ -1466,14 +1483,14 @@ public:
 
         seq_pos_rm(i);
 
-        pos[i]   += d;
+        write_pos(i, pos[i] + d);
         shift[i] += d;
 
         has_shift = true;
 
         if (pos[i] < 0) {
             seq[i].reset();
-            pos[i] = -1;
+            write_pos(i, -1);
             shift[i] = 0;
 
             used.erase(i);
@@ -1497,7 +1514,7 @@ public:
 
         seq_pos_rm(i);
 
-        pos[i]   /= d;
+        write_pos(i, pos[i] / d);
         shift[i] += p_old - pos[i];
 
         seq_pos_add(i);
@@ -1506,12 +1523,23 @@ public:
     }
 
 private:
+    // Every write to pos goes through here so pos_max_ stays an upper bound
+    // over the positions of used cells. The bound never decreases except on
+    // reset(): a removal or a downward shift leaves it high, which is safe.
+    void write_pos(uint32_t i, llama_pos p) {
+        pos[i] = p;
+        if (p > pos_max_) {
+            pos_max_ = p;
+        }
+    }
+
     // Swap the cell data without touching the journal borrow. Both assignment
     // operators require an unbound destination, so journal_ is not swapped.
     void swap_data(llama_kv_cells & other) noexcept {
         std::swap(has_shift, other.has_shift);
         used.swap(other.used);
         pos.swap(other.pos);
+        std::swap(pos_max_, other.pos_max_);
         ext.swap(other.ext);
         shift.swap(other.shift);
         seq.swap(other.seq);
@@ -1526,6 +1554,11 @@ private:
     std::set<uint32_t> used;
 
     std::vector<llama_pos> pos;
+
+    // Conservative upper bound over the positions of used cells. write_pos()
+    // raises it on every non-negative position write; only reset() lowers it,
+    // after used has been cleared.
+    llama_pos pos_max_ = -1;
 
     // stores extra info per cell
     std::vector<llama_kv_cell_ext> ext;
