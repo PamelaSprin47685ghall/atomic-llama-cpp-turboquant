@@ -366,7 +366,39 @@ void ggml_backend_free(ggml_backend_t backend) {
         return;
     }
 
+    // A scheduler retained under this backend owns copy slots whose native
+    // work may still be in flight. Drain it while the backend is still alive;
+    // if it cannot be proven quiescent, keep the backend handle reachable
+    // instead of freeing its native object underneath the retained scheduler.
+    if (ggml_backend_sched_retained_count(backend) != 0) {
+        (void) ggml_backend_sched_drain_retained(backend);
+        if (ggml_backend_sched_retained_count(backend) != 0) {
+            GGML_LOG_ERROR("%s: backend owner still holds a retained scheduler; not freeing\n", __func__);
+            return;
+        }
+    }
+
+    if (!ggml_backend_quiesce(backend)) {
+        GGML_LOG_ERROR("%s: backend owner could not prove begin/pending quiescence; not freeing\n", __func__);
+        return;
+    }
+
     backend->iface.free(backend);
+}
+
+bool ggml_backend_quiesce(ggml_backend_t backend) {
+    if (backend == nullptr) {
+        return true;
+    }
+    if (backend->device != nullptr && backend->device->reg != nullptr) {
+        using quiesce_t = bool (*)(ggml_backend_t);
+        auto fn = (quiesce_t) ggml_backend_reg_get_proc_address(
+                backend->device->reg, "ggml_backend_submission_quiesce");
+        if (fn != nullptr) {
+            return fn(backend);
+        }
+    }
+    return true;
 }
 
 ggml_backend_buffer_type_t ggml_backend_get_default_buffer_type(ggml_backend_t backend) {
@@ -1080,6 +1112,13 @@ struct ggml_backend_sched {
     // Monotonic id for explicit completion receipts. Normal graph_compute
     // calls do not use it.
     uint64_t receipt_attempt = 0;
+    // Reachable process-level owner for a scheduler that sched_free could
+    // not release. owner is the context or backend that will retry the
+    // drain; the retained list keeps the scheduler reachable.
+    void * owner = nullptr;
+    struct ggml_backend_sched * next_retained_sched = nullptr;
+    bool retained_registered = false;
+    bool draining = false;
 
     int n_backends;
 
@@ -2562,20 +2601,107 @@ void ggml_backend_sched_mark_unproven(ggml_backend_sched_t sched) {
     }
 }
 
+static bool ggml_backend_sched_has_standard_pending_view(ggml_backend_t backend) {
+    if (backend == nullptr || backend->device == nullptr || backend->device->reg == nullptr) {
+        return false;
+    }
+    return ggml_backend_reg_get_proc_address(
+            backend->device->reg, "ggml_backend_submission_pending") != nullptr;
+}
+
+static bool ggml_backend_sched_has_async_no_barrier(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_backends; ++i) {
+        ggml_backend_t backend = sched->backends[i];
+        const bool async_iface = backend != nullptr &&
+                (backend->iface.cpy_tensor_async != nullptr ||
+                 backend->iface.set_tensor_async != nullptr ||
+                 backend->iface.get_tensor_async != nullptr ||
+                 ggml_backend_sched_has_standard_pending_view(backend));
+        if (async_iface && backend->iface.synchronize == nullptr &&
+                !ggml_backend_sched_has_full_pending_view(backend)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_backend_sched_has_no_full_barrier(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_backends; ++i) {
+        ggml_backend_t backend = sched->backends[i];
+        if (backend != nullptr && backend->iface.synchronize != nullptr &&
+                !ggml_backend_sched_has_full_pending_view(backend)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_backend_sched_has_no_full_async(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_backends; ++i) {
+        ggml_backend_t backend = sched->backends[i];
+        const bool async_iface = backend != nullptr &&
+                (backend->iface.synchronize != nullptr ||
+                 backend->iface.cpy_tensor_async != nullptr ||
+                 backend->iface.set_tensor_async != nullptr ||
+                 backend->iface.get_tensor_async != nullptr ||
+                 ggml_backend_sched_has_standard_pending_view(backend));
+        if (async_iface && !ggml_backend_sched_has_full_pending_view(backend)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::mutex & ggml_backend_sched_retired_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static ggml_backend_sched *& ggml_backend_sched_retired_head() {
+    static ggml_backend_sched * head = nullptr;
+    return head;
+}
+
+static void ggml_backend_sched_retire(ggml_backend_sched_t sched) {
+    std::lock_guard<std::mutex> lock(ggml_backend_sched_retired_mutex());
+    if (sched->retained_registered) {
+        return;
+    }
+    sched->next_retained_sched = ggml_backend_sched_retired_head();
+    ggml_backend_sched_retired_head() = sched;
+    sched->retained_registered = true;
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
-    // Use the cached state only. The owner must call
-    // ggml_backend_sched_has_unproven() while its backends are alive; a caller
-    // may destroy the backends before the scheduler, and dereferencing them
-    // here would be a use-after-free on every normal shutdown.
-    if (sched->submission_failed != 0 || sched->submission_unproven) {
-        // Keep the copy slots and their buffers: an in-flight copy may still
-        // read them. The process owns them until exit; this is not a claim
-        // that the submission drained.
-        GGML_LOG_ERROR("%s: retaining copy slots, an async submission is still unproven\n", __func__);
+    if (sched->retained_registered || sched->draining) {
+        GGML_LOG_ERROR("%s: scheduler is retained/draining; drain_retained must release it\n", __func__);
         return;
+    }
+    bool unproven = sched->submission_failed != 0 || sched->submission_unproven;
+    const bool async_unknown = ggml_backend_sched_has_async_no_barrier(sched);
+    if (unproven || async_unknown) {
+        if (sched->owner == nullptr && sched->n_backends > 0) {
+            // The first backend is the caller's teardown authority; its
+            // ggml_backend_free drains this scheduler before the native free.
+            sched->owner = sched->backends[0];
+        }
+        GGML_LOG_ERROR("%s: retaining scheduler, an async submission or receipt is still unproven\n", __func__);
+        ggml_backend_sched_retire(sched);
+        return;
+    }
+    if (ggml_backend_sched_has_no_full_barrier(sched)) {
+        // synchronize is the contract's lifetime barrier for a backend without
+        // a full pending view. It proves quiescence, not success.
+        for (int b = 0; b < sched->n_backends; ++b) {
+            ggml_backend_t backend = sched->backends[b];
+            if (backend != nullptr && backend->iface.synchronize != nullptr &&
+                    !ggml_backend_sched_has_full_pending_view(backend)) {
+                ggml_backend_synchronize(backend);
+            }
+        }
     }
     if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
         sched->moe_cache_api.session_destroy(sched->moe_cache_session);
@@ -2605,6 +2731,108 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph.nodes);
     free(sched->graph.leafs);
     free(sched);
+}
+
+void ggml_backend_sched_set_owner(ggml_backend_sched_t sched, void * owner) {
+    if (sched != nullptr) {
+        sched->owner = owner;
+    }
+}
+
+int ggml_backend_sched_drain_retained(void * owner) {
+    int freed = 0;
+    for (;;) {
+        ggml_backend_sched * sched = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(ggml_backend_sched_retired_mutex());
+            for (ggml_backend_sched * it = ggml_backend_sched_retired_head(); it != nullptr;
+                    it = it->next_retained_sched) {
+                if (it->owner == owner && !it->draining) {
+                    it->draining = true;
+                    sched = it;
+                    break;
+                }
+            }
+        }
+        if (sched == nullptr) {
+            break;
+        }
+        bool drained = false;
+        if (ggml_backend_sched_has_async_no_barrier(sched)) {
+            // Async entry points without a synchronize hook: no barrier exists,
+            // so the copy slots cannot be proven quiescent.
+            GGML_LOG_ERROR("%s: scheduler has async work without a synchronize barrier; keeping it retained\n",
+                    __func__);
+        } else if (ggml_backend_sched_has_no_full_async(sched) && sched->submission_failed != 0) {
+            // A recorded native failure has no success receipt to clear it, and
+            // a synchronize barrier is a quiescence proof, not a success proof.
+            GGML_LOG_ERROR("%s: scheduler has a failed submission without a full pending view; keeping it retained\n",
+                    __func__);
+        } else {
+            if (ggml_backend_sched_has_no_full_barrier(sched)) {
+                for (int b = 0; b < sched->n_backends; ++b) {
+                    ggml_backend_t backend = sched->backends[b];
+                    if (backend != nullptr && backend->iface.synchronize != nullptr &&
+                            !ggml_backend_sched_has_full_pending_view(backend)) {
+                        ggml_backend_synchronize(backend);
+                    }
+                }
+            }
+            int error = 0;
+            drained = ggml_backend_sched_drain_pending(sched, &error);
+            if (drained && sched->submission_failed == 0) {
+                // A successful drain proves the backends report no pending or
+                // error submission; the cached flag was the only remaining
+                // unproven state. A recorded native failure stays fail-stop.
+                sched->submission_unproven = false;
+            }
+        }
+        if (!drained) {
+            std::lock_guard<std::mutex> lock(ggml_backend_sched_retired_mutex());
+            sched->draining = false;
+            break;
+        }
+        if (sched->submission_failed != 0 || sched->submission_unproven) {
+            std::lock_guard<std::mutex> lock(ggml_backend_sched_retired_mutex());
+            sched->draining = false;
+            break;
+        }
+        bool removed = false;
+        {
+            std::lock_guard<std::mutex> lock(ggml_backend_sched_retired_mutex());
+            ggml_backend_sched ** link = &ggml_backend_sched_retired_head();
+            while (*link != nullptr) {
+                if (*link == sched) {
+                    *link = sched->next_retained_sched;
+                    sched->next_retained_sched = nullptr;
+                    sched->retained_registered = false;
+                    sched->draining = false;
+                    removed = true;
+                    break;
+                }
+                link = &(*link)->next_retained_sched;
+            }
+        }
+        if (!removed) {
+            GGML_LOG_ERROR("%s: drained scheduler disappeared from owner list\n", __func__);
+            break;
+        }
+        ggml_backend_sched_free(sched);
+        ++freed;
+    }
+    return freed;
+}
+
+size_t ggml_backend_sched_retained_count(void * owner) {
+    std::lock_guard<std::mutex> lock(ggml_backend_sched_retired_mutex());
+    size_t n = 0;
+    for (ggml_backend_sched * it = ggml_backend_sched_retired_head(); it != nullptr;
+            it = it->next_retained_sched) {
+        if (it->owner == owner) {
+            ++n;
+        }
+    }
+    return n;
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {

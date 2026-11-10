@@ -77,6 +77,11 @@ extern "C" {
     GGML_API ggml_guid_t  ggml_backend_guid(ggml_backend_t backend);
     GGML_API const char * ggml_backend_name(ggml_backend_t backend);
     GGML_API void         ggml_backend_free(ggml_backend_t backend);
+    // Optional blocking owner protocol: close new submissions and wait for
+    // the backend's begin/pending counters. It does not wait for receipts or
+    // command buffers; free performs those checks. Backends without the
+    // "ggml_backend_submission_quiesce" proc return true (no extra contract).
+    GGML_API bool         ggml_backend_quiesce(ggml_backend_t backend);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_get_default_buffer_type(ggml_backend_t backend);
     GGML_API ggml_backend_buffer_t      ggml_backend_alloc_buffer(ggml_backend_t backend, size_t size);
@@ -331,6 +336,15 @@ extern "C" {
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
+    // Associate a scheduler with the context/backend that owns its backends.
+    // A scheduler that free cannot release is kept in a process-level list
+    // under this owner; drain_retained retries it while the owner still owns
+    // the backends.
+    GGML_API void                 ggml_backend_sched_set_owner(ggml_backend_sched_t sched, void * owner);
+    // Retry every retained scheduler belonging to owner. The caller must still
+    // own the backends. Returns the number of schedulers actually freed.
+    GGML_API int                  ggml_backend_sched_drain_retained(void * owner);
+    GGML_API size_t               ggml_backend_sched_retained_count(void * owner);
     // Query every backend's optional submission error/pending while the
     // scheduler's backends are still alive. Returns true when an asynchronous
     // submission is unproven. The scheduler keeps its copy slots and refuses
