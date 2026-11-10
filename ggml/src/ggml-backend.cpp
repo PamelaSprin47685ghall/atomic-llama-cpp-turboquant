@@ -1109,6 +1109,11 @@ struct ggml_backend_sched {
     // alive, so ggml_backend_sched_free never has to dereference them (the
     // caller may destroy the backends before the scheduler).
     bool submission_unproven = false;
+    // Cached at creation: the backend set has an async entry point without a
+    // synchronize hook and without a full pending view. sched_free must not
+    // probe the backends (they may already be freed), so this capability is
+    // recorded while they are alive and used as a retention reason.
+    bool async_no_barrier = false;
     // Monotonic id for explicit completion receipts. Normal graph_compute
     // calls do not use it.
     uint64_t receipt_attempt = 0;
@@ -1264,6 +1269,7 @@ static void ggml_backend_sched_receipt_finish(
 }
 
 static bool ggml_backend_sched_any_pending(ggml_backend_sched_t sched);
+static bool ggml_backend_sched_has_async_no_barrier(ggml_backend_sched_t sched);
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
@@ -2485,6 +2491,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
+    // Record the async-without-barrier capability while the backends are
+    // alive; sched_free uses the cached flag and never dereferences them.
+    sched->async_no_barrier = ggml_backend_sched_has_async_no_barrier(sched);
+
     {
         void * cache_backends[GGML_SCHED_MAX_BACKENDS];
         for (int b = 0; b < n_backends; b++) {
@@ -2680,9 +2690,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         GGML_LOG_ERROR("%s: scheduler is retained/draining; drain_retained must release it\n", __func__);
         return;
     }
-    bool unproven = sched->submission_failed != 0 || sched->submission_unproven;
-    const bool async_unknown = ggml_backend_sched_has_async_no_barrier(sched);
-    if (unproven || async_unknown) {
+    // Use cached state only. The caller may destroy the backends before the
+    // scheduler (llama_context does), so probing them here would be a
+    // use-after-free on a normal shutdown.
+    const bool unproven = sched->submission_failed != 0 || sched->submission_unproven ||
+                          sched->async_no_barrier;
+    if (unproven) {
         if (sched->owner == nullptr && sched->n_backends > 0) {
             // The first backend is the caller's teardown authority; its
             // ggml_backend_free drains this scheduler before the native free.
@@ -2691,17 +2704,6 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         GGML_LOG_ERROR("%s: retaining scheduler, an async submission or receipt is still unproven\n", __func__);
         ggml_backend_sched_retire(sched);
         return;
-    }
-    if (ggml_backend_sched_has_no_full_barrier(sched)) {
-        // synchronize is the contract's lifetime barrier for a backend without
-        // a full pending view. It proves quiescence, not success.
-        for (int b = 0; b < sched->n_backends; ++b) {
-            ggml_backend_t backend = sched->backends[b];
-            if (backend != nullptr && backend->iface.synchronize != nullptr &&
-                    !ggml_backend_sched_has_full_pending_view(backend)) {
-                ggml_backend_synchronize(backend);
-            }
-        }
     }
     if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
         sched->moe_cache_api.session_destroy(sched->moe_cache_session);

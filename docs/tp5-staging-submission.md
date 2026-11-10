@@ -100,7 +100,11 @@ pool test mirrors the v1 prefix and static-asserts that v3 appends
 - `ggml_backend_sched_free` uses the **cached** state only. It never
   dereferences the backends: the caller may destroy them before the scheduler
   (llama_context does), and a probe there would be a use-after-free on a
-  normal shutdown.
+  normal shutdown. The async-without-barrier capability is cached at scheduler
+  creation. A scheduler whose cached state is unproven, or whose backend set
+  has an async entry point without a synchronize/full-pending view, is retained
+  under its owner; `ggml_backend_free` drains the retained schedulers while the
+  backends are alive.
 - The Meta allreduce/reduce path checks both the generic helper result and the
   **Meta backend's own** error/pending state at graph-compute entry, before
   each child copy and before the copy-back. The child CUDA registry does not
