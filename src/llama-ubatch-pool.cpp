@@ -117,7 +117,7 @@ ubatch_data_handle ubatch_data_pool::acquire() {
         }
 
         slot.in_use = true;
-        slot.refs.store(1, std::memory_order_relaxed);
+        slot.refs.store(1, std::memory_order_release);
         ++slot.gen;
         ++in_use_;
         ++stats_.acquired;
@@ -164,7 +164,7 @@ void ubatch_data_pool::release(uint32_t slot, uint32_t gen) {
 
     assert(entry.refs.load(std::memory_order_relaxed) > 0);
 
-    if (entry.refs.fetch_sub(1, std::memory_order_relaxed) == 1) {
+    if (entry.refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         entry.in_use = false;
         assert(in_use_ > 0);
         --in_use_;
