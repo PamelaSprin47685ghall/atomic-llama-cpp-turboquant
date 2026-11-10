@@ -6102,11 +6102,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         // completion. Drain before memory updates, graph reset, or set_inputs.
         // Do not account the current, not-yet-submitted token as synchronized.
         ggml_backend_sched_synchronize(sched.get());
-        // The previous decode may have run on a per-shape scheduler. Drain it
-        // too before any entry can be evicted or rebuilt.
-        if (shape_last_sched != nullptr && shape_last_sched != sched.get()) {
-            ggml_backend_sched_synchronize(shape_last_sched);
-        }
+    }
+    // The previous decode may have run on a per-shape scheduler. Drain it too
+    // before any entry can be evicted or rebuilt. This is not relay-specific:
+    // an explicit GGML_TP5_LLAMA_PLAN_CACHE also uses shape_last_sched on a
+    // non-relay context.
+    if (shape_last_sched != nullptr && shape_last_sched != sched.get()) {
+        ggml_backend_sched_synchronize(shape_last_sched);
     }
 
     // The out_ids tensor is built at the high-water envelope (or at the
@@ -6260,6 +6262,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             // at the top of this function. Free it before installing a new
             // entry in the same slot, and drop any stale back-pointers.
             if (shape_plans[got.index]) {
+                // The top-of-function drain covers shape_last_sched, but an
+                // LRU victim may be an older slot that is not shape_last_sched.
+                // Synchronize its scheduler explicitly before reset() frees
+                // the graph and placement it may still be executing.
+                if (shape_plans[got.index]->sched) {
+                    ggml_backend_sched_synchronize(shape_plans[got.index]->sched.get());
+                }
                 if (shape_plans[got.index]->res.get() == gf_res_current) {
                     gf_res_current = nullptr;
                 }
