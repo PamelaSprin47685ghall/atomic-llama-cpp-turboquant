@@ -3732,6 +3732,8 @@ void llama_context::union_record_invalidate() {
     st.record_bound_rs_head = 0;
     st.record_bound_replay_len = 0;
     st.record_topology_key = llama_topology_key{};
+    st.live_topology_key   = llama_topology_key{};
+    st.live_topology_gf    = nullptr;
     st.shape_map = llama_union_shape_map{};
     st.record_nodes.clear();
     st.width_table.clear();
@@ -5195,21 +5197,35 @@ bool llama_context::union_rebind_apply(llm_graph_result * res,
     // would have accepted, never accept one the walk would refuse. The walk
     // below remains the authority for the tensor-level identity - the key says
     // "same topology", the walk says "same tensor objects".
+    llama_topology_key live_topology{};
     {
-        const llama_topology_key live =
-                llama_topology_key_of(res->get_gf(), union_topology_key_excl(st.shape_map, st.record_t));
+        // The key is invariant to every runtime dimension this lane binds
+        // (union_topology_key_excl() removes them), and record_topology_key is
+        // refreshed to the same value after every successful bind. Re-walking
+        // and re-hashing the whole graph on every decode step therefore
+        // recomputes the same bytes. Cache the live key per graph object; the
+        // record invalidation and the record snapshot (which re-arms the
+        // record after a rebuild, including workspace address reuse) reset it.
+        if (st.live_topology_gf == res->get_gf()) {
+            live_topology = st.live_topology_key;
+        } else {
+            live_topology = llama_topology_key_of(res->get_gf(),
+                    union_topology_key_excl(st.shape_map, st.record_t));
+            st.live_topology_key = live_topology;
+            st.live_topology_gf  = res->get_gf();
+        }
         if (union_bind_trace_on()) {
             LLAMA_LOG_ERROR("%s: topology gate live hash=%016llx nodes=%u | "
                             "record hash=%016llx nodes=%u | gf=%p res_gf=%p same=%d\n",
                             "union_rebind_apply",
-                            (unsigned long long) live.hash, live.n_nodes,
+                            (unsigned long long) live_topology.hash, live_topology.n_nodes,
                             (unsigned long long) st.record_topology_key.hash,
                             st.record_topology_key.n_nodes,
                             (const void *) res->get_gf(), (const void *) res->get_gf(),
-                            (int) (live.hash == st.record_topology_key.hash &&
-                                   live.n_nodes == st.record_topology_key.n_nodes));
+                            (int) (live_topology.hash == st.record_topology_key.hash &&
+                                   live_topology.n_nodes == st.record_topology_key.n_nodes));
         }
-        if (!llama_topology_same(live, st.record_topology_key)) {
+        if (!llama_topology_same(live_topology, st.record_topology_key)) {
             ++st.c_refused_topology;
             ++st.c_fallbacks;
             return false;
@@ -5716,7 +5732,13 @@ bool llama_context::union_rebind_apply(llm_graph_result * res,
     // arm the same n_kv as the graph's runtime width before re-taking the
     // hash. A hash that cannot be taken means the bind cannot prove what it
     // did, so it is refused and the caller rebuilds.
-    st.record_topology_key = llama_topology_key_of(res->get_gf(), union_topology_key_excl(st.shape_map, st.record_t));
+    // The gate above already has the live key, and the key is invariant to the
+    // runtime dimensions this bind patches (the lane's exclusion set removes
+    // them), so the bound graph hashes to the same value. Reuse it instead of
+    // re-walking the graph after every bind.
+    st.record_topology_key = live_topology;
+    st.live_topology_key   = live_topology;
+    st.live_topology_gf    = res->get_gf();
     if (new_nkv != 0) {
         // The bound is the arena the replan above just allocated, not the
         // width the graph was recorded at: on the token lane the two differ
@@ -6689,6 +6711,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                 st.width_table.clear();
             }
             st.record_topology_key = llama_topology_key_of(gf, union_topology_key_excl(st.shape_map, st.record_t));
+            st.live_topology_key   = st.record_topology_key;
+            st.live_topology_gf    = gf;
             if (union_bind_trace_on()) LLAMA_LOG_ERROR("%s: record post-alloc nodes=%zu rt_dims=%zu table_ok=%d hashed=%d hash=%016llx\n",
                     "union_rebind_apply", st.record_nodes.size(), runtime_dims.size(),
                     table_ok ? 1 : 0, st.topology_hashed ? 1 : 0,

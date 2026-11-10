@@ -507,6 +507,18 @@ struct llama_nkv_ctx_state {
     // the width-table hash answers "did the patch leave the topology alone".
     llama_topology_key       record_topology_key{};
 
+    // Cached live copy of record_topology_key for the bind gate. The key is
+    // invariant to the bound runtime dimensions (the lane's exclusion set
+    // removes every axis the bind patches), and record_topology_key is
+    // refreshed after every successful bind, so the gate can compare against
+    // this cache instead of re-walking and re-hashing the whole graph on every
+    // decode step. Cleared with the record; re-cached by nkv_record_snapshot()
+    // and by the post-allocation record build. The graph pointer guards the
+    // workspace-address-reuse case: a rebuilt graph invalidates the record,
+    // and the snapshot that re-arms it also re-caches this key.
+    llama_topology_key       live_topology_key{};
+    const ggml_cgraph *      live_topology_gf = nullptr;
+
     // High-water mark of the n_outputs build envelope. The graph is built at
     // max(active n_outputs, this value), never at cparams.n_outputs_max up
     // front: the envelope only ever covers widths that were actually

@@ -261,6 +261,9 @@ public:
 
     ggml_tensor * tokens = nullptr; // I32 [n_env]
     const uint32_t n_env;
+    // reused by set_input: the envelope width is fixed, so a steady-state
+    // decode must not allocate this buffer again on every step
+    std::vector<int32_t> scratch;
 };
 
 class llm_graph_input_prefab_pos : public llm_graph_input_i {
@@ -271,6 +274,7 @@ public:
 
     ggml_tensor * pos = nullptr; // I32 [n_env]
     const uint32_t n_env;
+    std::vector<int32_t> scratch;
 };
 
 class llm_graph_input_prefab_out_ids : public llm_graph_input_i {
@@ -281,6 +285,7 @@ public:
 
     ggml_tensor * out_ids = nullptr; // I32 [n_env]: real outputs first, then padding
     const uint32_t n_env;
+    std::vector<int32_t> scratch;
 };
 
 class llm_graph_input_prefab_attn_kv : public llm_graph_input_attn_kv {

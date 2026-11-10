@@ -118,11 +118,11 @@ void llm_graph_input_prefab_tokens::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ubatch->token != nullptr);
     const uint32_t n = ubatch->n_tokens;
     GGML_ASSERT(n >= 1 && n <= n_env);
-    std::vector<int32_t> data(n_env);
+    scratch.resize(n_env);
     for (uint32_t i = 0; i < n_env; ++i) {
-        data[i] = ubatch->token[i < n ? i : n - 1];
+        scratch[i] = ubatch->token[i < n ? i : n - 1];
     }
-    ggml_backend_tensor_set(tokens, data.data(), 0, n_env*sizeof(int32_t));
+    ggml_backend_tensor_set(tokens, scratch.data(), 0, n_env*sizeof(int32_t));
 }
 
 bool llm_graph_input_prefab_tokens::can_reuse(const llm_graph_params & params) {
@@ -133,11 +133,11 @@ void llm_graph_input_prefab_pos::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ubatch->pos != nullptr);
     const uint32_t n = ubatch->n_tokens;
     GGML_ASSERT(n >= 1 && n <= n_env);
-    std::vector<int32_t> data(n_env);
+    scratch.resize(n_env);
     for (uint32_t i = 0; i < n_env; ++i) {
-        data[i] = ubatch->pos[i < n ? i : n - 1];
+        scratch[i] = ubatch->pos[i < n ? i : n - 1];
     }
-    ggml_backend_tensor_set(pos, data.data(), 0, n_env*sizeof(int32_t));
+    ggml_backend_tensor_set(pos, scratch.data(), 0, n_env*sizeof(int32_t));
 }
 
 bool llm_graph_input_prefab_pos::can_reuse(const llm_graph_params & params) {
@@ -147,19 +147,19 @@ bool llm_graph_input_prefab_pos::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_prefab_out_ids::set_input(const llama_ubatch * ubatch) {
     const uint32_t n = ubatch->n_tokens;
     GGML_ASSERT(n >= 1 && n <= n_env);
-    std::vector<int32_t> data;
-    data.reserve(n_env);
+    scratch.clear();
+    scratch.reserve(n_env);
     for (uint32_t i = 0; i < n; ++i) {
         if (ubatch->output == nullptr || ubatch->output[i]) {
-            data.push_back((int32_t) i);
+            scratch.push_back((int32_t) i);
         }
     }
     // pad rows: duplicate the last real output (or the last real row if there is no output)
-    const int32_t pad = data.empty() ? (int32_t) (n - 1) : data.back();
-    while (data.size() < n_env) {
-        data.push_back(pad);
+    const int32_t pad = scratch.empty() ? (int32_t) (n - 1) : scratch.back();
+    while (scratch.size() < n_env) {
+        scratch.push_back(pad);
     }
-    ggml_backend_tensor_set(out_ids, data.data(), 0, n_env*sizeof(int32_t));
+    ggml_backend_tensor_set(out_ids, scratch.data(), 0, n_env*sizeof(int32_t));
 }
 
 bool llm_graph_input_prefab_out_ids::can_reuse(const llm_graph_params & params) {
