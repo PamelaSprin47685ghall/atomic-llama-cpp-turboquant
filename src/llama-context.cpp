@@ -8599,10 +8599,11 @@ class llama_io_read_file : public llama_io_read_i {
 
 class llama_io_write_device : public llama_io_write_i {
   public:
-    llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) :
+    llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs, llama_context * ctx) :
         ptr(p),
         buf_size(len),
-        mbufs(mbufs) {}
+        mbufs(mbufs),
+        ctx(ctx) {}
 
     ~llama_io_write_device() override = default;
 
@@ -8696,6 +8697,7 @@ class llama_io_write_device : public llama_io_write_i {
         // uses the generic host-staging tensor copy with the same ON_DEVICE
         // snapshot. A throw after a copy starts is partial/unknown in the new
         // staging; the old snapshot is not touched.
+        copy_began = true;
         for (const auto & [buft, mbuf] : mbufs) {
             if (!ggml_backend_buffer_is_meta(mbuf.buf.get())) {
                 continue;
@@ -8740,6 +8742,11 @@ class llama_io_write_device : public llama_io_write_i {
                 }
             }
         }
+        // A buffer cpy_tensor true only proves that the backend accepted the
+        // copy; it is not a device-completion receipt. Synchronize the
+        // scheduler backends before the caller swaps in this staging and
+        // releases the previous snapshot.
+        ctx->synchronize();
         return true;
     }
 
@@ -8777,7 +8784,14 @@ class llama_io_write_device : public llama_io_write_i {
     llama_memory_buffers & mbufs;
     // non-row-aligned ranges, grouped by buffer type in winfos order
     std::map<ggml_backend_buffer_type_t, std::vector<const write_info *>> host_ranges;
+    llama_context * ctx;
     bool finalized = false;
+    bool copy_began = false;
+
+  public:
+    // A throw after this point may have submitted a partial device copy. The
+    // caller must retain this staging owner instead of releasing it.
+    bool copy_started() const { return copy_began; }
 };
 
 class llama_io_read_device : public llama_io_read_i {
@@ -8856,6 +8870,10 @@ class llama_io_read_device : public llama_io_read_i {
                 }
             }
         }
+        // A true buffer cpy_tensor only means the backend accepted the copy.
+        // Prove device completion before the restore returns and the caller
+        // reads the restored sequence.
+        ctx->synchronize();
         return true;
     }
 
@@ -8882,10 +8900,6 @@ class llama_io_read_device : public llama_io_read_i {
             throw std::runtime_error("device state tensor range is not type-aligned");
         }
         const int64_t n = (int64_t) (size / type_size) * ggml_blck_size(tensor->type);
-        if (ggml_backend_buffer_is_meta(tensor->buffer)) {
-            has_meta = true;
-        }
-
         auto * buft = ggml_backend_buffer_get_type(tensor->buffer);
         const auto it = mbufs.find(buft);
         if (it == mbufs.end() || !it->second.buf) {
@@ -8919,9 +8933,16 @@ class llama_io_read_device : public llama_io_read_i {
         const bool row_aligned = row > 0 &&
             offset % row == 0 && size % row == 0;
         if (!row_aligned) {
-            std::vector<char> host(size);
-            ggml_backend_tensor_get(cpy, host.data(), 0, size);
-            ggml_backend_tensor_set(tensor, host.data(), offset, size);
+            try {
+                std::vector<char> host(size);
+                ggml_backend_tensor_get(cpy, host.data(), 0, size);
+                ggml_backend_tensor_set(tensor, host.data(), offset, size);
+            } catch (...) {
+                // The host staging may have written part of the target.
+                unproven = true;
+                retire_copy_contexts();
+                throw std::runtime_error("device state copy unproven");
+            }
             ++copy.next;
             return;
         }
@@ -8958,7 +8979,7 @@ class llama_io_read_device : public llama_io_read_i {
     }
 
     size_t n_bytes() override { return size_read; }
-    bool has_meta_buffer() const { return has_meta; }
+    bool is_unproven() const { return unproven; }
 
   private:
     void retire_copy_contexts() {
@@ -8979,7 +9000,6 @@ class llama_io_read_device : public llama_io_read_i {
     llama_context * ctx;
     bool finalized = false;
     bool unproven = false;
-    bool has_meta = false;
 };
 
 bool llama_context::state_copy_blocked(const char * func) {
@@ -9136,8 +9156,8 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     }
 
     std::unique_ptr<llama_io_write_i> io;
+    llama_memory_buffers new_storage;
     try {
-        llama_memory_buffers new_storage;
         std::uint64_t generation = 0;
 
         if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
@@ -9149,7 +9169,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
                 throw std::runtime_error("device state generation exhausted");
             }
             generation = current_generation + 1;
-            io = std::make_unique<llama_io_write_device>(dst, size, new_storage);
+            io = std::make_unique<llama_io_write_device>(dst, size, new_storage, this);
             state_seq_write_device_header(*io, seq_id, state_seq_device_id, generation);
         } else {
             io = std::make_unique<llama_io_write_host>(dst, size);
@@ -9159,10 +9179,14 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         const size_t written = state_seq_write_data(*io, seq_id, flags);
 
         // The device writer returns false only for an impossible Meta preflight.
-        // The new staging is discarded and the old snapshot remains valid; a
-        // copy that started and threw is also confined to the new staging. No
-        // format is switched and no unproven state is set.
+        // The new staging is discarded and the old snapshot remains valid.
         if (!io->finalize()) {
+            auto * reader = dynamic_cast<llama_io_read_device *>(io.get());
+            if (reader != nullptr && reader->is_unproven()) {
+                // A copy was submitted and its completion is unknown. Keep
+                // the destination cells and the snapshot owner alive.
+                mark_state_copy_unproven();
+            }
             LLAMA_LOG_ERROR("%s: device state copy unsupported\n", __func__);
             return 0;
         }
@@ -9174,6 +9198,14 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 
         return written;
     } catch (const std::exception & err) {
+        auto * writer = dynamic_cast<llama_io_write_device *>(io.get());
+        if (writer != nullptr && writer->copy_started()) {
+            // A copy was submitted before the failure. Its completion is
+            // unknown, so keep the new staging alive and make the context
+            // fail-stop instead of freeing memory a device may still write.
+            retire_state_snapshot(std::move(new_storage));
+            mark_state_copy_unproven();
+        }
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
     }
@@ -9267,9 +9299,9 @@ size_t llama_context::state_seq_set_data_impl(llama_seq_id          seq_id,
         return read;
     } catch (const std::exception & err) {
         auto * reader = dynamic_cast<llama_io_read_device *>(io.get());
-        if (restore_started && reader != nullptr && reader->has_meta_buffer()) {
-            // A Meta copy started and threw: partial/unknown. No fallback is
-            // attempted and unproven is not cleared.
+        if (restore_started && reader != nullptr && reader->is_unproven()) {
+            // A device copy started and threw: partial/unknown. No fallback
+            // is attempted and the destination is retained.
             mark_state_copy_unproven();
             LLAMA_LOG_ERROR("%s: error loading device state: %s\n", __func__, err.what());
             return 0;
