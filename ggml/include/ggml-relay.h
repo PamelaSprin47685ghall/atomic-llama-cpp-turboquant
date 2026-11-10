@@ -108,8 +108,9 @@ struct ggml_relay_event_v2 {
 // claim with a no-op CAS. The claim orders abort against host success
 // publication; general fail() is provider-mutex ordered.
 // error_code is the value passed to abort() when a host abort claimed the
-// failure; otherwise it is a POSIX errno from the provider. Callers must not
-// interpret one space as the other.
+// failure; otherwise it is the provider's native code (a POSIX errno for
+// host-side failures, or a HIP error value for device failures). Callers must
+// not assume one namespace.
 struct ggml_relay_status {
     uint32_t abi_version;
     uint32_t ranks;
