@@ -220,19 +220,25 @@ enum ggml_relay_token_result {
 // CPU-side facts for the current provider epoch: the single work borrow, the
 // output-release drain, and the provider completion tokens. Returns 1 on
 // success, 0 when the provider mutex is temporarily contended, and -1 when the
-// backend is not a relay or the provider predates this query (ABI < 5).
-// This does not extend ggml_relay_status. borrowed_channel is UINT32_MAX when
-// no work view is outstanding. A borrow survives abort: the CPU reader may
-// still own the mapped payload. Publish the saved INPUT_READY view to return
-// it, or retain the owner. The provider never revokes a borrow on its own.
-// tokens_outstanding counts every token record that release_token has not
-// retired, including settled records; active_token is the current record or 0.
+// backend is not a relay or the private provider ABI is older than 5. ABI 4 is
+// rejected during capability discovery, so -1 never means an ambiguous ABI 4.
+// This does not extend ggml_relay_status. A borrow survives abort: the CPU
+// reader may still own the mapped payload. Publish the saved INPUT_READY view
+// to return it, or retain the owner. The provider never revokes a borrow on
+// its own.
 struct ggml_relay_cpu_status {
+    // Provider epoch at the query. 0 means no epoch has begun.
     uint64_t epoch;
+    // Prepared channel count for that epoch.
     uint64_t channels;
+    // OUTPUT_RELEASED events consumed in that epoch. begin resets it to 0;
+    // prepare sets it to channels while the provider is idle.
     uint64_t outputs_released;
+    // Current completion token, or 0 when none is active.
     uint64_t active_token;
+    // Token records not yet retired by release_token, including settled ones.
     uint64_t tokens_outstanding;
+    // Outstanding work-view channel, or UINT32_MAX when none.
     uint32_t borrowed_channel;
 };
 GGML_API int ggml_backend_relay_cpu_snapshot(

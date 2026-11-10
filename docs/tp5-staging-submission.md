@@ -238,9 +238,11 @@ and whose child bytes are unchanged by a second copy.
   covered by that abort. On a clean state the destructor frees the scheduler
   **before** the backend members are destroyed, matching the actual reverse
   member order.
-  The relay snapshot and the unified CPU query are retried for up to 100 ms
-  each because their try-locks can lose to an ordinary courier publish. The
-  CPU query is tri-state: 1 filled, 0 contended, -1 unsupported (ABI < 5). A
+  The relay snapshot is retried for up to 100 ms because its try-lock can
+  lose to an ordinary courier publish. The CPU query runs only after a
+  successful snapshot and is retried for another 100 ms; both loops yield.
+  The CPU query is tri-state: 1 filled, 0 contended, -1 unsupported (private
+  provider ABI < 5). A
   snapshot that still fails, an unfinished epoch, a live CPU borrow
   (`borrowed_channel != UINT32_MAX`), unreleased completion tokens
   (`active_token != 0` or `tokens_outstanding != 0`), unreleased outputs for a
@@ -250,7 +252,10 @@ and whose child bytes are unchanged by a second copy.
   contention. Abort does not revoke a borrow, so only publishing the saved
   `INPUT_READY` view returns it. The provider never releases a borrow that a
   CPU reader may still own. Every completion token must be released before the
-  next prepare/submit: the token record owns the lane tail events.
+  next prepare/submit: the token record owns the lane tail events. `prepare`
+  sets `outputs_released` to the new channel count while the provider is idle,
+  so the prepare window is a settled state, not an old count against new
+  channels.
 - **Model**: `llama_model` carries a live-context reference count and a
   retained-context count. The live count and the free request are read and
   changed under a lifetime mutex; the retained count is atomic and is
@@ -449,13 +454,20 @@ g++ -std=c++17 -O2 -pthread -I ggml/include -I ggml/src \
 ```
 
 The relay ABI 5 borrow/token contract has one opt-in integration test:
-`test-hip-relay-rebinding`, gated by `TQ_BUILD_HIP_RELAY_PROVIDER_TEST=ON`,
-requiring five real HIP devices and registered `RUN_SERIAL`. It covers the
+`test-hip-relay-rebinding`, gated by `TQ_BUILD_HIP_RELAY_PROVIDER_TEST=ON`
+with `TQ_A_SOURCE_DIR` pointing at the matching source tree, requiring five
+real HIP devices and registered `RUN_SERIAL`. It covers the
 idle abort, the abort-after-borrow path, mismatched publish retention, destroy
 refusal, matching publish return, the ABI 5 capability table, and the aborted
-completion token's wait/release path. It is not
-part of the default CPU CTest run; a CPU-only fake provider would be needed to
-exercise the ABI 2/3 fallback and the pending-abort window.
+completion token's wait/release path, a successful token epoch, and the
+prepare/submit/destroy guards for an unreleased token. It is not part of the
+default CPU CTest run. `llama_free`'s relay retain decision is not covered by
+this test because it does not create a llama_context; a CPU-only fake provider
+would be needed to exercise that, the ABI 2/3 fallback, and the pending-abort
+window. The CPU-only `test-tp5-relay-free-decision` covers the pure retain
+decision itself: epoch 0 and the prepare window, borrow, tokens, releases, the
+failed-provider exemption, contention, unsupported ABI fallback, and
+epoch/channel mismatches.
 
 The scheduler test covers: success, rejected, fatal (no replay), a pending
 state without a local failure, and pending published by an accepted copy with

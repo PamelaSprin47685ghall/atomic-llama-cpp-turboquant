@@ -191,7 +191,7 @@ struct fixture {
         require(api->prepare(provider, terminals.data(), 1), "preparing terminal binding failed");
     }
 
-    void run_epoch(size_t epoch, bool select_b, clock_type::time_point deadline) {
+    void run_epoch(size_t epoch, bool select_b, clock_type::time_point deadline, bool use_token = false) {
         std::cerr << "phase epoch " << epoch + 1 << " inputs\n";
         std::array<float, width> values{};
         std::array<float, width> expected{};
@@ -203,7 +203,14 @@ struct fixture {
             ggml_backend_tensor_set(rank[r].input, values.data(), 0, sizeof(values));
         }
         std::cerr << "phase epoch " << epoch + 1 << " submit\n";
-        require(api->submit(provider, graphs.data(), 2), "submitting a complete epoch failed");
+        uint64_t token = 0;
+        if (use_token) {
+            require(api->submit_token(provider, graphs.data(), 2, &token) && token != 0,
+                    "submitting a complete token epoch failed");
+            pending_token = token;
+        } else {
+            require(api->submit(provider, graphs.data(), 2), "submitting a complete epoch failed");
+        }
         std::cerr << "phase epoch " << epoch + 1 << " service\n";
         bool published = false;
         bool released = false;
@@ -270,6 +277,26 @@ struct fixture {
                 final_status.attempted_mask == all_ranks && final_status.accepted_mask == all_ranks &&
                 final_status.completed_mask == all_ranks && final_status.unknown_mask == 0 &&
                 final_status.cpu_reductions == epoch + 1, "incomplete native/CPU completion proof");
+
+        if (use_token) {
+            int token_error = -1;
+            require(api->wait_token(provider, token, &token_error) == GGML_RELAY_TOKEN_SUCCESS &&
+                    token_error == 0, "token epoch did not report success");
+            // The token is settled but unreleased: prepare, submit and destroy
+            // must all refuse without changing the provider state.
+            std::array<ggml_tensor *, ranks> terminals{};
+            for (size_t r = 0; r < ranks; ++r) {
+                terminals[r] = select_b ? rank[r].b : rank[r].a;
+            }
+            require(!api->prepare(provider, terminals.data(), 1),
+                    "prepare accepted an unreleased token");
+            uint64_t again = 0;
+            require(!api->submit_token(provider, graphs.data(), 2, &again) && again == 0,
+                    "submit accepted an unreleased token");
+            require(!api->destroy(provider), "destroy accepted an unreleased token");
+            api->release_token(provider, token);
+            pending_token = 0;
+        }
 
         // Native completion and the CPU borrow return were proved before reads.
         std::cerr << "phase epoch " << epoch + 1 << " readback\n";
@@ -491,13 +518,14 @@ int main(int argc, char ** argv) {
                 test.run_epoch(epoch++, select_b, deadline);
             }
         }
+        test.run_epoch(epoch++, false, deadline, true);
         test.close();
         // A fresh provider owns a fresh claim word. The first provider proved
         // idle-abort visibility; this one proves the abort/borrow contract.
         test.open();
         test.abort_with_borrow(deadline);
         test.free_consumers();
-        std::cout << "{\"status\":\"PASS\",\"ranks\":5,\"channels\":1,\"epochs\":9,"
+        std::cout << "{\"status\":\"PASS\",\"ranks\":5,\"channels\":1,\"epochs\":10,\"token_epochs\":1,"
                      "\"binding_order\":\"A-B-A\",\"epochs_per_binding\":3,\"elements\":257,"
                      "\"input_bitwise_checks\":" << test.input_checks <<
                      ",\"selected_terminal_bitwise_checks\":" << test.selected_checks <<

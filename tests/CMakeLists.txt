@@ -629,6 +629,19 @@ add_test(NAME test-relay-verify-counters COMMAND test-relay-verify-counters)
 set_property(TEST test-relay-verify-counters PROPERTY LABELS "cpu;tp5")
 set_property(TEST test-relay-verify-counters PROPERTY PASS_REGULAR_EXPRESSION "RELAY_VERIFY_COUNTERS_TEST PASS")
 
+# TP5 llama_free relay retain policy. Header-only, no llama/ggml library and
+# no device: epoch 0 and the prepare window, borrow, completion tokens, output
+# releases, failed-provider exemption, contention, unsupported ABI fallback and
+# epoch/channel mismatches.
+add_executable(test-tp5-relay-free-decision test-tp5-relay-free-decision.cpp)
+target_compile_features(test-tp5-relay-free-decision PRIVATE cxx_std_17)
+target_include_directories(test-tp5-relay-free-decision PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include)
+add_test(NAME test-tp5-relay-free-decision COMMAND test-tp5-relay-free-decision)
+set_property(TEST test-tp5-relay-free-decision PROPERTY LABELS "cpu;tp5")
+set_property(TEST test-tp5-relay-free-decision PROPERTY PASS_REGULAR_EXPRESSION "RELAY_FREE_DECISION_TEST PASS")
+
 # TP5 llama-side per-shape plan cache policy. Header-only, no model/backend:
 # same-shape hit, alloc_gen isolation, flush, LRU eviction, rekey and the
 # dual-window independence of two cache instances.

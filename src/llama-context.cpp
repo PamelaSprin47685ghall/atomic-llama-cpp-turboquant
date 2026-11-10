@@ -15,6 +15,7 @@
 #include "llama-nout-state.h"
 #include "llama-prefab-env.h"
 #include "llama-prefab-iface.h"
+#include "llama-relay-free.h"
 #include "llama-io.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsv4.h"
@@ -43,6 +44,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 static thread_local bool g_state_copy_unproven = false;
@@ -10096,6 +10098,9 @@ void llama_free(llama_context * ctx) {
         const int64_t snapshot_deadline_us = ggml_time_us() + 100000;
         do {
             have_snapshot = ggml_backend_relay_snapshot(backend, &status);
+            if (!have_snapshot) {
+                std::this_thread::yield();
+            }
         } while (!have_snapshot && ggml_time_us() < snapshot_deadline_us);
         if (have_snapshot && status.failed) {
             LLAMA_LOG_ERROR("%s: relay failed before free: code=%d detail=%s\n",
@@ -10113,39 +10118,20 @@ void llama_free(llama_context * ctx) {
                 if (cpu_result != 0) {
                     break;
                 }
+                std::this_thread::yield();
             } while (ggml_time_us() < cpu_deadline_us);
         }
-        bool borrow_outstanding = false;
-        bool tokens_outstanding = false;
-        bool releases_outstanding = false;
-        bool cpu_unproven = false;
-        if (cpu_result == 1) {
-            if (have_snapshot && cpu.epoch == status.epoch && cpu.channels == status.channels) {
-                borrow_outstanding  = cpu.borrowed_channel != UINT32_MAX;
-                tokens_outstanding  = cpu.active_token != 0 || cpu.tokens_outstanding != 0;
-                // A failed provider's destroy does not require output release.
-                releases_outstanding = !status.failed && cpu.outputs_released != cpu.channels;
-            } else {
-                // The provider moved between the two queries, or a prepare
-                // changed the channel count. Do not compare stale facts.
-                cpu_unproven = true;
-            }
-        } else if (cpu_result == 0) {
-            // The provider mutex stayed contended for the whole window; the
-            // CPU facts are unproven, so retain instead of failing open.
-            cpu_unproven = true;
-        }
-        if (!have_snapshot || (status.epoch != 0 && !status.finished) ||
-            borrow_outstanding || tokens_outstanding || releases_outstanding || cpu_unproven) {
-            if (borrow_outstanding) {
-                retain_reason = "a relay CPU borrow is still outstanding";
-            } else if (tokens_outstanding) {
-                retain_reason = "relay completion tokens are still outstanding";
-            } else if (releases_outstanding) {
-                retain_reason = "relay output releases are still outstanding";
-            } else if (cpu_unproven) {
-                retain_reason = "relay CPU state could not be proven";
-            }
+        llama_relay_free_facts facts;
+        facts.have_snapshot   = have_snapshot;
+        facts.status_failed   = status.failed;
+        facts.status_finished = status.finished;
+        facts.status_epoch    = status.epoch;
+        facts.status_channels = status.channels;
+        facts.cpu_result      = cpu_result;
+        facts.cpu             = cpu;
+        const llama_relay_free_decision decision = llama_relay_free_decide(facts);
+        if (decision.retain) {
+            retain_reason = decision.reason;
             ggml_backend_relay_abort(backend, GGML_STATUS_ABORTED);
             // Scheduler buffers and memory are also native readers' owners.
             // Do not enter an unbounded synchronize or release them on failure.

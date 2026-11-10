@@ -54,6 +54,8 @@ constexpr uint64_t wait_seconds = 600;
 // provider, not a monotonically increasing creation ordinal. Retained unsafe
 // owners keep their lease because only provider deletion releases it.
 std::atomic<uint32_t> priority_pair_slots{ 0 };
+static_assert(GGML_RELAY_TOKEN_SUCCESS == 0 && GGML_RELAY_TOKEN_FAILED == 1 && GGML_RELAY_TOKEN_UNKNOWN == 2,
+              "relay token results must match the generic completion result values");
 static_assert(std::atomic<uint32_t>::is_always_lock_free, "relay priority leases require a lock-free host atomic");
 static_assert(std::atomic<size_t>::is_always_lock_free, "relay retirement queue requires a lock-free host atomic");
 
@@ -594,8 +596,18 @@ void fail(provider & p, int code, const char * message) {
 void fail_local(provider & p, int code, const char * message) {
     p.event_status.store(-1, std::memory_order_release);
     if (!p.status.failed) {
-        record_failure(p, code, message);
-        p.abort_attributed = false;
+        const bool claimed = (read_abort_claim(p) & abort_claim_bit) != 0;
+        const int32_t pending = claimed ? p.pending_abort.load(std::memory_order_acquire)
+                                        : read_pending_abort(p);
+        if (claimed || pending) {
+            // The host abort owns the first-failure slot even when a local
+            // ordering error raced into this window.
+            fail_abort(p, pending);
+            GGML_LOG_ERROR("HIP relay secondary failure: %s\n", message);
+        } else {
+            record_failure(p, code, message);
+            p.abort_attributed = false;
+        }
     } else {
         GGML_LOG_ERROR("HIP relay secondary failure: %s\n", message);
     }
@@ -1611,6 +1623,10 @@ bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, 
     if (!idle(p)) {
         return false; // Busy is transient; the caller may retry after draining.
     }
+    if (!p.token_tails.empty()) {
+        reject_local("relay prepare requires every completion token released");
+        return false;
+    }
     if (!terminals || count == 0 || count > channel_capacity) {
         fail_local(p, ENOTSUP, "relay plan exceeds reserved 256-channel channel capacity or is empty");
         return false;
@@ -1761,6 +1777,10 @@ bool begin(provider & p) {
     }
     if (p.status.epoch == UINT64_MAX) {
         fail(p, EOVERFLOW, "relay epoch overflow");
+        return false;
+    }
+    if (want_token && p.next_token == UINT64_MAX) {
+        fail(p, EOVERFLOW, "relay completion token counter exhausted");
         return false;
     }
     if (p.plan_cache_enabled && p.plan_cache_generation && p.status.plan_generation != 0) {
@@ -2003,7 +2023,7 @@ bool finish(provider & p) {
     }
     if (p.mode != submission::direct && !p.status.failed) {
         for (uint32_t r = 0; r < ranks; ++r) {
-            if (abort_visible(p) || p.status.failed || !select(p, r)) {
+            if (abort_requested(p) || p.status.failed || !select(p, r)) {
                 break;
             }
             const uint32_t bit = 1u << r;
@@ -2400,12 +2420,7 @@ bool submit_token(void * opaque, ggml_cgraph * const * graphs, size_t stages, ui
     }
     *token = 0;
     auto & p = *static_cast<provider *>(opaque);
-    uint64_t created = 0;
-    const bool ok = submit_internal(opaque, graphs, stages, true, &created);
-    std::lock_guard<std::mutex> lock(p.mutex);
-    if (!ok) {
-        // begin() may have created a record before a later stage failed. Erase
-        // only that record; a previous epoch's unreleased token must stay.
+    auto cleanup = [&p](uint64_t created) {
         if (created != 0) {
             p.token_state.erase(created);
             p.token_tails.erase(created);
@@ -2413,6 +2428,23 @@ bool submit_token(void * opaque, ggml_cgraph * const * graphs, size_t stages, ui
                 p.active_token = 0;
             }
         }
+    };
+    uint64_t created = 0;
+    bool ok = false;
+    try {
+        ok = submit_internal(opaque, graphs, stages, true, &created);
+    } catch (...) {
+        // The provider mutex is released by unwinding. Erase only the record
+        // this call created; a previous epoch's token must stay.
+        std::lock_guard<std::mutex> lock(p.mutex);
+        cleanup(created);
+        throw;
+    }
+    std::lock_guard<std::mutex> lock(p.mutex);
+    if (!ok) {
+        // begin() may have created a record before a later stage failed. Erase
+        // only that record; a previous epoch's unreleased token must stay.
+        cleanup(created);
         return false;
     }
     *token = created;
