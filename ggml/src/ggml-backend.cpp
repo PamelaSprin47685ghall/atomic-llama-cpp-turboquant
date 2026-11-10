@@ -685,6 +685,21 @@ static const ggml_backend_completion_api * ggml_backend_sched_completion_api(
     return api;
 }
 
+// A full lifetime view is either an explicit pending_full proc or the
+// versioned completion API. The latter names the exact attempts
+// (begin/end/wait/drain/release), so a backend that publishes it can be
+// drained without a separate pending_full proc.
+static bool ggml_backend_sched_has_full_pending_view(ggml_backend_t backend) {
+    if (backend == nullptr || backend->device == nullptr || backend->device->reg == nullptr) {
+        return false;
+    }
+    if (ggml_backend_reg_get_proc_address(
+            backend->device->reg, "ggml_backend_submission_pending_full") != nullptr) {
+        return true;
+    }
+    return ggml_backend_sched_completion_api(backend) != nullptr;
+}
+
 void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
