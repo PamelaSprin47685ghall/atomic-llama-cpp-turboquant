@@ -10671,7 +10671,13 @@ void llama_context::prefab_init() {
         throw std::runtime_error("factor-prefab: refusing context (fail closed): " + why);
     }
 
-    // envelope widths: LLAMA_PREFAB_ENVELOPES="1,4,512" (default 1,4,n_ubatch); n_ubatch is always the top envelope
+    // envelope widths: LLAMA_PREFAB_ENVELOPES="1,2,3,4,512" (default
+    // 1,2,3,4,n_ubatch); n_ubatch is always the top envelope. The MTP verify
+    // batch is 1 accepted token + up to mtp_depth draft tokens (default depth
+    // 1 => 2 rows), so 2 and 3 must be real envelope widths: the A+B exact-fit
+    // lane requires e == n_tokens and would otherwise decline every 2/3-row
+    // verify to the stock builder, while the smallest-fit lane would pad 2-row
+    // verify to 4 and compute two dead rows in every linear/MoE/attention op.
     std::vector<uint32_t> env;
     if (const char * s = getenv("LLAMA_PREFAB_ENVELOPES")) {
         std::string str(s);
@@ -10688,7 +10694,7 @@ void llama_context::prefab_init() {
             p = q + 1;
         }
     } else {
-        env = { 1, 4 };
+        env = { 1, 2, 3, 4 };
     }
     const uint32_t n_max = std::min(cparams.n_ctx, cparams.n_ubatch);
     env.push_back(n_max);

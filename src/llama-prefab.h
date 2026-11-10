@@ -1,7 +1,8 @@
 #pragma once
 
 // factor-prefab: compose decoder graphs from independently compiled, cached factor modules
-// into fixed-width microbatch envelopes (default N = 1 / 4 / n_ubatch).
+// into fixed-width microbatch envelopes (default N = 1 / 2 / 3 / 4 / n_ubatch;
+// 2 and 3 are the steady-state MTP verify widths: 1 accepted + 1..2 draft rows).
 //
 // Default OFF. Enabled only with LLAMA_PREFAB_ENABLE=1 *and* LLAMA_PREFAB_EXPERIMENTAL=1.
 //
