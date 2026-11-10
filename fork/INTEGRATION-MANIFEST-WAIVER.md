@@ -1171,6 +1171,18 @@ proven: the failure first appears at baseline state get, but this record does
 not assert fixture mismatch or a code regression. This failed run is not
 evidence of success.
 
+Follow-up correction (test-only): state buffers are now sized by
+`llama_state_seq_get_size`. qwen4exp's attention cache refuses `seq_add`
+("cannot shift its K/V"), so the mock failure would hit the main decode graph,
+not the K-shift update. The test now detects that no position changed and
+SKIPs the K-shift failure/empty-stream subcase. The qwen4exp run is
+`SKIP: cache cannot shift; K-shift failure path not applicable`,
+`KV_UPDATE_STATUS_TEST PASS checks=13`, exit 0. Root cause of the original
+empty-stream failures is therefore that no K-shift update occurred and the
+state guards were not reached; this does not prove a state-guard bug. The
+20-check llama-dense CPU result is from the earlier run and was not rerun
+after this test-only adjustment.
+
 Manifest: no digest was re-signed. `src/llama-context.cpp/.h`,
 `src/llama-memory-recurrent.h` and `patches/ws5/README.md` remain red/unsigned.
 
