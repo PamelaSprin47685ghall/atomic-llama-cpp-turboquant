@@ -11,9 +11,11 @@
 
 #include "llama.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 struct llama_ubatch_data {
@@ -114,8 +116,31 @@ private:
     struct slot_t {
         llama_ubatch_data data;
         uint32_t gen = 0;
-        uint32_t refs = 0;
+        // Copies retain a slot the handle already owns, so the increment must
+        // not take the pool mutex. The generation and in_use fields stay
+        // under the mutex: a live handle pins them.
+        std::atomic<uint32_t> refs{0};
         bool in_use = false;
+
+        slot_t() = default;
+        slot_t(const slot_t &) = delete;
+        slot_t & operator=(const slot_t &) = delete;
+
+        // configure() grows slots_ only when no handle is live, so every refs
+        // value moved here is zero. The move still carries it so the type
+        // stays usable by std::vector.
+        slot_t(slot_t && other) noexcept
+            : data(std::move(other.data)),
+              gen(other.gen),
+              refs(other.refs.load(std::memory_order_relaxed)),
+              in_use(other.in_use) {}
+        slot_t & operator=(slot_t && other) noexcept {
+            data = std::move(other.data);
+            gen = other.gen;
+            refs.store(other.refs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            in_use = other.in_use;
+            return *this;
+        }
     };
 
     void retain(uint32_t slot);
@@ -124,6 +149,9 @@ private:
 
     mutable std::mutex mutex_;
     std::vector<slot_t> slots_;
+    // Published after slots_.resize(); configure() and the read-only
+    // accessors take the fast path without the mutex.
+    std::atomic<uint32_t> capacity_{0};
     uint32_t in_use_ = 0;
     stats_t stats_;
 };

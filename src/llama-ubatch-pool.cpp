@@ -31,18 +31,15 @@ ubatch_data_handle & ubatch_data_handle::operator=(const ubatch_data_handle & ot
 }
 
 ubatch_data_handle::ubatch_data_handle(ubatch_data_handle && other) noexcept
-    : pool_(other.pool_), slot_(other.slot_), gen_(other.gen_), fallback_(std::move(other.fallback_)) {
-    other.pool_ = nullptr;
-}
+    : pool_(std::move(other.pool_)), slot_(other.slot_), gen_(other.gen_), fallback_(std::move(other.fallback_)) {}
 
 ubatch_data_handle & ubatch_data_handle::operator=(ubatch_data_handle && other) noexcept {
     if (this != &other) {
         reset();
-        pool_     = other.pool_;
+        pool_     = std::move(other.pool_);
         slot_     = other.slot_;
         gen_      = other.gen_;
         fallback_ = std::move(other.fallback_);
-        other.pool_ = nullptr;
     }
 
     return *this;
@@ -70,13 +67,22 @@ void ubatch_data_handle::reset() {
 }
 
 bool ubatch_data_pool::configure(uint32_t capacity) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     if (capacity == 0) {
         return false;
     }
 
+    // A previous grow already provides this capacity. The release store after
+    // slots_.resize() pairs with this acquire load; slots_ itself is only read
+    // under the mutex by the callers that use it. This keeps the per-split
+    // configure call out of the pool mutex in the steady state.
+    if (capacity <= capacity_.load(std::memory_order_acquire)) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
     if (capacity <= slots_.size()) {
+        capacity_.store(static_cast<uint32_t>(slots_.size()), std::memory_order_release);
         return true;
     }
 
@@ -87,20 +93,17 @@ bool ubatch_data_pool::configure(uint32_t capacity) {
     }
 
     slots_.resize(capacity);
+    capacity_.store(capacity, std::memory_order_release);
 
     return true;
 }
 
 bool ubatch_data_pool::configured() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    return !slots_.empty();
+    return capacity_.load(std::memory_order_acquire) != 0;
 }
 
 uint32_t ubatch_data_pool::capacity() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    return static_cast<uint32_t>(slots_.size());
+    return capacity_.load(std::memory_order_acquire);
 }
 
 ubatch_data_handle ubatch_data_pool::acquire() {
@@ -114,7 +117,7 @@ ubatch_data_handle ubatch_data_pool::acquire() {
         }
 
         slot.in_use = true;
-        slot.refs   = 1;
+        slot.refs.store(1, std::memory_order_relaxed);
         ++slot.gen;
         ++in_use_;
         ++stats_.acquired;
@@ -128,12 +131,14 @@ ubatch_data_handle ubatch_data_pool::acquire() {
 }
 
 void ubatch_data_pool::retain(uint32_t slot) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
+    // A handle copy already owns a reference. While that reference exists the
+    // slot stays in_use, its generation is stable, and configure() cannot
+    // resize slots_ (in_use_ != 0). Only the atomic refcount changes, so the
+    // increment does not need the pool lock.
     assert(slot < slots_.size());
     assert(slots_[slot].in_use);
 
-    ++slots_[slot].refs;
+    slots_[slot].refs.fetch_add(1, std::memory_order_relaxed);
 }
 
 void ubatch_data_pool::note_fallback() {
@@ -157,9 +162,9 @@ void ubatch_data_pool::release(uint32_t slot, uint32_t gen) {
         return;
     }
 
-    assert(entry.refs > 0);
+    assert(entry.refs.load(std::memory_order_relaxed) > 0);
 
-    if (--entry.refs == 0) {
+    if (entry.refs.fetch_sub(1, std::memory_order_relaxed) == 1) {
         entry.in_use = false;
         assert(in_use_ > 0);
         --in_use_;
