@@ -1453,6 +1453,10 @@ bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, 
         }
         p.status.channels = count;
     }
+    // prepare leaves every channel released. Keep the CPU drain count in step
+    // with the new plan so a snapshot or free in the prepare window sees a
+    // settled provider, not an old count against new channels.
+    p.outputs_released = p.status.channels;
     p.status.plan_generation = generation;
     if (p.status.epoch != 0 && (p.status.epoch % 64) == 0) {
         log_plan_stats(p, "prepare");
