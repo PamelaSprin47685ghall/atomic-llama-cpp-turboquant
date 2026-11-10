@@ -350,3 +350,35 @@ the generation-phase reservation to the true max speculative width, not
 just relaxing that guard. Not attempted - left as a known, quantified,
 low-priority inefficiency rather than risk the arena-repartitioning logic
 while the feature is stable.
+
+## Cell journal borrow ownership
+
+`llama_kv_cells` carries a non-owning `cell_journal *` while a prepare trial
+is active. The borrow belongs to the object that is the live writer of its
+stream, not to the data being copied. The special members are:
+
+- copy construction copies the data and starts unbound: a snapshot never
+  inherits the source's journal;
+- copy assignment copies the data into an unbound destination and leaves it
+  unbound. Copy-and-swap gives the strong exception guarantee, so a failed
+  copy leaves the destination unchanged;
+- move construction transfers the borrow and clears the source;
+- move assignment moves the data into an unbound destination, transfers the
+  source's borrow (the move-construction rule) and clears the source.
+
+Both assignment operators require an unbound destination. A bound object is
+the live writer of its stream and is only mutated in place: the per-cell
+journal cannot represent a wholesale replacement (including a size change),
+so overwriting it would leave a trial that cannot be replayed. `GGML_ASSERT`
+is active in every build, so a bound destination fails loudly instead of
+silently dropping its journal. No production path assigns a bound
+`llama_kv_cells`; the live `v_cells[s]` is mutated in place, and the prepare
+snapshots are unbound copies. Vector growth and snapshot reuse only assign
+unbound elements, so the constraint does not affect the normal container
+path.
+
+`tests/test-kv-cells-journal-ownership.cpp` checks this behaviourally:
+copy/move construction ownership, copy/move assignment into an unbound
+destination with the real `restore_from_journal` state, the strong exception
+guarantee under an injected allocation failure, and (on POSIX) that assigning
+over a bound destination aborts.

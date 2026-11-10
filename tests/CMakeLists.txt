@@ -639,6 +639,21 @@ add_test(NAME test-shape-cache COMMAND test-shape-cache)
 set_property(TEST test-shape-cache PROPERTY LABELS "cpu;tp5")
 set_property(TEST test-shape-cache PROPERTY PASS_REGULAR_EXPRESSION "SHAPE_CACHE_TEST PASS")
 
+# llama_kv_cells journal borrow ownership. Header-only, no model/backend:
+# a snapshot copy must not keep the source's cell_journal pointer, and a
+# moved-from object must not record into the journal it no longer owns.
+add_executable(test-kv-cells-journal-ownership test-kv-cells-journal-ownership.cpp)
+target_compile_features(test-kv-cells-journal-ownership PRIVATE cxx_std_17)
+target_include_directories(test-kv-cells-journal-ownership PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include)
+# ggml supplies ggml_abort for the GGML_ASSERTs in the header.
+target_link_libraries(test-kv-cells-journal-ownership PRIVATE ggml)
+add_test(NAME test-kv-cells-journal-ownership COMMAND test-kv-cells-journal-ownership)
+set_property(TEST test-kv-cells-journal-ownership PROPERTY LABELS "cpu;tp5")
+set_property(TEST test-kv-cells-journal-ownership PROPERTY PASS_REGULAR_EXPRESSION "KV_CELLS_JOURNAL_OWNERSHIP_TEST PASS")
+
 if (UNIX)
     add_executable(test-ntok-onegraph test-ntok-onegraph.cpp)
     target_link_libraries(test-ntok-onegraph PRIVATE llama)

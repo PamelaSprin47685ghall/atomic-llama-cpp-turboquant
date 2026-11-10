@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <numeric>
 #include <map>
@@ -877,9 +878,11 @@ void llama_kv_cache::clear(bool data) {
             }
         }
     }
+
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+
     // Safe while block KV streaming is active: this only edits cell bookkeeping (which
     // positions and sequence ids a slot holds). No K/V bytes move, so the host cache stays
     // authoritative and the resident GPU mirror stays valid - a freed slot is not attended
@@ -956,6 +959,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+
     if (kv_stream_runtime.runtime != nullptr) {
         throw std::runtime_error("seq_cp is not supported while block KV streaming is active");
     }
@@ -1051,6 +1055,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1182,6 +1187,7 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
 }
 
 llama_pos llama_kv_cache::seq_pos_min(llama_seq_id seq_id) const {
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return other->seq_pos_min(seq_id);
@@ -1195,6 +1201,7 @@ llama_pos llama_kv_cache::seq_pos_min(llama_seq_id seq_id) const {
 }
 
 llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return other->seq_pos_max(seq_id);
@@ -1240,6 +1247,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             uint32_t n_ubatch,
             bool embd_all) {
     GGML_UNUSED(embd_all);
+
 
     const bool pool_decode = tp5::flag_exact_one("TP5_KV_SNAPSHOT_POOL") ||
                              tp5::flag_exact_one("TP5_DECODE_SCRATCH_POOL");
@@ -1341,11 +1349,13 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 }
 
 llama_memory_context_ptr llama_kv_cache::init_full() {
+
     return std::make_unique<llama_kv_cache_context>(this);
 }
 
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
+
 
     bool do_shift = get_has_shift();
 
@@ -1373,9 +1383,59 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     return res;
 }
 
+bool llama_kv_cache::prepare_journal_begin() {
+    // the reversible journal is the recovery mechanism for every prepare:
+    // it extracts the live nodes before a mutation and the replay re-inserts
+    // them without allocating, so the non-SWA path does not clone the
+    // ordered-tree nodes per old pos/used.
+    if (cell_journals.size() != n_stream) {
+        cell_journals.resize(n_stream);
+    }
+    if (heads_before.size() != n_stream) {
+        heads_before.resize(n_stream);
+    }
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        cell_journals[s].begin(v_cells[s].size(), s);
+        v_cells[s].set_journal(&cell_journals[s]);
+    }
+
+    heads_before = v_heads;
+
+    return true;
+}
+
+void llama_kv_cache::prepare_journal_end(bool journal_cells) {
+    if (!journal_cells) {
+        return;
+    }
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        v_cells[s].set_journal(nullptr);
+    }
+}
+
+void llama_kv_cache::prepare_journal_replay(bool journal_cells) {
+    if (!journal_cells) {
+        return;
+    }
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        v_cells[s].set_journal(nullptr);
+    }
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        cell_journals[s].replay([&](cell_journal::entry & e) {
+            GGML_ASSERT(v_cells[s].restore_from_journal(cell_journals[s], e));
+        });
+    }
+
+    v_heads = heads_before;
+}
+
 // the pre-pool implementation of prepare(). the TP5_KV_SNAPSHOT_POOL flag
 // keeps this path byte-for-byte identical to the code before the pool
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_reference(const std::vector<llama_ubatch> & ubatches) {
+
     llama_kv_cache::slot_info_vec_t res;
 
     struct state_t {
@@ -1383,28 +1443,93 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_reference(const std::vec
 
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
 
-        std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+        std::vector<llama_kv_cells> v_cells; // journal snapshot of the old cells
+
+        size_t trial_idx_off = 0; // offset into the flat per-stream trial index block
     };
 
     // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
+    states.reserve(ubatches.size());
 
-    bool success = true;
+    // one flat block for every state's per-stream trial index: allocated once
+    // before the loop, not per trial
+    std::vector<size_t> trial_idx;
 
-    for (const auto & ubatch : ubatches) {
-        // only find a suitable slot for the ubatch. don't modify the cells yet
-        const auto sinfo_new = find_slot(ubatch, false);
-        if (sinfo_new.empty()) {
-            success = false;
-            break;
+    bool journal_cells = false;
+    bool success       = true;
+
+    auto restore_all = [&]() {
+        for (auto it = states.rbegin(); it != states.rend(); ++it) {
+            for (uint32_t s = 0; s < it->sinfo.n_stream(); ++s) {
+                auto & cells = v_cells[it->sinfo.strm[s]];
+
+                if (journal_cells) {
+                    const auto & snap = it->v_cells[s];
+                    cell_journal & jr = cell_journals[it->sinfo.strm[s]];
+                    GGML_ASSERT(it->trial_idx_off + it->sinfo.n_stream() <= trial_idx.size());
+                    for (uint32_t j = 0; j < it->sinfo.idxs[s].size(); ++j) {
+                        const uint32_t idx = it->sinfo.idxs[s][j];
+                        cell_journal::trial_entry * te = cell_journal::find_trial(
+                            jr.trial_at(trial_idx[it->trial_idx_off + s]), idx);
+                        if (te != nullptr) {
+                            GGML_ASSERT(cells.restore_trial(jr, idx, *te));
+                        } else {
+                            cell_journal::entry * e = jr.find(idx);
+                            if (e != nullptr &&
+                                e->pos == snap.pos_get(j) &&
+                                e->ext.x == snap.ext_get(j).x && e->ext.y == snap.ext_get(j).y &&
+                                e->shift == snap.get_shift(j) &&
+                                e->seq == snap.seq_get_all(j)) {
+                                GGML_ASSERT(cells.restore_from_journal(jr, idx));
+                            } else {
+                                GGML_ASSERT(cells.restore_cell_from_snapshot(jr, idx, snap, j));
+                            }
+                        }
+                    }
+                }
+
+                v_heads[it->sinfo.strm[s]] = it->v_heads_old[it->sinfo.strm[s]];
+            }
+        }
+    };
+
+    try {
+        journal_cells = prepare_journal_begin();
+
+        if (journal_cells) {
+            GGML_ASSERT(n_stream > 0);
+            GGML_ASSERT(ubatches.size() <= SIZE_MAX / n_stream);
+            trial_idx.assign(ubatches.size() * n_stream, 0);
         }
 
-        // remember the position that we found
-        res.push_back(sinfo_new);
+        for (const auto & ubatch : ubatches) {
+            // only find a suitable slot for the ubatch. don't modify the cells yet
+            const auto sinfo_new = find_slot(ubatch, false);
+            if (sinfo_new.empty()) {
+                success = false;
+                break;
+            }
 
-        // store the old state of the cells in the recovery stack
-        {
-            state_t state = { sinfo_new, v_heads, {} };
+            // remember the position that we found
+            res.push_back(sinfo_new);
+
+            // every throwing preparation happens before the state enters the
+            // stack and before any mutation: a throw cannot leave a
+            // half-filled state for the catch or the restore
+            GGML_ASSERT(sinfo_new.n_stream() <= n_stream);
+            const size_t trial_idx_off = states.size() * n_stream;
+
+            if (journal_cells) {
+                GGML_ASSERT(trial_idx_off + sinfo_new.n_stream() <= trial_idx.size());
+                for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
+                    cell_journal & jr = cell_journals[sinfo_new.strm[s]];
+                    jr.begin_trial();
+                    trial_idx[trial_idx_off + s] = jr.trial_count() - 1;
+                }
+            }
+
+            state_t state = { sinfo_new, v_heads, {}, trial_idx_off };
 
             for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
                 auto & cells = v_cells[sinfo_new.strm[s]];
@@ -1413,29 +1538,37 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_reference(const std::vec
             }
 
             states.push_back(std::move(state));
-        }
 
-        // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+            // now emplace the ubatch
+            apply_ubatch(sinfo_new, ubatch);
+
+        }
+    } catch (...) {
+        // A throw after an earlier trial must not leave any cell, head or SWA
+        // purge in the cache. The SWA journal restores the full write domain;
+        // the non-SWA path restores the recorded trial slices. If that restore
+        // also throws, the cache is marked failed and fails closed until
+        // clear(); the original exception still propagates.
+        const std::exception_ptr original = std::current_exception();
+        prepare_journal_end(true); // detach any partially attached journals
+        if (journal_cells) {
+            prepare_journal_replay(true);
+        } else {
+            restore_all();
+        }
+        std::rethrow_exception(original);
     }
 
     GGML_ASSERT(!states.empty() || !success);
 
-    // This reverse restore always runs, on success and on the find_slot
-    // failure path: it undoes every recorded trial placement. The exception
-    // window starts after the first apply_ubatch(). An allocation failure
-    // there unwinds past this loop and leaves the simulated placement in the
-    // cells. That failure is a C++ exception escaping llama_decode(), not a
-    // llama_decode() return: llama_decode() has no exception contract, a C
-    // caller cannot catch it, and a C++ caller catches it outside the
-    // documented return-code path. The partial-memory rule for abort (2) and
-    // fatal error (< -1) tells the caller to reconcile with
-    // llama_memory_seq_pos_min/max(); it does not make this exception a
-    // supported return. A no-throw rollback is impossible here because
-    // set() re-inserts into used/seq_pos (std::set/std::map) and can allocate.
-    // iterate backwards and restore the cells to their original state
-    for (auto it = states.rbegin(); it != states.rend(); ++it) {
-        restore_cells(v_cells, v_heads, it->sinfo, it->v_heads_old, it->v_cells);
+    prepare_journal_end(journal_cells);
+
+    restore_all();
+
+    if (journal_cells) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            cell_journals[s].clear();
+        }
     }
 
     if (!success) {
@@ -1448,6 +1581,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_reference(const std::vec
 // pooled prepare: the same search, apply and restore order as
 // prepare_reference(), with the recovery snapshots taken from the pool
 bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, slot_info_vec_t & res, decode_scratch * scratch) {
+
     // an empty batch cannot be placed: the reference path asserts on it, so
     // return the failure that every caller already handles
     if (ubatches.empty()) {
@@ -1466,6 +1600,9 @@ bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, sl
     std::vector<snapshot_slot *> &                states   = scratch != nullptr ? scratch->states   : states_local;
     std::vector<snapshot_slot *> &                pooled   = scratch != nullptr ? scratch->pooled   : pooled_local;
     std::vector<std::unique_ptr<snapshot_slot>> & fallback = scratch != nullptr ? scratch->fallback : fallback_local;
+
+    std::vector<size_t> trial_idx_local;
+    std::vector<size_t> & trial_idx = scratch != nullptr ? scratch->trial_idx : trial_idx_local;
 
     states.clear();
     pooled.clear();
@@ -1513,75 +1650,148 @@ bool llama_kv_cache::prepare_into(const std::vector<llama_ubatch> & ubatches, sl
     // does.
     const bool skip_last_trial = n_swa == 0 && swa_type == LLAMA_SWA_TYPE_NONE;
 
-    bool success = true;
+    bool journal_cells = false;
+    bool success       = true;
 
-    for (size_t i = 0; i < ubatches.size(); ++i) {
-        const auto & ubatch = ubatches[i];
-        const bool last = i + 1 == ubatches.size();
-        const bool skip = skip_last_trial && last;
+    auto restore_all = [&]() {
+        for (auto it = states.rbegin(); it != states.rend(); ++it) {
+            for (uint32_t s = 0; s < (*it)->sinfo.n_stream(); ++s) {
+                auto & cells = v_cells[(*it)->sinfo.strm[s]];
 
-        snapshot_slot * st = nullptr;
+                if (journal_cells) {
+                    const auto & snap = (*it)->v_cells[s];
+                    cell_journal & jr = cell_journals[(*it)->sinfo.strm[s]];
+                    GGML_ASSERT((*it)->trial_idx_off + (*it)->sinfo.n_stream() <= trial_idx.size());
+                    for (uint32_t j = 0; j < (*it)->sinfo.idxs[s].size(); ++j) {
+                        const uint32_t idx = (*it)->sinfo.idxs[s][j];
+                        cell_journal::trial_entry * te = cell_journal::find_trial(
+                            jr.trial_at(trial_idx[(*it)->trial_idx_off + s]), idx);
+                        if (te != nullptr) {
+                            GGML_ASSERT(cells.restore_trial(jr, idx, *te));
+                        } else {
+                            cell_journal::entry * e = jr.find(idx);
+                            if (e != nullptr &&
+                                e->pos == snap.pos_get(j) &&
+                                e->ext.x == snap.ext_get(j).x && e->ext.y == snap.ext_get(j).y &&
+                                e->shift == snap.get_shift(j) &&
+                                e->seq == snap.seq_get_all(j)) {
+                                GGML_ASSERT(cells.restore_from_journal(jr, idx));
+                            } else {
+                                GGML_ASSERT(cells.restore_cell_from_snapshot(jr, idx, snap, j));
+                            }
+                        }
+                    }
+                }
 
-        if (!skip) {
-            st = snapshots.acquire();
-
-            if (st == nullptr) {
-                // the pool is exhausted: use a heap snapshot that dies with the guard
-                fallback.push_back(std::make_unique<snapshot_slot>());
-                st = fallback.back().get();
-            } else {
-                pooled.push_back(st);
+                v_heads[(*it)->sinfo.strm[s]] = (*it)->v_heads_old[(*it)->sinfo.strm[s]];
             }
         }
+    };
 
-        if (skip) {
-            // No later find_slot observes this placement and the real apply
-            // rebuilds it after the earlier trials are restored. The output
-            // slot is written in place, so no snapshot is acquired.
-            if (!find_slot(ubatch, false, res[i])) {
+    try {
+        journal_cells = prepare_journal_begin();
+
+        if (journal_cells) {
+            GGML_ASSERT(n_stream > 0);
+            GGML_ASSERT(ubatches.size() <= SIZE_MAX / n_stream);
+            trial_idx.assign(ubatches.size() * n_stream, 0);
+        }
+
+        for (size_t i = 0; i < ubatches.size(); ++i) {
+            const auto & ubatch = ubatches[i];
+            const bool last = i + 1 == ubatches.size();
+            const bool skip = skip_last_trial && last;
+
+            snapshot_slot * st = nullptr;
+
+            if (!skip) {
+                st = snapshots.acquire();
+
+                if (st == nullptr) {
+                    // the pool is exhausted: use a heap snapshot that dies with the guard
+                    fallback.push_back(std::make_unique<snapshot_slot>());
+                    st = fallback.back().get();
+                } else {
+                    pooled.push_back(st);
+                }
+            }
+
+            if (skip) {
+                // No later find_slot observes this placement and the real apply
+                // rebuilds it after the earlier trials are restored. The output
+                // slot is written in place, so no snapshot is acquired.
+                if (!find_slot(ubatch, false, res[i])) {
+                    success = false;
+                }
+                break;
+            }
+
+            // only find a suitable slot for the ubatch. don't modify the cells yet
+            if (!find_slot(ubatch, false, st->sinfo)) {
                 success = false;
+                break;
             }
-            break;
+
+            // remember the position that we found
+            res[i] = st->sinfo;
+
+            // store the old state of the cells in the recovery stack
+            st->v_heads_old = v_heads;
+
+            st->v_cells.resize(n_stream);
+
+            for (uint32_t s = 0; s < st->sinfo.n_stream(); ++s) {
+                auto & cells = v_cells[st->sinfo.strm[s]];
+                cells.cp_into(st->sinfo.idxs[s], st->v_cells[s]);
+            }
+
+            // every throwing preparation happens before the state enters the
+            // stack and before any mutation
+            GGML_ASSERT(st->sinfo.n_stream() <= n_stream);
+            const size_t trial_idx_off = states.size() * n_stream;
+
+            if (journal_cells) {
+                GGML_ASSERT(trial_idx_off + st->sinfo.n_stream() <= trial_idx.size());
+                for (uint32_t s = 0; s < st->sinfo.n_stream(); ++s) {
+                    cell_journal & jr = cell_journals[st->sinfo.strm[s]];
+                    jr.begin_trial();
+                    trial_idx[trial_idx_off + s] = jr.trial_count() - 1;
+                }
+            }
+
+            st->trial_idx_off = trial_idx_off;
+            states.push_back(st);
+
+            // now emplace the ubatch
+            apply_ubatch(st->sinfo, ubatch);
+
         }
-
-        // only find a suitable slot for the ubatch. don't modify the cells yet
-        if (!find_slot(ubatch, false, st->sinfo)) {
-            success = false;
-            break;
+    } catch (...) {
+        // A throw after an earlier trial must not leave any cell, head or SWA
+        // purge in the cache. The SWA journal restores the full write domain;
+        // the non-SWA path restores the recorded trial slices. If that restore
+        // also throws, the cache is marked failed and fails closed until
+        // clear(); the original exception still propagates.
+        const std::exception_ptr original = std::current_exception();
+        prepare_journal_end(true); // detach any partially attached journals
+        if (journal_cells) {
+            prepare_journal_replay(true);
+        } else {
+            restore_all();
         }
-
-        // remember the position that we found
-        res[i] = st->sinfo;
-
-        // store the old state of the cells in the recovery stack
-        st->v_heads_old = v_heads;
-
-        st->v_cells.resize(n_stream);
-
-        for (uint32_t s = 0; s < st->sinfo.n_stream(); ++s) {
-            auto & cells = v_cells[st->sinfo.strm[s]];
-
-            cells.cp_into(st->sinfo.idxs[s], st->v_cells[s]);
-        }
-
-        states.push_back(st);
-
-        // now emplace the ubatch
-        apply_ubatch(st->sinfo, ubatch);
+        std::rethrow_exception(original);
     }
 
     GGML_ASSERT(!success || states.size() + (skip_last_trial ? 1 : 0) == ubatches.size());
 
-    // The reverse restore covers every recorded trial. With SWA active the
-    // last ubatch is recorded too, so the reference path's purge timing is
-    // preserved; without SWA its skipped apply has no cache side effect. An
-    // allocation failure after an earlier apply still unwinds past this loop:
-    // no no-throw rollback is possible because restore_cells() ->
-    // llama_kv_cells::set() re-inserts into std::set/std::map and allocates.
-    // That is the documented C++-exception boundary, not a llama_decode
-    // return.
-    for (auto it = states.rbegin(); it != states.rend(); ++it) {
-        restore_cells(v_cells, v_heads, (*it)->sinfo, (*it)->v_heads_old, (*it)->v_cells);
+    prepare_journal_end(journal_cells);
+
+    restore_all();
+
+    if (journal_cells) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            cell_journals[s].clear();
+        }
     }
 
     if (!success) {
@@ -2001,6 +2211,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2358,6 +2569,7 @@ static attention_cell_map attention_cells(const llama_kv_cells & cells) {
 
 bool llama_kv_cache::prepare_attention_views(const llama_attention_view * views, size_t count,
         std::vector<llama_attention_view_owned> & out) const {
+
     if (get_n_stream() != 1 || !views || count == 0 || count > LLAMA_MAX_SEQ || get_has_shift()) {
         return false;
     }
@@ -2448,6 +2660,7 @@ bool llama_kv_cache::validate_attention_batch(const llama_batch & batch) const {
 
 bool llama_kv_cache::resolve_attention_view(llama_seq_id seq, llama_pos pos,
         llama_attention_view_resolved & out) const {
+
     const auto found = std::find_if(attention_views.begin(), attention_views.end(), [&](const auto & view) {
         return view.query_seq == seq && view.query_pos == pos;
     });
@@ -2489,6 +2702,7 @@ bool llama_kv_cache::resolve_attention_view(llama_seq_id seq, llama_pos pos,
 // armed, it asks get_n_kv_exact() and aborts if the layout refuses; unarmed,
 // it keeps the width the cache applied in apply().
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+
     uint32_t result = 0;
 
     // stock graph-stability pad: keep the n_kv width on a 256-cell bucket so a
@@ -2527,6 +2741,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 // the quantized one, so the width is rounded up to the largest V block size and
 // rejected if it does not fit a participating stream.
 uint32_t llama_kv_cache::get_n_kv_exact(const slot_info & sinfo) const {
+
     if (kv_stream_runtime.runtime != nullptr || sinfo.n_stream() == 0) {
         return 0;
     }
@@ -2587,6 +2802,7 @@ uint32_t llama_kv_cache::get_n_kv_exact(const slot_info & sinfo) const {
 // which is exactly what llama_kv_cache_context::get_n_kv() does when the exact
 // query refuses.
 uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const {
+
     if (sinfo.n_stream() != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0 ||
         ubatch.pos == nullptr || ubatch.n_seq_id == nullptr ||
         ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr) {
@@ -2632,6 +2848,7 @@ uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const 
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
@@ -2668,6 +2885,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -2721,6 +2939,7 @@ static void llama_union_mark_token_axis(ggml_tensor * t, int axis) {
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo,
                                     bool token_axis_marker) const {
+
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
@@ -2780,6 +2999,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo,
                                     bool token_axis_marker) const {
+
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
@@ -2868,6 +3088,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
+
     const uint32_t n_tokens = ubatch.n_tokens;
 
     ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
@@ -2879,6 +3100,7 @@ ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama
 }
 
 ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
+
     const uint32_t n_tokens = ubatch.n_tokens;
 
     ggml_tensor * v_idxs;
@@ -2946,6 +3168,7 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
 }
 
 void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
+
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
@@ -2969,6 +3192,7 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
 }
 
 void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
+
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
@@ -3007,6 +3231,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 }
 
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
+
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     int32_t * data = (int32_t *) dst->data;
@@ -3276,6 +3501,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_kv_runtime) const {
+
     // Stock layout contract: the mask carries one row per real token (per
     // stream). A prefab envelope mask has n_env rows and only n_tokens of them
     // are real, so it calls fill_input_kq_mask with an explicit row count
@@ -3487,6 +3713,7 @@ enum llama_gate_verdict llama_kv_cache::check_mask_row(
 
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+
     const int64_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
@@ -3545,6 +3772,7 @@ void llama_kv_cache::set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatc
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+
     if (!dst) {
         // rotation disabled for this cache (attn_rot_k == false): the graph
         // never created the input tensor — nothing to fill.
@@ -3589,6 +3817,7 @@ int64_t llama_kv_cache::prefab_scratch_cell(const slot_info & sinfo) const {
 
 void llama_kv_cache::prefab_set_input_idxs(ggml_tensor * k_dst, ggml_tensor * v_dst, const llama_ubatch * ubatch,
                                            const slot_info & sinfo, uint32_t n_env, int64_t scratch) const {
+
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(sinfo.n_stream() == 1);
     GGML_ASSERT(n_tokens == (uint32_t) sinfo.size());
@@ -3632,6 +3861,7 @@ void llama_kv_cache::prefab_set_input_idxs(ggml_tensor * k_dst, ggml_tensor * v_
 
 void llama_kv_cache::prefab_set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_env,
                                               const slot_info & sinfo) const {
+
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(dst->ne[3] == 1 && dst->ne[2] == 1);
     GGML_ASSERT(dst->ne[1] == (int64_t) n_env);
@@ -3944,6 +4174,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+
     state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
 }
 
@@ -4755,7 +4986,7 @@ void llama_kv_cache_context::nkv_envelope_end() const {
 }
 
 bool llama_kv_cache_context::has_attention_views() const {
-    return !ubatches.empty() && !kv->attention_views.empty();
+    return kv != nullptr && !ubatches.empty() && !kv->attention_views.empty();
 }
 
 llama_attention_view_resolved llama_kv_cache_context::attention_view(llama_seq_id seq, llama_pos pos) const {

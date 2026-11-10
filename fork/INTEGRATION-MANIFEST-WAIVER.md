@@ -1198,6 +1198,49 @@ state guards were not reached; this does not prove a state-guard bug.
 Manifest: no digest was re-signed. `src/llama-context.cpp/.h`,
 `src/llama-memory-recurrent.h` and `patches/ws5/README.md` remain red/unsigned.
 
+### E.15 KV prepare journal and ownership round 2026-11-10
+
+Integrated the final net `99f1d48f9` -> `758b81a98` (journal branch plus the
+unbound-destination ownership fix). This is a net application, not a replay
+of the used-node pool/revert history pair.
+
+Prepare now activates a per-stream cell journal. The journal records the full
+write domain, including SWA `seq_rm` purge cells outside `sinfo.idxs`, and
+replays in reverse on a throw; heads and the stream `has_shift` state are
+restored. The normal restore uses the per-trial `v_cells` snapshot when the
+journal entry predates the trial, otherwise the journal entry. K-shift
+`shift_failed`, update status, shift backup and the state guards remain the
+explicit async-failure path; the journal covers prepare exceptions, not
+native async success.
+
+`llama_kv_cells` now requires an unbound destination for both assignment
+operators. Copy construction/assignment never inherit the source journal;
+move construction/assignment transfer and clear the source journal; a bound
+destination asserts. Production mutates live `v_cells` in place and uses
+unbound prepare snapshots; vector growth/snapshot reuse only assign unbound
+elements. This is the ownership fix, not a change to the journal data model.
+
+Scope: `test-kv-cells-journal-ownership` is header-only synthetic ownership/
+OOM coverage; it was not run here. `test-tp5-ubatch-pool` uses a synthetic
+real `llama_kv_cache` with OOM sweeps (SWA/non-SWA, persistent, begin_trial,
+same-cell) and capacity/microbench reporting; it is not a full model run.
+`test-kv-update-status` uses a real CPU dense Llama context. SWA purge tests
+use synthetic cache construction; `n_swa=0` covers the journal replay branch,
+not an SWA purge. No full runtime model, GPU, or staging receipt was run.
+
+Narrow verification in this isolated worktree, once each:
+`test-tp5-ubatch-pool` reported `OK failures=0 allocs=24256 frees=23106`,
+exit 0 (synthetic real-cache OOM/SWA/non-SWA sweep, not a full model);
+`test-kv-update-status` with `tests/test-models/llama-dense.gguf` reported
+`KV_UPDATE_STATUS_TEST PASS checks=21`, exit 0 (real CPU dense context).
+`test-kv-cells-journal-ownership` was not run. No GPU/full suite was run.
+
+Manifest: `src/llama-kv-cache.cpp`, `src/llama-kv-cache.h`,
+`src/llama-kv-cells.h` and `tests/test-tp5-ubatch-pool.cpp` were updated to
+their actual post-integration hashes. `tests/test-kv-cells-journal-ownership.cpp`
+has no manifest entry and was not added. Existing K-shift entries and stale
+red items were not re-signed.
+
 ## F. Why this does not block the integration
 
 - The guard is a manifest boundary check, not a compiler or runtime test. Its failure

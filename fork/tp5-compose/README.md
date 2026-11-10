@@ -89,9 +89,102 @@ sequence.
 
 The CPU counterexample compares cache state on a real `llama_kv_cache`; the
 non-SWA control checks cache-state equivalence only and does not prove the
-last trial is skipped. An allocation failure after an earlier apply still
-unwinds past `restore_cells`; that is the existing C++-exception boundary,
-not a no-throw rollback.
+last trial is skipped. A prepare trial activates a per-stream cell journal:
+`apply_ubatch()` and its SWA `seq_rm` purge record every mutated cell,
+including cells outside `sinfo.idxs`. The journal records each cell's
+pos/ext/seq/shift; a generation mark deduplicates a cell. The trial never
+changes the stream's `has_shift` flag, so the journal does not save it. A throw replays the journal in reverse and restores the
+heads, so the full write domain returns to the pre-prepare state; the original
+exception propagates. Two layers: the global journal owns the nodes of the pre-prepare state and
+the reverse replay restores the full transaction on an exception; the journal
+keeps all trial entries in one flat vector plus each trial's range, so a trial
+owns its snapshot state and the nodes it removed without a per-trial buffer.
+
+The failure counterexamples use the test allocator as a probe: it compares the
+real cells at every allocation and arms the fault only after the target
+stream(s) have changed, recording the allocation number instead of pinning an
+index. A no-op replay fails the full-state check.
+
+The `n_swa=0` case covers the journal replay branch only; it does not execute
+an SWA purge. The SWA purge path is covered by the separate SWA purge tests.
+
+The recovery state records one trial index per stream: a stream that an
+earlier ubatch did not touch keeps its own count. All states' indices are one
+flat block allocated once per prepare, not a vector per trial; the block is
+allocated only when the journal is active (SWA), the pooled path reuses the
+decode scratch's block, and the block size and the per-stream count are
+checked before the write. All throwing setup before apply (the per-stream
+trial index, `begin_trial()` and the cell snapshots) happens before the state
+enters the recovery stack and before any mutation, so a setup throw cannot
+leave a half-filled state for the catch or the restore. A throw from
+`apply_ubatch()` after a mutation is recovered by the journal replay. `apply_ubatch()`
+never calls `pos_add()`/`pos_div()`, so `has_shift` cannot change during a
+trial and the journal does not save or restore it. A journal belongs to one stream: the trial entries carry the stream tag and the search rejects a
+foreign tag, so the same cell/position in another stream cannot supply a node.
+A `seq_pos` node is keyed by (sequence, position), not by the cell: when two
+cells share the key, the extracted node can live in another cell's entry. The
+search checks the cell's global entry, then the flat trial entries newest
+first, and only then all global entries for the shared key. When the trial's
+first mutation creates the global entry, the trial entry is created lazily
+from it, so later mutations' used/`seq_pos` nodes are owned too. The restore
+compares positions as well as sequence bits: a purge followed by reuse moves a
+cell, so the same sequence bit at a different position still moves its
+`seq_pos` entry. A normal restore with no trial entry restores the real
+snapshot state, used or empty; it no longer assumes an empty snapshot. The
+snapshot copy keeps a non-zero `shift`, so there is no zero-shift
+precondition. The per-cell copy carries pos/ext/seq/shift; the stream
+`has_shift` flag is not part of the copy contract, and a prepare trial does
+not change it. The journal is active for every prepare: the non-SWA path uses the same
+reversible log, so the mutation extracts the live used/seq_pos nodes and the
+replay re-inserts them without allocating; no ordered-tree nodes are cloned
+per old pos/used. The old `set` stays for the restore_cells helper. The
+non-trial record and every replay walk only the set sequence bits, not all
+`LLAMA_MAX_SEQ` bits; the trial-record path still scans all `LLAMA_MAX_SEQ`
+bits. The common one- or two-sequence node handles live inline
+in the journal entry, so a touched cell does not allocate a per-cell vector;
+wider masks spill to a heap vector. The replay passes the entry directly to
+the restore, and each node-handle insert uses a `begin()`/`end()` hint. A
+failed map insert means another cell already supplies the same (sequence,
+position) key; the restore increments that count and drops the redundant
+node, so the path stays allocation-free. The retired capacity test's five-pair
+microbench for 1024 cells reported the old `cp_into`+`set` median about
+0.135 ms and the journal median about 0.142 ms per iteration (ratio about
+1.05, single observation). That is historical local evidence, not a stable
+performance claim and not part of the long-term test suite; the journal
+removes the clone allocations and the
+remaining per-mutation record and replay are close to the old allocating
+restore. `prepare()` runs once per ubatch in the decode loop for both SWA and
+non-SWA, so the cost is per ubatch (amortized over the ubatch's tokens), not
+per token, but it is on the decode path. The non-SWA journal uses the same
+8 B/cell marks and the same per-trial entries as the SWA journal.
+The fallback increments an existing map entry
+through an iterator, never through `operator[]`, and `seq_pos_dec` checks its
+entry with `GGML_ASSERT`; a missing entry aborts instead of dereferencing
+`end()`. A node returned to the
+containers by a normal restore can be re-extracted and re-owned by a later
+prepare's journal; the replay inserts the extracted node handles, allocates
+nothing, and a third prepare can own them again. `pos_set` inserts into `used`
+before it writes the position, and every container that grows after a mutation
+is reserved before the take, so a reserve failure leaves the nodes in the
+journal where the replay finds them. A forward `seq_add` inserts its
+`seq_pos` entry before the seq bit, so a failed insert leaves the cell
+unchanged. Prepare exceptions are recovered by the journal; K-shift async
+failure still uses the explicit `shift_failed` fail-stop path, and
+`clear(true)` recovers it. `clear()` is synchronous, never throws, and does not
+block on a retained context object; the caller owns the ordering. With SWA,
+`prepare()` runs on the decode path, so the journal marks, the flat
+trial entries and the source scan are part of the SWA decode cost. The marks
+are two 4 B arrays per cell per stream (8 B/cell, 2 MiB per stream for 262144
+cells); the entries, the flat trial entries and the ranges hold the distinct
+nodes. The source search is O(1) for the cell's own entry and the newest trial
+entries; the worst case is a linear scan over the flat trial entries. The `bytes()` ledger covers the journal marks, the global entries, the flat
+trial entries, the ranges and the discard; the recovery snapshots
+(`states`/`v_cells`), the non-SWA snapshot nodes and the flat trial index
+block are separate prepare storage and are not included. The retired capacity
+test reported about 2.2 MiB for the journal ledger and printed
+single-observation record/replay/trial/scan microbenchmarks; those remain
+historical observations, not stable performance claims, and the long-term
+suite no longer contains that microbenchmark.
 
 A prepares every rank/stage and mapped communication allocation before starting
 an epoch. Each partial-sum boundary uses two bounded single-workgroup kernels:

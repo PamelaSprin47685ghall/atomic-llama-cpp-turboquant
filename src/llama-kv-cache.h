@@ -130,7 +130,9 @@ public:
 
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
 
-        std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+        std::vector<llama_kv_cells> v_cells; // journal snapshot of the old cells
+
+        size_t trial_idx_off = 0; // offset into the flat per-stream trial index block
     };
 
     // decode-time buffers reused by one batch context. the context returns
@@ -143,6 +145,7 @@ public:
         std::vector<snapshot_slot *>                    states;
         std::vector<snapshot_slot *>                    pooled;
         std::vector<std::unique_ptr<snapshot_slot>>     fallback;
+        std::vector<size_t>                             trial_idx; // flat per-stream trial indices
 
         bool in_use    = false;
         bool from_pool = false;
@@ -568,6 +571,13 @@ private:
     // vectors are reused too. returns false on failure
     bool prepare_into(const std::vector<llama_ubatch> & ubatches, slot_info_vec_t & res, decode_scratch * scratch);
 
+    // Prepare undo journal for the SWA purge cells. begin() enables it on all
+    // streams and snapshots the heads; end() detaches it; replay() restores
+    // the full write domain and throws if that restore fails.
+    bool prepare_journal_begin();
+    void prepare_journal_end(bool journal_cells);
+    void prepare_journal_replay(bool journal_cells);
+
     // Shared KQ-mask fill. `n_rows` is the number of token rows per stream to
     // write. The stock layout passes dst->ne[1] and asserts it equals the
     // batch rows; a prefab envelope mask has n_env rows and passes only its
@@ -664,6 +674,11 @@ private:
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
+
+    // Per-stream undo journals for the prepare trials. Only SWA-active caches
+    // allocate entries; the normal path records into pre-reserved storage.
+    std::vector<cell_journal> cell_journals;
+    std::vector<uint32_t>     heads_before;
 
     // fixed-slot pool of prepare snapshots. the pool allocates every slot once
     // and hands the same slots out again on later decodes
