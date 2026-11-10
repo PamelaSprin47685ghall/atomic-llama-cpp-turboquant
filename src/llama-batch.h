@@ -160,6 +160,11 @@ private:
     // batch indices of the output
     std::vector<int32_t> out_ids;
 
+    // Scratch index list for one split. Every split_* clears it and refills
+    // it before ubatch_add() consumes it, so the capacity survives from one
+    // decode step to the next and a steady decode does not allocate here.
+    std::vector<int32_t> split_idxs;
+
     uint32_t n_used;
 
     // used[i] indicates if token i has already been used in a previous ubatch
