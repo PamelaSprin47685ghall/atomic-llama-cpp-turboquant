@@ -1502,3 +1502,14 @@ add_test(NAME test-tp5-prefab-subenvelope COMMAND test-tp5-prefab-subenvelope)
 set_property(TEST test-tp5-prefab-subenvelope PROPERTY LABELS "cpu;tp5;prefab")
 set_property(TEST test-tp5-prefab-subenvelope PROPERTY PASS_REGULAR_EXPRESSION "PREFAB_SUBENVELOPE_TEST PASS")
 set_property(TEST test-tp5-prefab-subenvelope PROPERTY FAIL_REGULAR_EXPRESSION "^FAIL:")
+
+# Meta host<->shard virtual-address copy test. CPU Meta buffers can report
+# is_host=true while the top-level tensor data is a sentinel; the generic copy
+# must route through the real simple-tensor bytes. Covers host<->Meta non-view
+# and non-zero cross-rank views, different splits, empty and alias semantics.
+add_executable(test-meta-host-view-copy test-meta-host-view-copy.cpp)
+target_link_libraries(test-meta-host-view-copy PRIVATE llama)
+add_test(NAME test-meta-host-view-copy COMMAND test-meta-host-view-copy)
+set_property(TEST test-meta-host-view-copy PROPERTY LABELS "cpu;meta")
+set_property(TEST test-meta-host-view-copy PROPERTY PASS_REGULAR_EXPRESSION "META_HOST_VIEW_COPY_TEST PASS")
+set_property(TEST test-meta-host-view-copy PROPERTY FAIL_REGULAR_EXPRESSION "FAIL ")

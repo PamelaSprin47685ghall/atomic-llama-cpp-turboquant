@@ -739,6 +739,12 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
         return;
     }
 
+    // Empty copies are a no-op. Do not reach the fallback's malloc(0), whose
+    // result is implementation-defined and may be nullptr.
+    if (ggml_nbytes(src) == 0) {
+        return;
+    }
+
     ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
     // Meta buffers report is_host=true when all children are host buffers, but
@@ -762,7 +768,7 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
         ggml_backend_moe_cache_invalidate_buffer(
                 dst_buf, dst->data, ggml_nbytes(dst));
         ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
-    } else if (!ggml_backend_buffer_copy_tensor(src, dst)) {
+    } else if (src_meta || dst_meta || !ggml_backend_buffer_copy_tensor(src, dst)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));
 #endif // NDEBUG
