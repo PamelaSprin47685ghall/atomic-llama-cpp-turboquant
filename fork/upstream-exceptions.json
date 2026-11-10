@@ -801,12 +801,12 @@
     },
     {
       "path": "tests/CMakeLists.txt",
-      "sha256": "9a94fd693d250398dd67475384024d4f24d5f721eef206c8a64d1e82dc4f4bca",
+      "sha256": "8c12f343fc009d7ef72214954351820ca31eade18ee1e561405186a98ed5363c",
       "mode": "100644",
       "consumers": [
         "llama batch allocator tests"
       ],
-      "reason": "Register the TP5 ubatch-pool, staging scheduler/pool/lock, context-retention and prefab sub-envelope CPU tests. Register the relay verification counter CPU test. Register the CPU-only Meta partial-enqueue test target.",
+      "reason": "Register the TP5 ubatch-pool, staging scheduler/pool/lock, staging pool lifecycle, context-retention and prefab sub-envelope CPU tests. Register the relay verification counter CPU test. Register the CPU-only Meta partial-enqueue test target.",
       "removal_condition": "Remove when the pool test moves into the upstream test tree."
     },
     {
