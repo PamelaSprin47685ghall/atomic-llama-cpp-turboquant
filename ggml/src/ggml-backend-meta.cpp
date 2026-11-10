@@ -119,7 +119,7 @@ enum class release_result {
 
 static void drop_orphan_hold(uint16_t tag);
 static bool provider_reap_quarantined_locked();
-static release_result release_token_impl(uint64_t owner, uint64_t generation);
+static release_result release_token_impl(uint64_t owner, uint64_t generation, bool drain_first);
 static release_result release_orphan_record(const orphan_owner_record & record);
 
 struct orphan_ticket {
@@ -232,7 +232,7 @@ static release_result release_orphan_record(const orphan_owner_record & record) 
     if (record.token != 0) {
         // Token path: release_token_impl drains the provider owner before it
         // removes the token and its active_owners hold.
-        return release_token_impl(record.token, record.generation);
+        return release_token_impl(record.token, record.generation, true);
     }
     if (record.provider == nullptr || record.provider->owner_drain == nullptr ||
             record.provider->owner_release == nullptr) {
@@ -1368,7 +1368,7 @@ extern "C" int ggml_backend_meta_staging_owner_drain(uint64_t owner, uint64_t ge
     }
 }
 
-static release_result release_token_impl(uint64_t owner, uint64_t generation) {
+static release_result release_token_impl(uint64_t owner, uint64_t generation, bool drain_first) {
     const uint16_t tag = uint16_t(owner >> kOwnerRawBits);
     if (tag == 0) {
         return release_result::invalid;
@@ -1400,12 +1400,23 @@ static release_result release_token_impl(uint64_t owner, uint64_t generation) {
     int drained = int(ggml_cuda_staging::owner_drain_result::invalid);
     bool released = false;
     try {
-        drained = st != nullptr && st->owner_drain != nullptr
-            ? st->owner_drain(raw_owner, generation)
-            : int(ggml_cuda_staging::owner_drain_result::invalid);
-        if (drained == int(ggml_cuda_staging::owner_drain_result::drained) &&
-                st->owner_release != nullptr) {
-            released = st->owner_release(raw_owner, generation);
+        if (drain_first) {
+            drained = st != nullptr && st->owner_drain != nullptr
+                ? st->owner_drain(raw_owner, generation)
+                : int(ggml_cuda_staging::owner_drain_result::invalid);
+            if (drained == int(ggml_cuda_staging::owner_drain_result::drained) &&
+                    st->owner_release != nullptr) {
+                released = st->owner_release(raw_owner, generation);
+            }
+        } else {
+            // Public release is the second half of the documented
+            // drain-then-release sequence. The caller already drained, so a
+            // second drain would be observable (and is rejected by the
+            // provider contract).
+            released = st != nullptr && st->owner_release != nullptr &&
+                st->owner_release(raw_owner, generation);
+            drained = released ? int(ggml_cuda_staging::owner_drain_result::drained)
+                               : int(ggml_cuda_staging::owner_drain_result::failed);
         }
     } catch (...) {
         // A throwing provider callback must not leave releasing=true.
@@ -1491,22 +1502,16 @@ extern "C" bool ggml_backend_meta_staging_owner_release(uint64_t owner, uint64_t
         if (!hold.acquire(reg)) {
             return false;
         }
-        int drained = int(ggml_cuda_staging::owner_drain_result::invalid);
-        bool released = false;
         try {
-            drained = st != nullptr && st->owner_drain != nullptr
-                ? st->owner_drain(info.raw_owner, generation)
-                : int(ggml_cuda_staging::owner_drain_result::invalid);
-            if (drained == int(ggml_cuda_staging::owner_drain_result::drained) &&
-                    st->owner_release != nullptr) {
-                released = st->owner_release(info.raw_owner, generation);
-            }
+            // Public release is the second half of the documented
+            // drain-then-release sequence; do not drain again.
+            return st != nullptr && st->owner_release != nullptr &&
+                st->owner_release(info.raw_owner, generation);
         } catch (...) {
             return false;
         }
-        return drained == int(ggml_cuda_staging::owner_drain_result::drained) && released;
     }
-    return release_token_impl(owner, generation) == release_result::released;
+    return release_token_impl(owner, generation, false) == release_result::released;
 }
 
 // Per-request inputs are bounded by this. It must cover the MTP hidden input
@@ -5318,7 +5323,7 @@ extern "C" int ggml_backend_meta_staging_owner_acquire_set(
     auto release_acquired = [&]() {
         for (size_t i = 0; i < count; ++i) {
             const release_result result =
-                release_token_impl(owners[i], generations[i]);
+                release_token_impl(owners[i], generations[i], true);
             if (result == release_result::busy || result == release_result::failed) {
                 if (!orphan_commit(orphan_ticket_res, owners[i], generations[i])) {
                     (void) remember_orphan_owner(owners[i], generations[i]);

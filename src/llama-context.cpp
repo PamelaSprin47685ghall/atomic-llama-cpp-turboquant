@@ -246,12 +246,15 @@ struct tp5_cleanup_traits {
         if (raw == nullptr) {
             return true;
         }
-        // Pin-aware free: takes the host pin, calls the provider, and either
-        // releases the pin or puts it back on retention.
-        if (!ggml_backend_free_and_report(raw)) {
-            // Keep the unique_ptr owning the retained backend so the cleanup
-            // slot can retry; never release the raw pointer on failure.
-            return false;
+        // Single retry owner: ggml_backend_free_and_report takes the host pin
+        // and, on false, parks that pin in the retained-pin list. The slot
+        // must abandon its unique_ptr in both outcomes; otherwise the slot
+        // and retry_retained_pins would free the same raw backend twice.
+        try {
+            (void) ggml_backend_free_and_report(raw);
+        } catch (...) {
+            // A throwing host free path must not leave the slot retrying the
+            // same pointer behind a partially-taken pin.
         }
         (void) backend.release();
         return true;
@@ -1057,21 +1060,6 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 return false;
             }
             ++lane_count;
-            return true;
-        }
-        bool retain_unarmed(ggml_backend_ptr && owned) {
-            if (!owned) {
-                return true;
-            }
-            if (unarmed_spares.empty()) {
-                return false;
-            }
-            std::unique_ptr<tp5_unarmed_node> node = std::move(unarmed_spares.back());
-            unarmed_spares.pop_back();
-            node->backend = std::move(owned);
-            std::lock_guard<std::mutex> lock(tp5_unarmed_mutex());
-            node->next = tp5_unarmed_head();
-            tp5_unarmed_head() = node.release();
             return true;
         }
         void commit() {

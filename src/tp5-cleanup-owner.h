@@ -31,8 +31,10 @@ public:
     using backend_ptr  = typename Traits::backend_ptr;
 
     struct retained_raw_node {
-        backend_ptr backend{};
+        // Declared before backend: reverse destruction destroys backend
+        // first, then the module reference that keeps its code mapped.
         std::shared_ptr<void> module;
+        backend_ptr backend{};
         const char * why = nullptr;
         retained_raw_node * next = nullptr;
     };
@@ -44,6 +46,10 @@ public:
 
     struct reservation {
         std::vector<std::size_t> slot;
+        // armed[pos] is true once this reservation has handed the slot to a
+        // worker. commit() must not reset an armed slot: it may already be
+        // FREE and reused by another reservation.
+        std::vector<bool> armed;
         std::size_t count = 0;
         // Nodes are exclusively bound to this reservation. They are allocated
         // before any native side effect and moved into a slot when armed.
@@ -107,6 +113,7 @@ public:
                 slots_.resize(slots_.size() + need);
             }
             out.slot.resize(n);
+            out.armed.assign(n, false);
             std::size_t found = 0;
             for (std::size_t i = 0; i < slots_.size() && found < n; ++i) {
                 if (slots_[i].state == slot::FREE) {
@@ -121,11 +128,13 @@ public:
                 }
                 out.count = 0;
                 out.slot.clear();
+                out.armed.clear();
                 return false;
             }
         } catch (...) {
             out.count = 0;
             out.slot.clear();
+            out.armed.clear();
             return false;
         }
         if (!worker_.joinable()) {
@@ -183,6 +192,9 @@ public:
         s.next_retry = {};
         s.release_attempts = 0;
         s.state = slot::READY;
+        if (pos < res.armed.size()) {
+            res.armed[pos] = true;
+        }
         cv_.notify_all();
         return true;
     }
@@ -216,6 +228,9 @@ public:
         s.next_retry = {};
         s.release_attempts = 0;
         s.state = slot::READY;
+        if (pos < res.armed.size()) {
+            res.armed[pos] = true;
+        }
         cv_.notify_all();
         return true;
     }
@@ -251,6 +266,9 @@ public:
         s.next_retry = {};
         s.release_attempts = 0;
         s.state = slot::READY;
+        if (pos < res.armed.size()) {
+            res.armed[pos] = true;
+        }
         cv_.notify_all();
         return true;
     }
@@ -277,6 +295,9 @@ public:
         s.next_retry = {};
         s.release_attempts = 0;
         s.state = slot::READY;
+        if (pos < res.armed.size()) {
+            res.armed[pos] = true;
+        }
         cv_.notify_all();
         return true;
     }
@@ -345,12 +366,13 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         for (std::size_t i = 0; i < res.count; ++i) {
             slot & s = slots_[res.slot[i]];
-            if (s.state == slot::RESERVED) {
+            if (!res.armed[i] && s.state == slot::RESERVED) {
                 s.reset();
             }
         }
         res.count = 0;
         res.slot.clear();
+        res.armed.clear();
         cv_.notify_all();
     }
 
