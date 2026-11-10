@@ -676,6 +676,11 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+    // Observation state for the last memory_update(): failed distinguishes a
+    // real failure from NO_UPDATE; error is the decode return code (-2 for a
+    // prepare/alloc failure, -3 for an apply/K-shift failure).
+    bool memory_update_failed = false;
+    int  memory_update_error  = 0;
 
     // factor-prefab state (null unless enabled); see llama-prefab.h
     std::unique_ptr<llama_prefab_state> prefab;

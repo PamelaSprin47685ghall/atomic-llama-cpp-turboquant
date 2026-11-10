@@ -200,6 +200,9 @@ public:
 
     bool next() override;
     bool apply() override;
+    llama_memory_apply_status get_update_status() const override {
+        return llama_memory_apply_status_combine(ctx_base_mem->get_update_status(), ctx_swa_mem->get_update_status());
+    }
 
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -350,6 +353,13 @@ public:
 
     bool next()  override;
     bool apply() override;
+    llama_memory_apply_status get_update_status() const override {
+        auto st = ctx_raw ? ctx_raw->get_update_status() : LLAMA_MEMORY_APPLY_NO_UPDATE;
+        st = llama_memory_apply_status_combine(st, ctx_csa_mem->get_update_status());
+        st = llama_memory_apply_status_combine(st, ctx_hca_mem->get_update_status());
+        st = llama_memory_apply_status_combine(st, ctx_lid_mem->get_update_status());
+        return st;
+    }
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

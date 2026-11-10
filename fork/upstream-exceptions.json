@@ -510,7 +510,7 @@
     },
     {
       "path": "src/llama-kv-cache.cpp",
-      "sha256": "1d18cf8b7e2e12f8bdd56736a1c0beda18580a8e33dbb9e232cdfe41fdf2b6d5",
+      "sha256": "44af3f957c43ce372cb4a67711044f5669aedb02e578f853c669c6b79866483f",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
@@ -522,7 +522,7 @@
     },
     {
       "path": "src/llama-kv-cache.h",
-      "sha256": "35574422ffeadc7804ff227af348d7b90c30aebfbb861647a881f5c14e4448ff",
+      "sha256": "79ad005c96cc88c7063713e8015f66b0373e9a2ff0a3d297af80896f3186ecee",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
@@ -567,7 +567,7 @@
     },
     {
       "path": "src/llama-memory.h",
-      "sha256": "a4b15c76b1a2800d3fb09bff029fcb6f92837057bd1b32cd72f2614e11577d60",
+      "sha256": "aca5be49c17afe8222ec234775cf82cd365ade2dc8f5413f8c21a9eddd60fdf0",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
@@ -935,7 +935,7 @@
     },
     {
       "path": "patches/ws5/README.md",
-      "sha256": "0006c31d7db3f41587140a5882c2e0a3f99dee7ad5a3ac50fe7338381af620b5",
+      "sha256": "f61082ba68b60220709fd0c573cf235f657d0ddb162dd98d5168dfe9fc9069c9",
       "mode": "100644",
       "consumers": [
         "integ/tp5-mtp-r28b integration maintainers"
@@ -1109,6 +1109,16 @@
       "removal_condition": "Remove with the TP5 staging partial-enqueue path or when upstream supplies an equivalent CPU-testable fault-publication contract.",
       "sha256": "d46e164fc08c907902df46779e81bd474cdb062db86a5c26ee46c19c2dd909c3",
       "mode": "100644"
+    },
+    {
+      "path": "tests/test-kv-update-status.cpp",
+      "sha256": "84875c31662442c69f8a216f075db222338eb1ffa95682be04c4d476a72c2b6e",
+      "mode": "100644",
+      "consumers": [
+        "WS5 KV update/apply status CPU test"
+      ],
+      "reason": "Drive the real CPU context through update NO_UPDATE and APPLIED K-shift paths; the K-shift graph runs and decode succeeds only after the status protocol is applied. No production hook or mock backend. Cover NO_UPDATE, APPLIED and a controlled FAILED K-shift compute through a real CPU backend wrapper; decode -3, cells restored, state refused, clear(true) recovers. Cover nonempty and empty-stream state get/set refusal after a controlled K-shift failure, plus clear(true) recovery; 19 checks. Capture a seq1 empty-state blob before the controlled failure and replay it after; the entry guard, not a seq/magic mismatch, must refuse it. 20 checks; this count is the isolated branch result and was not rerun in the main tree.",
+      "removal_condition": "Remove with the WS5 KV status protocol, or replace with an upstream test covering the same real context paths."
     }
   ]
 }

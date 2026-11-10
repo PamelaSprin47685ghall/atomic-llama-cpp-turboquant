@@ -849,6 +849,10 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    shift_backup_clear();
+    if (data) {
+        shift_failed = false;
+    }
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -1074,6 +1078,9 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    if (shift_failed) {
+        return;
+    }
     if (kv_stream_runtime.runtime != nullptr) {
         throw std::runtime_error("seq_add (K-shift) is not supported while block KV streaming is active");
     }
@@ -1082,6 +1089,10 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
+    if (!get_can_shift()) {
+        LLAMA_LOG_ERROR("%s: this cache cannot shift its K/V; ignoring seq_add\n", __func__);
+        return;
+    }
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
 
@@ -1107,6 +1118,8 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
+    shift_backup_save();
+
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (!cells.pos_in(i, p0, p1)) {
             continue;
@@ -1127,6 +1140,9 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    if (shift_failed) {
+        return;
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1337,6 +1353,10 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    if (shift_failed) {
+        LLAMA_LOG_ERROR("%s: refusing prepare: KV state is invalid after a failed update; clear(true) is required\n", __func__);
+        return {};
+    }
     const bool pool_decode = tp5::flag_exact_one("TP5_KV_SNAPSHOT_POOL") ||
                              tp5::flag_exact_one("TP5_DECODE_SCRATCH_POOL");
 
@@ -1626,13 +1646,20 @@ void llama_kv_cache::scratch_return(
     }
 }
 
-bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+llama_memory_apply_status llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+    if (shift_failed) {
+        LLAMA_LOG_ERROR("%s: KV state is invalid after a failed K-shift; clear(true) is required\n", __func__);
+        return LLAMA_MEMORY_APPLY_FAILED;
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // In this tree `other` is the all-shared mirror. A tree that supports
+    // partial sharing must narrow this to shares_target_kv_all_; partial
+    // private layers still need their K-shift.
     if (other) {
-        return true;
+        return LLAMA_MEMORY_APPLY_NO_UPDATE;
     }
 
-    bool updated = false;
+    llama_memory_apply_status status = LLAMA_MEMORY_APPLY_NO_UPDATE;
 
     auto * sched = lctx->get_sched();
 
@@ -1664,11 +1691,17 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 }
             }
         }
+        status = LLAMA_MEMORY_APPLY_APPLIED;
     }
 
     if (do_shift) {
         if (!get_can_shift()) {
-            GGML_ABORT("The current KV cache / model configuration does not support K-shift");
+            LLAMA_LOG_ERROR("%s: K-shift requested but this cache cannot shift; refusing\n", __func__);
+            if (status == LLAMA_MEMORY_APPLY_APPLIED) {
+                // The stream copy already changed K/V; cells alone cannot undo it.
+                shift_failed = true;
+            }
+            return LLAMA_MEMORY_APPLY_FAILED;
         }
 
         LLAMA_LOG_DEBUG("%s: applying K-shift\n", __func__);
@@ -1678,7 +1711,11 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             ggml_backend_sched_reset(sched);
             if (!ggml_backend_sched_set_split_copy_tracking(sched, false)) {
                 LLAMA_LOG_ERROR("%s: failed to disable split copy tracking for K-shift\n", __func__);
-                return updated;
+                shift_backup_restore();
+                if (status == LLAMA_MEMORY_APPLY_APPLIED) {
+                    shift_failed = true;
+                }
+                return LLAMA_MEMORY_APPLY_FAILED;
             }
 
             auto * res = lctx->get_gf_res_reserve();
@@ -1688,17 +1725,21 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             auto * gf = build_graph_shift(res, lctx);
             if (!ggml_backend_sched_alloc_graph(sched, gf)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate compute graph for K-shift\n", __func__);
-                return updated;
+                shift_backup_restore();
+                if (status == LLAMA_MEMORY_APPLY_APPLIED) {
+                    shift_failed = true;
+                }
+                return LLAMA_MEMORY_APPLY_FAILED;
             }
 
             res->set_inputs(nullptr);
 
             if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
-                LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
-                return updated;
+                LLAMA_LOG_ERROR("%s: K-shift compute failed; KV state is invalid until clear(true)\n", __func__);
+                shift_backup_restore();
+                shift_failed = true;
+                return LLAMA_MEMORY_APPLY_FAILED;
             }
-
-            updated = true;
         }
 
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1706,9 +1747,34 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
             cells.reset_shift();
         }
+        shift_backup_clear();
+        status = LLAMA_MEMORY_APPLY_APPLIED;
+    } else {
+        shift_backup_clear();
     }
 
-    return updated;
+    return status;
+}
+
+void llama_kv_cache::shift_backup_save() {
+    if (shift_cells_backup.empty()) {
+        shift_cells_backup = v_cells;
+        shift_heads_backup = v_heads;
+    }
+}
+
+void llama_kv_cache::shift_backup_restore() {
+    if (shift_cells_backup.empty()) {
+        return;
+    }
+    v_cells = shift_cells_backup;
+    v_heads = shift_heads_backup;
+    shift_backup_clear();
+}
+
+void llama_kv_cache::shift_backup_clear() {
+    shift_cells_backup.clear();
+    shift_heads_backup.clear();
 }
 
 bool llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont, slot_info & out) const {
@@ -3789,6 +3855,9 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (shift_failed) {
+        throw std::runtime_error("KV state is invalid after a failed update; clear(true) is required");
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -3884,6 +3953,9 @@ void llama_kv_cache::state_read_sinfo(
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
 const slot_info_vec_t *   sinfos_in) {
+    if (shift_failed) {
+        throw std::runtime_error("KV state is invalid after a failed update; clear(true) is required");
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -3964,6 +4036,9 @@ const slot_info_vec_t *   sinfos_in) {
 }
 
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
+    if (shift_failed) {
+        throw std::runtime_error("KV state is invalid after a failed update; clear(true) is required");
+    }
     const auto & cells = v_cells[cr.strm];
 
     for (const auto & range : cr.data) {
@@ -4094,6 +4169,10 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 }
 
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+    if (shift_failed) {
+        LLAMA_LOG_ERROR("%s: refusing state read: KV state is invalid after a failed update; clear(true) is required\n", __func__);
+        return false;
+    }
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -4506,10 +4585,12 @@ bool llama_kv_cache_context::apply() {
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
-        kv->update(lctx, do_shift, sc_info);
+        update_status = kv->update(lctx, do_shift, sc_info);
 
-        return true;
+        return update_status != LLAMA_MEMORY_APPLY_FAILED;
     }
+
+    update_status = LLAMA_MEMORY_APPLY_APPLIED;
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);

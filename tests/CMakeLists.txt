@@ -644,6 +644,20 @@ if (UNIX)
     target_link_libraries(test-ntok-onegraph PRIVATE llama)
     set(LLAMA_NTOK_TEST_MODEL "" CACHE FILEPATH "Dense LLAMA GGUF for the variable-token test")
     set(LLAMA_NTOK_TEST_ROUNDS "50" CACHE STRING "Alternating-width test rounds")
+    # Narrow real-CPU status test for llama_kv_cache::update: NO_UPDATE,
+    # APPLIED K-shift, and a real K-shift graph-allocation failure that must
+    # return -3 and restore the pre-shift cells.
+    add_executable(test-kv-update-status test-kv-update-status.cpp)
+    target_link_libraries(test-kv-update-status PRIVATE llama)
+    target_include_directories(test-kv-update-status PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/include)
+    if (LLAMA_NTOK_TEST_MODEL)
+        add_test(NAME test-kv-update-status COMMAND $<TARGET_FILE:test-kv-update-status> "${LLAMA_NTOK_TEST_MODEL}")
+        set_property(TEST test-kv-update-status PROPERTY LABELS "main;cpu;tp5")
+        set_property(TEST test-kv-update-status PROPERTY PASS_REGULAR_EXPRESSION "KV_UPDATE_STATUS_TEST PASS")
+    endif()
     if (LLAMA_NTOK_TEST_MODEL)
         # The n_outputs probe sets both binder arms itself, so it needs no
         # environment and no extra switch: the same caller-supplied GGUF is the

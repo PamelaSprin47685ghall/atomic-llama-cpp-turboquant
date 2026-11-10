@@ -101,6 +101,40 @@ buffers. Slot count trades host/device memory for build reuse; the five-shape
 relay working set needs at least five slots to avoid LRU thrash. The flag is
 off by default, so the stock and relay-OFF legs keep the single scheduler.
 
+## KV update status
+
+`llama_memory_apply_status` (`src/llama-memory.h`) distinguishes
+`NO_UPDATE`, `APPLIED` and `FAILED`. `llama_kv_cache::update()` returns it;
+`llama_memory_context_i::apply()` keeps its bool contract (FAILED -> false)
+and exposes `get_update_status()` (default APPLIED, KV context override).
+
+- `NO_UPDATE`: no state change, no graph reserve (all-shared cache, no shift
+  and no stream copy).
+- `APPLIED`: stream copy and/or K-shift applied; `memory_update` may reserve.
+- `FAILED`: K-shift cannot run or setup/alloc/compute failed. Setup/alloc
+  restore the pre-shift cells; a compute failure also sets `shift_failed`
+  until `clear(true)`. `seq_add` checks `shift_failed`/`get_can_shift` and
+  saves a backup before mutating cells.
+
+`memory_update` maps `init_update` FAILED_PREPARE/FAILED_COMPUTE to -2 and an
+apply/update FAILED (including an unproven submission) to -3; `decode` checks
+`memory_update_failed` after `memory_update(false)`. Direct C++ callers of
+`memory_update` must check that flag instead of expecting an exception; the C
+API returns -3. `false` without the flag remains the normal NO_UPDATE no-op.
+`tests/test-kv-update-status.cpp` drives the real CPU context through
+NO_UPDATE, APPLIED K-shift and a controlled FAILED K-shift compute. The
+failure case uses a CPU backend wrapper that fails one `graph_compute`; decode
+returns -3, the cells are restored, nonempty and empty-stream state get/set are
+refused, and `clear(true)` recovers. `state_write` and `state_read_sinfo` guard
+`shift_failed` at their entry, so a `cell_count == 0` stream cannot bypass the
+meta guard. No production fault hook is added.
+
+The isolated branch reports 20 checks passing; the main tree did not rerun
+that test. The composite status keeps the known recurrent default: a recurrent
+sub-context defaults to APPLIED, so a mixed composite is APPLIED even when the
+KV sub-context reports NO_UPDATE; only an all-NO_UPDATE composite avoids the
+graph reserve.
+
 ## First catch-up output rows
 
 The relay constructor preallocates the host output buffer for

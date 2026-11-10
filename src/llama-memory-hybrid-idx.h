@@ -159,6 +159,13 @@ public:
 
     bool next()  override;
     bool apply() override;
+    llama_memory_apply_status get_update_status() const override {
+        auto st = llama_memory_hybrid_context::get_update_status();
+        if (ctx_idx) {
+            st = llama_memory_apply_status_combine(st, ctx_idx->get_update_status());
+        }
+        return st;
+    }
 
     //
     // llama_memory_hybrid_idx_context specific API

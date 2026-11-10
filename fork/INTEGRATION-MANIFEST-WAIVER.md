@@ -1050,6 +1050,38 @@ abort-word visibility and RMW concurrency remain unverified. t4 also records
 the pre-existing staging `submission_failed` gap in `llama_free`, which this
 net does not change.
 
+### E.12 K-shift FAILED/NO_UPDATE round 2026-11-10
+
+Integrate `3ac5c64d0` -> `b62af685b` -> `1b2139dad` -> `c22ca654e`. The
+target tree did not contain the prior `2c98090a` prerequisite; the four-commit
+`memory_update` changes were adapted to the target's pre-`2c98090a` body,
+including the status/failure flags and the `has_unproven` pre/post guards
+required by the four-commit diff. The separate `2c98090a` destructor
+null-scheduler guard is not part of this integration.
+
+`llama_memory_apply_status` distinguishes `NO_UPDATE`, `APPLIED` and `FAILED`.
+`llama_kv_cache::update()` returns it; `apply()` keeps bool and exposes
+`get_update_status()`. Setup/alloc failure restores the pre-shift cells; a
+compute failure sets `shift_failed` until `clear(true)`. `state_write` and
+`state_read_sinfo` guard `shift_failed` at their entry so an empty stream
+cannot bypass the meta guard. Composite status combines FAILED > APPLIED >
+NO_UPDATE.
+
+Known limitation: recurrent sub-contexts default to APPLIED, so a mixed
+composite is APPLIED even when the KV sub-context reports NO_UPDATE; only an
+all-NO_UPDATE composite avoids the graph reserve. This performance limitation
+is retained.
+
+The real CPU test `tests/test-kv-update-status.cpp` reports 20 checks passing
+on the isolated branch; it was not rerun in this main tree. No GPU, full suite
+or guard rerun.
+
+Manifest: `src/llama-kv-cache.cpp`, `src/llama-kv-cache.h`, `src/llama-memory.h`
+and `patches/ws5/README.md` matched their baseline digests and were reviewed;
+their hashes are updated, and `tests/test-kv-update-status.cpp` is added as a
+new entry. `src/llama-context.cpp`, `src/llama-context.h` and
+`tests/CMakeLists.txt` were already stale and remain unsigned red items.
+
 ## F. Why this does not block the integration
 
 - The guard is a manifest boundary check, not a compiler or runtime test. Its failure

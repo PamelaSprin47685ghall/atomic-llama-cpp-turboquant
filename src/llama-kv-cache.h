@@ -417,7 +417,10 @@ public:
     // take the vectors back into the scratch and mark it free again
     void scratch_return(slot_info_vec_t & sinfos, std::vector<llama_ubatch> & ubatches, decode_scratch * scratch);
 
-    bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
+    llama_memory_apply_status update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
+    void shift_backup_save();
+    void shift_backup_restore();
+    void shift_backup_clear();
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
@@ -737,6 +740,12 @@ private:
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
 
+    // K-shift failure/backup state. shift_failed is set only when a K-shift
+    // compute may have partially written K/V; clear(true) resets it.
+    std::vector<llama_kv_cells> shift_cells_backup;
+    std::vector<uint32_t>       shift_heads_backup;
+    bool                        shift_failed = false;
+
     std::shared_ptr<llama_kv_cells_vec> v_cells_impl;
 
     llama_kv_cells_vec & v_cells;
@@ -838,6 +847,7 @@ public:
 
     bool next()  override;
     bool apply() override;
+    llama_memory_apply_status get_update_status() const override { return update_status; }
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -1028,6 +1038,8 @@ private:
     bool do_shift = false;
 
     stream_copy_info sc_info;
+
+    llama_memory_apply_status update_status = LLAMA_MEMORY_APPLY_APPLIED;
 
     //
     // batch processing context

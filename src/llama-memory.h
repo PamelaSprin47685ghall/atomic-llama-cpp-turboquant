@@ -65,9 +65,31 @@ enum llama_memory_status {
     LLAMA_MEMORY_STATUS_FAILED_COMPUTE,
 };
 
+// Result of applying a memory update. Unlike a plain bool, this distinguishes
+// "nothing to do" from "applied successfully" and from a failure. It is
+// returned by llama_kv_cache::update and exposed by memory contexts through
+// get_update_status().
+enum llama_memory_apply_status : uint8_t {
+    LLAMA_MEMORY_APPLY_NO_UPDATE = 0,
+    LLAMA_MEMORY_APPLY_APPLIED,
+    LLAMA_MEMORY_APPLY_FAILED,
+};
+
 // helper function for combining the status of two memory contexts
 // useful for implementing hybrid memory types (e.g. iSWA)
 llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_memory_status s1);
+
+// combine two apply results: FAILED dominates, then APPLIED, else NO_UPDATE
+inline llama_memory_apply_status llama_memory_apply_status_combine(
+        llama_memory_apply_status s0, llama_memory_apply_status s1) {
+    if (s0 == LLAMA_MEMORY_APPLY_FAILED || s1 == LLAMA_MEMORY_APPLY_FAILED) {
+        return LLAMA_MEMORY_APPLY_FAILED;
+    }
+    if (s0 == LLAMA_MEMORY_APPLY_APPLIED || s1 == LLAMA_MEMORY_APPLY_APPLIED) {
+        return LLAMA_MEMORY_APPLY_APPLIED;
+    }
+    return LLAMA_MEMORY_APPLY_NO_UPDATE;
+}
 
 // helper function for checking if a memory status indicates a failure
 bool llama_memory_status_is_fail(llama_memory_status status);
@@ -89,6 +111,10 @@ struct llama_memory_context_i {
     // apply the memory state for the current ubatch to the memory object
     // return false on failure
     virtual bool apply() = 0;
+
+    // Detailed result of the last apply(). Defaults to APPLIED for contexts
+    // that do not distinguish no-update from applied; KV contexts override it.
+    virtual llama_memory_apply_status get_update_status() const { return LLAMA_MEMORY_APPLY_APPLIED; }
 
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;

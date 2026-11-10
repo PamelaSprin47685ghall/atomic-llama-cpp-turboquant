@@ -117,6 +117,9 @@ public:
 
     bool next()  override;
     bool apply() override;
+    llama_memory_apply_status get_update_status() const override {
+        return llama_memory_apply_status_combine(ctx_base->get_update_status(), ctx_idx->get_update_status());
+    }
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

@@ -2738,7 +2738,16 @@ enum ggml_type llama_context::get_kv_type_v() const {
 }
 
 bool llama_context::memory_update(bool optimize) {
+    memory_update_failed = false;
+    memory_update_error  = 0;
+
     if (!memory) {
+        return false;
+    }
+    if (has_unproven()) {
+        LLAMA_LOG_ERROR("%s: refusing memory update while an async submission is unproven\n", __func__);
+        memory_update_failed = true;
+        memory_update_error  = -3;
         return false;
     }
 
@@ -2759,6 +2768,8 @@ bool llama_context::memory_update(bool optimize) {
             case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
                 {
                     LLAMA_LOG_ERROR("%s: failed to prepare memory update\n", __func__);
+                    memory_update_failed = true;
+                    memory_update_error  = -2;
                     return false;
                 }
         }
@@ -2777,6 +2788,27 @@ bool llama_context::memory_update(bool optimize) {
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+            memory_update_failed = true;
+            memory_update_error  = -3;
+            return false;
+        }
+
+        const auto update_status = mctx->get_update_status();
+        if (update_status == LLAMA_MEMORY_APPLY_FAILED) {
+            LLAMA_LOG_ERROR("%s: memory update reported FAILED\n", __func__);
+            memory_update_failed = true;
+            memory_update_error  = -3;
+            return false;
+        }
+        if (update_status == LLAMA_MEMORY_APPLY_NO_UPDATE) {
+            // no state change; no graph reserve is needed
+            return false;
+        }
+        if (has_unproven()) {
+            LLAMA_LOG_ERROR("%s: memory update left an unproven submission\n", __func__);
+            memory_update_failed = true;
+            memory_update_error  = -3;
+            return false;
         }
     }
 
@@ -2784,7 +2816,10 @@ bool llama_context::memory_update(bool optimize) {
     {
         const auto mctx = memory->init_full();
         if (!mctx) {
-            throw std::runtime_error("failed to initialize memory context");
+            LLAMA_LOG_ERROR("%s: failed to initialize memory context for reserve\n", __func__);
+            memory_update_failed = true;
+            memory_update_error  = -2;
+            return false;
         }
 
         const uint32_t n_seqs   = n_seq_max_active();
@@ -7329,8 +7364,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     bool did_optimize = false;
 
-    // handle any pending shifts/copies
+    // handle any pending shifts/copies. false with memory_update_failed set
+    // is a real failure; false without it is the normal NO_UPDATE no-op.
     memory_update(false);
+    if (memory_update_failed) {
+        return memory_update_error;
+    }
 
     llama_memory_context_ptr mctx;
 
@@ -7361,6 +7400,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                                             balloc->get_n_tokens());
 
                             continue;
+                        }
+                        if (memory_update_failed) {
+                            return memory_update_error;
                         }
                     }
 
