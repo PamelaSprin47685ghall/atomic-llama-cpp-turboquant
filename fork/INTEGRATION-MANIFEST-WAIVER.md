@@ -1280,11 +1280,14 @@ snapshot pools/fallback slots and shift backup are counted once, the flat
 trial index is counted from the scratch blocks, and scratch control vectors
 are separate. Main resident `v_cells` metadata is not included in this
 journal/prepare account. These are payload capacities, not allocator
-bookkeeping.
+bookkeeping. hybrid/hybrid-iswa/hybrid-idx aggregate their KV sub-caches;
+dsa/msa/dsv4 aggregate their KV members; recurrent contributes zero.
 
 `shift_backup_restore()` now swaps cell payloads in place instead of swapping
 the `v_cells` vector, so `get_cells()` references and the cell objects keep
-their addresses. The shift-backup test checks the address and restored state.
+their addresses. `get_cells()` has no production caller that holds a
+reference across restore; the test access path checks the address and the
+restored state explicitly.
 
 Manifest: `src/llama-kv-cache.cpp`, `src/llama-kv-cache.h`,
 `src/llama-kv-cells.h` and `tests/test-tp5-ubatch-pool.cpp` were updated to

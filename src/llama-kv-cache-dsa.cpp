@@ -103,6 +103,16 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsa::memory_breakdow
     return mb;
 }
 
+llama_host_memory_breakdown_data llama_kv_cache_dsa::host_memory_breakdown() const {
+    llama_host_memory_breakdown_data res = kv_mla->host_memory_breakdown();
+    const auto lid = kv_lid->host_memory_breakdown();
+    res.journal     += lid.journal;
+    res.trial_index += lid.trial_index;
+    res.snapshots   += lid.snapshots;
+    res.scratch     += lid.scratch;
+    return res;
+}
+
 llama_memory_context_ptr llama_kv_cache_dsa::init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,

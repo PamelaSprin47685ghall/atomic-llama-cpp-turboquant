@@ -1554,6 +1554,18 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
     return mb;
 }
 
+llama_host_memory_breakdown_data llama_kv_cache_dsv4::host_memory_breakdown() const {
+    llama_host_memory_breakdown_data res = kv_raw->host_memory_breakdown();
+    for (const auto * kv : { kv_csa.get(), kv_hca.get(), kv_lid.get() }) {
+        const auto part = kv->host_memory_breakdown();
+        res.journal     += part.journal;
+        res.trial_index += part.trial_index;
+        res.snapshots   += part.snapshots;
+        res.scratch     += part.scratch;
+    }
+    return res;
+}
+
 void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
 
