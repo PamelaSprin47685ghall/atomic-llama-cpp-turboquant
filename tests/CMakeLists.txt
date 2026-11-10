@@ -1,3 +1,5 @@
+find_package(Threads REQUIRED)
+
 llama_add_compile_flags()
 
 function(llama_build source)

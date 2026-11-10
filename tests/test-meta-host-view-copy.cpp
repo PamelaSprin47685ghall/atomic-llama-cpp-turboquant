@@ -67,6 +67,19 @@ ggml_backend_meta_split_state split_segmented(const ggml_tensor * t, void *) {
     return s;
 }
 
+// Same expanded owner sequence as split_segmented, expressed as one segment
+// repeated twice: child0/child1/child0/child1.
+ggml_backend_meta_split_state split_segmented_repeat(const ggml_tensor * t, void *) {
+    ggml_backend_meta_split_state s = {};
+    s.axis = GGML_BACKEND_SPLIT_AXIS_0;
+    s.n_segments = 1;
+    s.nr[0] = 2;
+    const int64_t n = t->ne[0];
+    s.ne[0] = n / 4;
+    s.ne[1] = n / 4;
+    return s;
+}
+
 ggml_backend_meta_split_state split_repeated(const ggml_tensor * t, void *) {
     ggml_backend_meta_split_state s = {};
     s.axis = GGML_BACKEND_SPLIT_AXIS_0;
@@ -396,6 +409,134 @@ void test_repeated_view(ggml_backend_dev_t cpu) {
     CHECK(all_value(got, -1.0f, 36, 64));
 }
 
+// The parent split state describes one base period while the tensor holds
+// two: a whole-period view keeps the base pattern with an internal group
+// count, and a prefix partial view stays inside the first period.
+static void test_parent_periods_group(ggml_backend_dev_t cpu) {
+    meta_fixture m;
+    CHECK(m.init(cpu, split_half));
+    if (m.buf == nullptr) {
+        return;
+    }
+    ggml_tensor * whole = ggml_view_1d(m.ctx, m.root, 64, 0);
+    CHECK(whole != nullptr);
+    CHECK(ggml_backend_view_init(whole) == GGML_STATUS_SUCCESS);
+    std::vector<float> src(64), got(64, 0.0f);
+    fill_sequence(src, 7000.0f);
+    ggml_backend_tensor_set(whole, src.data(), 0, src.size() * sizeof(float));
+    ggml_backend_tensor_get(m.root, got.data(), 0, got.size() * sizeof(float));
+    CHECK(all_equal(got, src, 0, src.size()));
+
+    ggml_tensor * part = ggml_view_1d(m.ctx, m.root, 16, 8 * sizeof(float));
+    CHECK(part != nullptr);
+    CHECK(ggml_backend_view_init(part) == GGML_STATUS_SUCCESS);
+    std::vector<float> psrc(16), pgot(16, 0.0f);
+    fill_sequence(psrc, 9000.0f);
+    ggml_backend_tensor_set(part, psrc.data(), 0, psrc.size() * sizeof(float));
+    ggml_backend_tensor_get(part, pgot.data(), 0, pgot.size() * sizeof(float));
+    CHECK(all_equal(pgot, psrc, 0, psrc.size()));
+    ggml_backend_tensor_get(m.root, got.data(), 0, got.size() * sizeof(float));
+    CHECK(range_equal(got, 8, psrc, 0, psrc.size()));
+}
+
+// REPEAT tiles the whole source owner sequence. With split_segmented the
+// source sequence is child0/child1/child0/child1; repeating to twice the
+// extent must keep that order twice, not stretch each segment.
+static void test_repeat_tiling(ggml_backend_dev_t cpu) {
+    meta_fixture m;
+    CHECK(m.init(cpu, split_segmented));
+    if (m.buf == nullptr) {
+        return;
+    }
+    const ggml_init_params rep_params = { 1u << 20, nullptr, true };
+    ggml_context * rep_ctx = ggml_init(rep_params);
+    CHECK(rep_ctx != nullptr);
+    ggml_tensor * shape = ggml_new_tensor_1d(rep_ctx, GGML_TYPE_F32, 128);
+    CHECK(shape != nullptr);
+    ggml_tensor * rep = ggml_repeat(rep_ctx, m.root, shape);
+    CHECK(rep != nullptr);
+    rep->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    ggml_backend_buffer_t rep_buf = ggml_backend_alloc_ctx_tensors_from_buft(rep_ctx, m.buft);
+    CHECK(rep_buf != nullptr);
+
+    ggml_backend_t backend = ggml_backend_dev_init(m.dev, nullptr);
+    CHECK(backend != nullptr);
+    ggml_cgraph * graph = ggml_new_graph(m.ctx);
+    CHECK(graph != nullptr);
+    ggml_build_forward_expand(graph, rep);
+    std::vector<float> src(64);
+    fill_sequence(src, 100.0f);
+    ggml_backend_tensor_set(m.root, src.data(), 0, src.size() * sizeof(float));
+    CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> got(128, 0.0f);
+    ggml_backend_tensor_get(rep, got.data(), 0, got.size() * sizeof(float));
+    for (size_t i = 0; i < got.size(); ++i) {
+        CHECK(got[i] == src[i % src.size()]);
+    }
+    ggml_backend_free(backend);
+    ggml_backend_buffer_free(rep_buf);
+    ggml_free(rep_ctx);
+}
+
+// ADD of two sources: equivalent expanded owner sequences with a different
+// segment/nr spelling must compute; truly different owner mappings must fail
+// closed without aborting.
+static void test_different_owner_add(ggml_backend_dev_t cpu) {
+    {
+        meta_fixture a;
+        meta_fixture b;
+        CHECK(a.init(cpu, split_segmented_repeat));
+        CHECK(b.init(cpu, split_segmented));
+        if (a.buf == nullptr || b.buf == nullptr) {
+            return;
+        }
+        const ggml_init_params add_params = { 1u << 20, nullptr, true };
+        ggml_context * add_ctx = ggml_init(add_params);
+        CHECK(add_ctx != nullptr);
+        ggml_tensor * add = ggml_add(add_ctx, a.root, b.root);
+        CHECK(add != nullptr);
+        add->flags |= GGML_TENSOR_FLAG_COMPUTE;
+        ggml_backend_buffer_t add_buf = ggml_backend_alloc_ctx_tensors_from_buft(add_ctx, a.buft);
+        CHECK(add_buf != nullptr);
+        std::vector<float> av(64), bv(64);
+        fill_sequence(av, 100.0f);
+        fill_sequence(bv, 1000.0f);
+        ggml_backend_tensor_set(a.root, av.data(), 0, av.size() * sizeof(float));
+        ggml_backend_tensor_set(b.root, bv.data(), 0, bv.size() * sizeof(float));
+        ggml_backend_t backend = ggml_backend_dev_init(a.dev, nullptr);
+        CHECK(backend != nullptr);
+        ggml_cgraph * graph = ggml_new_graph(add_ctx);
+        CHECK(graph != nullptr);
+        ggml_build_forward_expand(graph, add);
+        CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        std::vector<float> got(64, 0.0f);
+        ggml_backend_tensor_get(add, got.data(), 0, got.size() * sizeof(float));
+        for (size_t i = 0; i < got.size(); ++i) {
+            CHECK(got[i] == av[i] + bv[i]);
+        }
+        ggml_backend_free(backend);
+        ggml_backend_buffer_free(add_buf);
+        ggml_free(add_ctx);
+    }
+    {
+        meta_fixture a;
+        meta_fixture b;
+        CHECK(a.init(cpu, split_half));
+        CHECK(b.init(cpu, split_segmented));
+        if (a.buf == nullptr || b.buf == nullptr) {
+            return;
+        }
+        const ggml_init_params add_params = { 1u << 20, nullptr, true };
+        ggml_context * add_ctx = ggml_init(add_params);
+        CHECK(add_ctx != nullptr);
+        ggml_tensor * add = ggml_add(add_ctx, a.root, b.root);
+        CHECK(add != nullptr);
+        CHECK(ggml_backend_tensor_alloc(a.buf, add,
+                (char *) ggml_backend_buffer_get_base(a.buf)) == GGML_STATUS_FAILED);
+        ggml_free(add_ctx);
+    }
+}
+
 void test_q8_view(ggml_backend_dev_t cpu) {
     meta_fixture m;
     host_fixture h;
@@ -508,6 +649,12 @@ int main() {
     test_segmented_view(cpu);
     std::fprintf(stderr, "test_repeated_view\n");
     test_repeated_view(cpu);
+    std::fprintf(stderr, "test_parent_periods_group\n");
+    test_parent_periods_group(cpu);
+    std::fprintf(stderr, "test_repeat_tiling\n");
+    test_repeat_tiling(cpu);
+    std::fprintf(stderr, "test_different_owner_add\n");
+    test_different_owner_add(cpu);
     std::fprintf(stderr, "test_q8_view\n");
     test_q8_view(cpu);
     std::fprintf(stderr, "test_noncontiguous_unaligned\n");
