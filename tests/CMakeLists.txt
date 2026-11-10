@@ -637,7 +637,8 @@ add_executable(test-tp5-relay-free-decision test-tp5-relay-free-decision.cpp)
 target_compile_features(test-tp5-relay-free-decision PRIVATE cxx_std_17)
 target_include_directories(test-tp5-relay-free-decision PRIVATE
     ${PROJECT_SOURCE_DIR}/src
-    ${PROJECT_SOURCE_DIR}/ggml/include)
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/ggml/src)
 add_test(NAME test-tp5-relay-free-decision COMMAND test-tp5-relay-free-decision)
 set_property(TEST test-tp5-relay-free-decision PROPERTY LABELS "cpu;tp5")
 set_property(TEST test-tp5-relay-free-decision PROPERTY PASS_REGULAR_EXPRESSION "RELAY_FREE_DECISION_TEST PASS")

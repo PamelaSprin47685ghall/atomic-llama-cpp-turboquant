@@ -4,6 +4,7 @@
 #include "ggml-cuda.h"
 #include "ggml-relay-plan.h"
 #include "ggml-relay-verify.h"
+#include "ggml-relay-token-guard.h"
 #include "relay.cuh"
 
 #include <algorithm>
@@ -1629,7 +1630,7 @@ bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, 
     if (!idle(p)) {
         return false; // Busy is transient; the caller may retry after draining.
     }
-    if (!p.token_tails.empty() || !p.token_state.empty()) {
+    if (relay_token_blocks_new_epoch(p.token_tails.size(), p.token_state.size())) {
         reject_local("relay prepare requires every completion token released");
         return false;
     }
@@ -1777,7 +1778,7 @@ bool begin(provider & p) {
     // A token record owns the lane tail event handles. Re-recording those
     // events for a new epoch would silently retarget wait_token, so every
     // token must be released before the next prepare/begin.
-    if (!p.token_tails.empty() || !p.token_state.empty()) {
+    if (relay_token_blocks_new_epoch(p.token_tails.size(), p.token_state.size())) {
         reject_local("relay begin requires every completion token released");
         return false;
     }

@@ -17,11 +17,19 @@ struct llama_relay_free_facts {
     // 1: cpu filled, 0: contended, -1: unsupported (private provider ABI < 5).
     int                  cpu_result = -1;
     ggml_relay_cpu_status cpu        = {};
+    // llama_context::has_unproven(): a scheduler/prefab attempt may still own
+    // child buffers. It retains the whole context even when the relay is clean.
+    bool has_unproven = false;
 };
 
 struct llama_relay_free_decision {
-    bool         retain = false;
-    const char * reason = "an async/native submission is still unproven";
+    // Retain the whole context and call retain_for_process().
+    bool retain = false;
+    // Abort the relay provider before retaining. Set only when the relay
+    // itself is unproven; a scheduler-only retain must not poison a clean
+    // relay provider.
+    bool         abort_relay = false;
+    const char * reason      = "an async/native submission is still unproven";
 };
 
 inline llama_relay_free_decision llama_relay_free_decide(const llama_relay_free_facts & facts) {
@@ -50,21 +58,25 @@ inline llama_relay_free_decision llama_relay_free_decide(const llama_relay_free_
         cpu_unproven = true;
     }
 
+    bool relay_retain = false;
     if (borrow_outstanding) {
-        decision.retain = true;
+        relay_retain = true;
         decision.reason = "a relay CPU borrow is still outstanding";
     } else if (tokens_outstanding) {
-        decision.retain = true;
+        relay_retain = true;
         decision.reason = "relay completion tokens are still outstanding";
     } else if (releases_outstanding) {
-        decision.retain = true;
+        relay_retain = true;
         decision.reason = "relay output releases are still outstanding";
     } else if (cpu_unproven) {
-        decision.retain = true;
+        relay_retain = true;
         decision.reason = "relay CPU state could not be proven";
     } else if (!facts.have_snapshot ||
                (facts.status_epoch != 0 && !facts.status_finished)) {
-        decision.retain = true;
+        relay_retain = true;
     }
+
+    decision.abort_relay = relay_retain;
+    decision.retain      = relay_retain || facts.has_unproven;
     return decision;
 }

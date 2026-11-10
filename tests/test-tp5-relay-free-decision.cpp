@@ -5,6 +5,7 @@
 // queries themselves are covered by the opt-in five-GPU relay test.
 
 #include "llama-relay-free.h"
+#include "ggml-relay-token-guard.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -46,6 +47,7 @@ llama_relay_free_facts settled() {
 void test_settled() {
     const auto decision = llama_relay_free_decide(settled());
     CHECK(!decision.retain);
+    CHECK(!decision.abort_relay);
 }
 
 void test_epoch_zero() {
@@ -57,6 +59,7 @@ void test_epoch_zero() {
     facts.cpu.outputs_released = 0;
     const auto decision = llama_relay_free_decide(facts);
     CHECK(!decision.retain);
+    CHECK(!decision.abort_relay);
 }
 
 void test_prepare_window() {
@@ -71,6 +74,7 @@ void test_prepare_window() {
     facts.cpu.outputs_released = 4;
     const auto decision = llama_relay_free_decide(facts);
     CHECK(!decision.retain);
+    CHECK(!decision.abort_relay);
 }
 
 void test_prepare_window_after_epoch() {
@@ -84,6 +88,7 @@ void test_prepare_window_after_epoch() {
     facts.cpu.outputs_released = 5;
     const auto decision = llama_relay_free_decide(facts);
     CHECK(!decision.retain);
+    CHECK(!decision.abort_relay);
 }
 
 void test_borrow() {
@@ -91,6 +96,7 @@ void test_borrow() {
     facts.cpu.borrowed_channel = 1;
     const auto decision = llama_relay_free_decide(facts);
     CHECK(decision.retain);
+    CHECK(decision.abort_relay);
     CHECK(std::strcmp(decision.reason, "a relay CPU borrow is still outstanding") == 0);
 }
 
@@ -99,6 +105,7 @@ void test_active_token() {
     facts.cpu.active_token = 7;
     const auto decision = llama_relay_free_decide(facts);
     CHECK(decision.retain);
+    CHECK(decision.abort_relay);
     CHECK(std::strcmp(decision.reason, "relay completion tokens are still outstanding") == 0);
 }
 
@@ -108,6 +115,7 @@ void test_settled_token_not_released() {
     facts.cpu.tokens_outstanding = 1;
     const auto decision = llama_relay_free_decide(facts);
     CHECK(decision.retain);
+    CHECK(decision.abort_relay);
     CHECK(std::strcmp(decision.reason, "relay completion tokens are still outstanding") == 0);
 }
 
@@ -116,6 +124,7 @@ void test_releases_outstanding() {
     facts.cpu.outputs_released = 3;
     const auto decision = llama_relay_free_decide(facts);
     CHECK(decision.retain);
+    CHECK(decision.abort_relay);
     CHECK(std::strcmp(decision.reason, "relay output releases are still outstanding") == 0);
 }
 
@@ -125,6 +134,7 @@ void test_failed_provider_skips_releases() {
     facts.cpu.outputs_released = 3;
     const auto decision = llama_relay_free_decide(facts);
     CHECK(!decision.retain);
+    CHECK(!decision.abort_relay);
 }
 
 void test_contended() {
@@ -132,6 +142,7 @@ void test_contended() {
     facts.cpu_result = 0;
     const auto decision = llama_relay_free_decide(facts);
     CHECK(decision.retain);
+    CHECK(decision.abort_relay);
     CHECK(std::strcmp(decision.reason, "relay CPU state could not be proven") == 0);
 }
 
@@ -141,6 +152,7 @@ void test_unsupported_falls_back() {
     facts.cpu = {};
     const auto decision = llama_relay_free_decide(facts);
     CHECK(!decision.retain);
+    CHECK(!decision.abort_relay);
 }
 
 void test_epoch_mismatch() {
@@ -148,6 +160,7 @@ void test_epoch_mismatch() {
     facts.cpu.epoch = 3;
     const auto decision = llama_relay_free_decide(facts);
     CHECK(decision.retain);
+    CHECK(decision.abort_relay);
     CHECK(std::strcmp(decision.reason, "relay CPU state could not be proven") == 0);
 }
 
@@ -156,6 +169,7 @@ void test_channels_mismatch() {
     facts.cpu.channels = 5;
     const auto decision = llama_relay_free_decide(facts);
     CHECK(decision.retain);
+    CHECK(decision.abort_relay);
     CHECK(std::strcmp(decision.reason, "relay CPU state could not be proven") == 0);
 }
 
@@ -164,6 +178,7 @@ void test_unfinished_epoch() {
     facts.status_finished = false;
     const auto decision = llama_relay_free_decide(facts);
     CHECK(decision.retain);
+    CHECK(decision.abort_relay);
     CHECK(std::strcmp(decision.reason, "an async/native submission is still unproven") == 0);
 }
 
@@ -173,6 +188,7 @@ void test_borrow_precedes_unfinished() {
     facts.cpu.borrowed_channel = 2;
     const auto decision = llama_relay_free_decide(facts);
     CHECK(decision.retain);
+    CHECK(decision.abort_relay);
     CHECK(std::strcmp(decision.reason, "a relay CPU borrow is still outstanding") == 0);
 }
 
@@ -183,7 +199,55 @@ void test_no_snapshot() {
     facts.cpu = {};
     const auto decision = llama_relay_free_decide(facts);
     CHECK(decision.retain);
+    CHECK(decision.abort_relay);
     CHECK(std::strcmp(decision.reason, "an async/native submission is still unproven") == 0);
+}
+
+void test_has_unproven_only() {
+    auto facts = settled();
+    facts.has_unproven = true;
+    const auto decision = llama_relay_free_decide(facts);
+    CHECK(decision.retain);
+    CHECK(!decision.abort_relay);
+    CHECK(std::strcmp(decision.reason, "an async/native submission is still unproven") == 0);
+}
+
+void test_has_unproven_and_borrow() {
+    auto facts = settled();
+    facts.has_unproven = true;
+    facts.cpu.borrowed_channel = 3;
+    const auto decision = llama_relay_free_decide(facts);
+    CHECK(decision.retain);
+    CHECK(decision.abort_relay);
+    CHECK(std::strcmp(decision.reason, "a relay CPU borrow is still outstanding") == 0);
+}
+
+void test_token_order_contract() {
+    // The provider's prepare/begin gate blocks on either map. A token record
+    // is created by begin, remains after wait settles it, and is retired only
+    // by release. A second release is a no-op; wait after release is UNKNOWN.
+    CHECK(!relay_token_blocks_new_epoch(0, 0));
+    CHECK(relay_token_blocks_new_epoch(1, 0));
+    CHECK(relay_token_blocks_new_epoch(0, 1));
+    CHECK(relay_token_blocks_new_epoch(1, 1));
+    CHECK(relay_token_release_is_noop(0));
+    CHECK(!relay_token_release_is_noop(1));
+    CHECK(relay_token_wait_after_release_is_unknown(0));
+    CHECK(!relay_token_wait_after_release_is_unknown(1));
+
+    size_t tails = 0;
+    size_t states = 0;
+    auto begin_allowed = [&]() { return !relay_token_blocks_new_epoch(tails, states); };
+    CHECK(begin_allowed());
+    tails = 1; states = 1; // begin created the token record
+    CHECK(!begin_allowed());
+    // wait_token settles success/failure but does not retire the record.
+    CHECK(!begin_allowed());
+    tails = 0; states = 0; // release_token
+    CHECK(begin_allowed());
+    tails = 0; states = 0; // second release is idempotent
+    CHECK(begin_allowed());
+    CHECK(relay_token_wait_after_release_is_unknown(states));
 }
 
 } // namespace
@@ -205,6 +269,9 @@ int main() {
     test_unfinished_epoch();
     test_borrow_precedes_unfinished();
     test_no_snapshot();
+    test_has_unproven_only();
+    test_has_unproven_and_borrow();
+    test_token_order_contract();
 
     if (failures != 0) {
         std::fprintf(stderr, "RELAY_FREE_DECISION_TEST FAIL (%d failures / %d checks)\n", failures, checks);

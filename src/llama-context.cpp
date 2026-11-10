@@ -10129,17 +10129,21 @@ void llama_free(llama_context * ctx) {
         facts.status_channels = status.channels;
         facts.cpu_result      = cpu_result;
         facts.cpu             = cpu;
+        // Query the schedulers after the relay retries: this is the latest
+        // state the retain decision can use.
+        facts.has_unproven    = ctx->has_unproven();
         const llama_relay_free_decision decision = llama_relay_free_decide(facts);
+        if (decision.abort_relay) {
+            ggml_backend_relay_abort(backend, GGML_STATUS_ABORTED);
+        }
         if (decision.retain) {
             retain_reason = decision.reason;
-            ggml_backend_relay_abort(backend, GGML_STATUS_ABORTED);
             // Scheduler buffers and memory are also native readers' owners.
             // Do not enter an unbounded synchronize or release them on failure.
             retain = true;
         }
-    }
-    if (ctx->has_unproven()) {
-        retain = true;
+    } else {
+        retain = ctx->has_unproven();
     }
     if (retain) {
         // Retain the whole context: every member (memory, arena, balloc,

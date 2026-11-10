@@ -469,8 +469,10 @@ its Meta completion/receipt consumer lives on the KV receipt branch; this tree
 does not claim that production wiring is complete. The CPU-only
 `test-tp5-relay-free-decision` covers the pure retain
 decision itself: epoch 0 and the prepare window, borrow, tokens, releases, the
-failed-provider exemption, contention, unsupported ABI fallback, and
-epoch/channel mismatches.
+failed-provider exemption, contention, unsupported ABI fallback,
+epoch/channel mismatches, the scheduler-only retain vs relay-abort split, and
+the token release/prepare/begin ordering contract. The provider's prepare and
+begin share the token-guard predicate with that test.
 
 The scheduler test covers: success, rejected, fatal (no replay), a pending
 state without a local failure, and pending published by an accepted copy with
