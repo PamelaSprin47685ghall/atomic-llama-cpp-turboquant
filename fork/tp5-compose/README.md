@@ -655,6 +655,13 @@ the real call and adds no production hook or ABI. Every failure must report
 normal path skips injection and still passes. The contract is documented in
 `include/llama.h`.
 
+`mtp_batch_pool::stats()` reports the same reuse without the probe log:
+`pooled_leases`, `fallback_leases`, `slot_inits` and `exhausted`. A run that
+keeps the pool enabled must show `fallback_leases == 0` and
+`slot_inits <= slots`; a nonzero `exhausted` means the slot count is below the
+worker's concurrent lease depth. The destructor asserts that no lease is live,
+because a lease that outlives the pool would write into freed batch storage.
+
 ## MTP target state checkpoint (2026-11-09)
 
 The non-native-trim MTP verify path (`GGML_TP5_MTP_RS_RING=0`,

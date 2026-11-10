@@ -132,6 +132,12 @@ static void test_pooled_lease() {
     }
 
     check(true, "pooled: three sequential leases completed");
+
+    const auto stats = pool.stats();
+    check(stats.pooled_leases == 3, "pooled: three pooled leases counted");
+    check(stats.fallback_leases == 0, "pooled: no heap fallback");
+    check(stats.slot_inits == 1, "pooled: the first slot is initialised once");
+    check(stats.exhausted == 0, "pooled: no exhaustion");
 }
 
 static void test_fallback_lease() {
@@ -164,6 +170,11 @@ static void test_fallback_lease() {
         check(std::memcmp(lease.batch().embd, embd2, sizeof(embd2)) == 0,
               "fallback: second lease copies its own embedding");
     }
+
+    const auto stats = pool.stats();
+    check(stats.pooled_leases == 0, "fallback: no pooled lease");
+    check(stats.fallback_leases == 2, "fallback: two heap leases counted");
+    check(stats.slot_inits == 0, "fallback: no slot is initialised");
 }
 
 static void test_exhaustion_falls_back() {
@@ -185,6 +196,11 @@ static void test_exhaustion_falls_back() {
     }
 
     check(first.batch().token[0] == 1, "exhaustion: first lease untouched");
+
+    const auto stats = pool.stats();
+    check(stats.pooled_leases == 1, "exhaustion: one pooled lease");
+    check(stats.exhausted == 1, "exhaustion: the second acquire found no slot");
+    check(stats.fallback_leases == 1, "exhaustion: the second lease owns a heap batch");
 }
 
 static void test_events() {
@@ -274,6 +290,12 @@ static void test_steady_state() {
 
     const std::size_t after = mallinfo2().uordblks;
     check(before == after, "steady: 10k MTP leases, no heap growth");
+
+    const auto stats = pool.stats();
+    check(stats.pooled_leases == 10001, "steady: every lease borrowed the warmed slot");
+    check(stats.fallback_leases == 0, "steady: no heap fallback");
+    check(stats.exhausted == 0, "steady: no exhaustion");
+    check(stats.slot_inits == 1, "steady: one slot init for 10k leases");
 
     set_flag("TP5_MTP_BATCH_POOL", nullptr);
 #else

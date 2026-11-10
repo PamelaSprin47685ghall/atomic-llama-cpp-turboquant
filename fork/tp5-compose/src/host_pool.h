@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -66,6 +67,16 @@ public:
     // Bound the optional probe log. Steady state would otherwise append two
     // records per token.
     static constexpr std::size_t max_events = 4096;
+
+    // Steady-state reuse counters. The probe log records individual events
+    // only while TP5_ALLOC_PROBE is on; these counters are always live, so a
+    // run can report its reuse rate without paying for a 4096-record log.
+    struct stats_t {
+        std::uint64_t pooled_leases   = 0; // leases that borrowed a slot
+        std::uint64_t fallback_leases = 0; // leases that owned a heap batch
+        std::uint64_t slot_inits      = 0; // lazy llama_batch_init calls
+        std::uint64_t exhausted       = 0; // enabled acquires that found no free slot
+    };
 
     // A one-token batch. A pooled lease borrows a pool slot. A fallback lease
     // owns a heap batch. Both release their batch when the lease dies.
@@ -180,6 +191,11 @@ public:
 
     ~mtp_batch_pool() {
         for (slot & s : slots_) {
+            // A lease that outlives the pool would write n_tokens into freed
+            // batch storage. The contract says the pool outlives every lease;
+            // assert it here so a future owner-ordering bug fails at the
+            // destruction that broke the contract, not in a later destructor.
+            assert(!s.in_use);
             if (!s.ready) {
                 continue;
             }
@@ -217,18 +233,23 @@ public:
                     batch.token = &s.token;
                     s.batch = batch;
                     s.ready = true;
+                    ++stats_.slot_inits;
                 }
                 s.in_use = true;
                 ++s.gen;
+                ++stats_.pooled_leases;
                 record(static_cast<std::uint32_t>(i), s.gen, tq::alloc::LeaseAction::lease,
                        tq::alloc::State::free, tq::alloc::State::leased);
                 return lease(this, s, static_cast<std::uint32_t>(i));
             }
+            ++stats_.exhausted;
         }
+        ++stats_.fallback_leases;
         return lease(this);
     }
 
     const std::vector<tq::alloc::LeaseEvent> & events() const { return events_; }
+    stats_t stats() const { return stats_; }
 
 private:
     void release(std::uint32_t index, std::uint64_t gen) {
@@ -264,6 +285,7 @@ private:
     bool enabled_ = false;
     std::uint64_t event_seq_ = 0;
     std::vector<tq::alloc::LeaseEvent> events_;
+    stats_t stats_;
 };
 
 // A reusable buffer for one token piece. The view points into the buffer and
