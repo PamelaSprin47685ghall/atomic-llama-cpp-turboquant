@@ -571,7 +571,7 @@
     },
     {
       "path": "ggml/src/ggml-backend-meta.cpp",
-      "sha256": "fda5346bafc4dc6cdce882384a87f013226b59476438cd305b008f7eb1d1d8e8",
+      "sha256": "2ba8f944c55798e9857224454d220aaac2d3b51eddbdfc4deb607a9609205cde",
       "mode": "100644",
       "consumers": [
         "public meta backend tensor transfers",
@@ -632,7 +632,7 @@
     },
     {
       "path": "ggml/src/ggml-backend.cpp",
-      "sha256": "02e2084930c8b7a79a64dc88c2f6c55baba6e5d499721863a787d86387e2d95b",
+      "sha256": "758734ab321eee01ac4e3aba5b21ee333dc731e17909dd0a5d9454f02a4d1129",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -3591,7 +3591,7 @@
     },
     {
       "path": "tests/test-tp5-staging-sync-src.cpp",
-      "sha256": "df8a0db00b2de6958579b20e06297c0762dff859ebac9d8dfd25b39901e795b3",
+      "sha256": "dcff94e45f52186f63c78c66cc97d4d999d15160852cd16b89c3fc2453dc30ad",
       "mode": "100644",
       "consumers": [
         "TP5 staging/CPU tests",

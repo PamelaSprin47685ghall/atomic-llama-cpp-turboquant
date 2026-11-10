@@ -5156,6 +5156,25 @@ struct ggml_backend_meta_context {
     }
 };
 
+static ggml_backend_reg_t provider_reg_for_meta_device(ggml_backend_dev_t meta_dev) {
+    if (meta_dev == nullptr || !ggml_backend_dev_is_meta(meta_dev)) {
+        return nullptr;
+    }
+    const auto * meta_ctx = static_cast<const ggml_backend_meta_device_context *>(meta_dev->context);
+    if (meta_ctx == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = nullptr;
+    for (ggml_backend_dev_t dev : meta_ctx->simple_devs) {
+        ggml_backend_reg_t child_reg = ggml_backend_dev_backend_reg(dev);
+        if (child_reg == nullptr || (reg != nullptr && reg != child_reg)) {
+            return nullptr;
+        }
+        reg = child_reg;
+    }
+    return reg;
+}
+
 static ggml_backend_reg_t provider_reg_for_backend(ggml_backend_t backend) {
     if (backend == nullptr) {
         return nullptr;
@@ -5170,6 +5189,25 @@ static ggml_backend_reg_t provider_reg_for_backend(ggml_backend_t backend) {
 extern "C" ggml_backend_reg_t ggml_backend_meta_staging_provider_reg_for_backend(
         ggml_backend_t backend) {
     return provider_reg_for_backend(backend);
+}
+
+extern "C" ggml_backend_reg_t ggml_backend_meta_staging_provider_reg_for_device(
+        ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    if (ggml_backend_dev_is_meta(dev)) {
+        return provider_reg_for_meta_device(dev);
+    }
+    return ggml_backend_dev_backend_reg(dev);
+}
+
+extern "C" bool ggml_backend_meta_staging_owner_acquire_for_device(
+        ggml_backend_dev_t dev, uint64_t run_id, uint32_t window_id,
+        uint64_t * owner, uint64_t * generation) {
+    return ggml_backend_meta_staging_owner_acquire_for_reg(
+        ggml_backend_meta_staging_provider_reg_for_device(dev),
+        run_id, window_id, owner, generation);
 }
 
 extern "C" ggml_backend_reg_t ggml_backend_meta_staging_owner_provider_reg(
