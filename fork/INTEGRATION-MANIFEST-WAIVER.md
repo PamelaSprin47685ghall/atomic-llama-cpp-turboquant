@@ -1342,6 +1342,12 @@ fill path, not a general throughput result. The old arm cannot record the
 262145th entry, so that record boundary is not a paired same-workload
 comparison. No GPU, model tok/s, or significant-gain claim.
 
+Combined main-tree CPU check: a fresh CPU-only build in
+`/tmp/tmp.sguI26rjTw` built once; `test-kv-cells-pos-lookup` and
+`test-tp5-ubatch-pool` each ran once and passed. No real model or GPU was
+used. The four uncommitted staging files were not exercised; their runtime
+behavior remains unverified.
+
 Manifest: `src/llama-kv-cache.cpp`, `src/llama-kv-cache.h`,
 `src/llama-kv-cells.h` and `tests/test-tp5-ubatch-pool.cpp` were updated to
 their actual post-integration hashes. `tests/test-kv-cells-journal-ownership.cpp`
