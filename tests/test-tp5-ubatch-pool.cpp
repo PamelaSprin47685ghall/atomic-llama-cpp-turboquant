@@ -282,6 +282,66 @@ static void test_acquire_requires_shared_owner() {
     check(pool.stats().exhausted == 0, "owner: the refusal is not an exhaustion");
 }
 
+// Each split builds one index list before ubatch_add() consumes it. The
+// allocator must keep that list, or a steady one-token decode allocates and
+// frees a vector on every decode call.
+static void test_split_scratch_reuse() {
+#ifdef _WIN32
+    _putenv_s("TP5_UBATCH_POOL", "1");
+#else
+    setenv("TP5_UBATCH_POOL", "1", 1);
+#endif
+
+    llama_vocab vocab;
+
+    constexpr uint32_t n_tokens = 8;
+    constexpr uint32_t n_embd   = 2;
+
+    std::vector<float>          embd(n_tokens * n_embd, 0.0f);
+    std::vector<llama_pos>      pos(n_tokens);
+    std::vector<int32_t>        n_seq_id(n_tokens, 1);
+    std::vector<llama_seq_id>   seq_ids(n_tokens, 0);
+    std::vector<llama_seq_id *> seq_id(n_tokens);
+    std::vector<int8_t>         logits(n_tokens, 0);
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        pos[i]    = (llama_pos) i;
+        seq_id[i] = &seq_ids[i];
+    }
+    logits[n_tokens - 1] = 1;
+
+    llama_batch batch = {};
+    batch.n_tokens = (int32_t) n_tokens;
+    batch.embd     = embd.data();
+    batch.pos      = pos.data();
+    batch.n_seq_id = n_seq_id.data();
+    batch.seq_id   = seq_id.data();
+    batch.logits   = logits.data();
+
+    llama_batch_allocr ba(1);
+    check(ba.init(batch, vocab, nullptr, n_embd, 4, false), "split scratch: init");
+
+    // Warm the index list, the out_ids list and one pool slot.
+    while (ba.split_simple(1).n_tokens > 0) {
+    }
+
+    const long long base = alloc_delta();
+
+    for (int round = 0; round < 1000; ++round) {
+        ba.split_reset();
+        while (ba.split_simple(1).n_tokens > 0) {
+        }
+    }
+
+    check(alloc_delta() == base, "split scratch: 1000 resplit rounds, zero net allocation");
+
+#ifdef _WIN32
+    _putenv_s("TP5_UBATCH_POOL", "");
+#else
+    unsetenv("TP5_UBATCH_POOL");
+#endif
+}
+
 static void test_steady_state() {
     auto pool = std::make_shared<ubatch_data_pool>();
     check(pool->configure(4), "steady: pool configured");
@@ -2126,6 +2186,7 @@ int main() {
     test_pool_outlives_owner();
     test_exhaustion_and_fallback();
     test_acquire_requires_shared_owner();
+    test_split_scratch_reuse();
     test_steady_state();
     test_concurrency();
     test_decode_scratch_pool();

@@ -589,11 +589,14 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 
     const uint32_t n_avail = (uint32_t) (used.size() - cur_idx);
 
-    std::vector<int32_t> idxs;
-    idxs.reserve(std::min(n_ubatch, n_avail));
+    // Reuse the allocator's index scratch: reserve() is a no-op once the
+    // capacity covers the split, so a steady one-token decode does not
+    // allocate a fresh vector on every step.
+    split_idxs.clear();
+    split_idxs.reserve(std::min(n_ubatch, n_avail));
 
     while (true) {
-        idxs.push_back(cur_idx);
+        split_idxs.push_back(cur_idx);
 
         used[cur_idx] = true;
         ++n_used;
@@ -604,12 +607,12 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
             break;
         }
 
-        if (idxs.size() >= n_ubatch) {
+        if (split_idxs.size() >= n_ubatch) {
             break;
         }
     }
 
-    return ubatch_add(idxs, idxs.size(), false);
+    return ubatch_add(split_idxs, split_idxs.size(), false);
 }
 
 llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
@@ -776,13 +779,12 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     }
 
     // concat the per-sequence-set lists
-    std::vector<int32_t> idxs;
-
+    split_idxs.clear();
     for (uint32_t s = 0; s < n_seqs; ++s) {
-        idxs.insert(idxs.end(), idxs_per_seq[s].begin(), idxs_per_seq[s].end());
+        split_idxs.insert(split_idxs.end(), idxs_per_seq[s].begin(), idxs_per_seq[s].end());
     }
 
-    return ubatch_add(idxs, n_seqs, true);
+    return ubatch_add(split_idxs, n_seqs, true);
 }
 
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
@@ -803,15 +805,15 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
     // we allow adding tokens only if their sequence set is a subset of the current sequence set
     auto cur_seq_set = seq_set[cur_idx];
 
-    std::vector<int32_t> idxs;
+    split_idxs.clear();
 
     while (true) {
-        idxs.push_back(cur_idx);
+        split_idxs.push_back(cur_idx);
 
         used[cur_idx] = true;
         ++n_used;
 
-        if (idxs.size() >= n_ubatch) {
+        if (split_idxs.size() >= n_ubatch) {
             break;
         }
 
@@ -826,7 +828,7 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
         cur_seq_set = seq_set[cur_idx];
     }
 
-    return ubatch_add(idxs, 1, true);
+    return ubatch_add(split_idxs, 1, true);
 }
 
 void llama_batch_allocr::clear() {
