@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 #include "ggml-backend.h"
 
@@ -21,6 +22,9 @@ namespace ggml_cuda_staging {
 
 constexpr size_t   kMaxPoolBytes = 4u << 20;
 constexpr uint32_t kRanks        = 16;  // == GGML_CUDA_MAX_DEVICES
+// One key per staging thread. The compose runtime has one worker thread per
+// service window, so the two active workers get separate keys; a process with
+// more staging threads than this wraps and shares a key.
 constexpr uint32_t kWindows      = 4;
 constexpr uint32_t kSlotsPerKey  = 2;   // double buffer
 // Bump when the host-only api table grows. New fields are appended after the
@@ -228,6 +232,12 @@ public:
         uint64_t leases_by_kind[kKindCount]   = {};
         uint64_t reaps_by_kind[kKindCount]    = {};
         uint64_t queries_by_kind[kKindCount]  = {};
+        // Per-window attribution. The compose runtime has one worker thread
+        // per service window; the host assigns each staging thread its own
+        // window. These counters prove that the split is used and that the
+        // remaining misses are not one window starving another.
+        uint64_t leases_by_window[kWindows]   = {};
+        uint64_t no_slot_by_window[kWindows]  = {};
         uint64_t reaps                     = 0;
         uint64_t queries                   = 0;
         uint64_t quarantine                = 0;
@@ -280,88 +290,191 @@ public:
             stats_.invalid++;
             return false;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (disabled_.load(std::memory_order_relaxed)) {
-            return false;
-        }
-        auto & key = slots_[window][size_t(k)];
-        slot * chosen = pick_free_locked(key, bytes);
-        // 3) Free but pending, large enough: wait, then reuse.
-        if (chosen == nullptr && wait_pending) {
-            for (auto & s : key) {
-                if (!s.leased && !s.quarantined && s.cap >= bytes) {
-                    chosen = &s;
-                    break;
+        if (wait_pending) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            for (;;) {
+                if (disabled_.load(std::memory_order_relaxed)) {
+                    return false;
                 }
+                auto & key = slots_[window][size_t(k)];
+                slot * chosen = pick_free_locked(key, bytes);
+                // Free but pending, large enough: wait, then reuse.
+                if (chosen == nullptr) {
+                    for (auto & s : key) {
+                        if (!s.leased && !s.quarantined && !s.reaping && s.cap >= bytes) {
+                            chosen = &s;
+                            break;
+                        }
+                    }
+                }
+                // Free but pending, grow after the wait.
+                if (chosen == nullptr) {
+                    for (auto & s : key) {
+                        if (!s.leased && !s.quarantined && !s.reaping) {
+                            chosen = &s;
+                            break;
+                        }
+                    }
+                }
+                if (chosen != nullptr) {
+                    return lease_slot_locked(*chosen, size_t(chosen - key.data()), window, k, bytes, out);
+                }
+                // A non-blocking acquire is querying every otherwise usable
+                // pending slot. Its query is bounded and it only needs the
+                // lock to clear reaping, so drop the lock and retry instead of
+                // waiting on a slot it owns. This keeps the blocking wait
+                // under mutex_ (the note_source cycle proof depends on it).
+                bool any_reaping = false;
+                for (const auto & s : key) {
+                    if (!s.leased && !s.quarantined && s.reaping) {
+                        any_reaping = true;
+                        break;
+                    }
+                }
+                if (!any_reaping) {
+                    count_no_slot_locked(key, window, k);
+                    return false;
+                }
+                lock.unlock();
+                std::this_thread::yield();
+                lock.lock();
             }
         }
-        // 4) Free but pending, grow after the wait.
-        if (chosen == nullptr && wait_pending) {
-            for (auto & s : key) {
-                if (!s.leased && !s.quarantined) {
-                    chosen = &s;
+
+        // Async lane: never wait a pending slot. A completed in-flight copy is
+        // reclaimed without blocking the pipeline. The backend event queries
+        // and their device switches run outside mutex_: the old path held the
+        // process-global pool lock across up to kRanks HIP calls per slot, so
+        // one worker's retire probe stalled the other worker's acquire.
+        std::array<bool, kSlotsPerKey> examined{};
+        for (;;) {
+            size_t   reap_index  = kSlotsPerKey;
+            uint32_t reap_ranks  = 0;
+            uint64_t reap_epoch  = 0;
+            void *   reap_events[kRanks] = {};
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (disabled_.load(std::memory_order_relaxed)) {
+                    return false;
+                }
+                auto & key = slots_[window][size_t(k)];
+                if (slot * chosen = pick_free_locked(key, bytes)) {
+                    return lease_slot_locked(*chosen, size_t(chosen - key.data()), window, k, bytes, out);
+                }
+                for (size_t i = 0; i < key.size(); ++i) {
+                    if (examined[i]) {
+                        continue;
+                    }
+                    slot & s = key[i];
+                    if (s.leased || s.quarantined || !s.pending || s.reaping) {
+                        continue;
+                    }
+                    s.reaping    = true;
+                    reap_index   = i;
+                    reap_ranks   = s.pending_ranks;
+                    reap_epoch   = s.epoch;
+                    std::memcpy(reap_events, s.events, sizeof(reap_events));
                     break;
                 }
+                if (reap_index == kSlotsPerKey) {
+                    count_no_slot_locked(key, window, k);
+                    return false;
+                }
             }
-        }
-        // 5) A completed in-flight copy can be reclaimed without waiting. The
-        //    async lane never waits, so without this step both slots stay
-        //    pending after their first copy and every later copy misses.
-        if (chosen == nullptr && !wait_pending) {
-            for (auto & s : key) {
-                if (s.leased || s.quarantined || !s.pending) {
+            examined[reap_index] = true;
+
+            bool complete = true;
+            int  fail_err = 0;
+            uint64_t queries = 0;
+            if (ops_.event_query == nullptr) {
+                // No completion probe: leave the slot pending instead of
+                // turning a missing optional hook into a pool fault.
+                complete = false;
+            } else {
+                const int saved = ops_.current_device != nullptr ? ops_.current_device() : -1;
+                for (uint32_t r = 0; r < kRanks; ++r) {
+                    if ((reap_ranks & (uint32_t(1) << r)) == 0) {
+                        continue;
+                    }
+                    if (ops_.select_device != nullptr && !ops_.select_device(int(r))) {
+                        fail_err = -1;
+                        break;
+                    }
+                    if (reap_events[r] == nullptr) {
+                        fail_err = -1;
+                        break;
+                    }
+                    // Queries counts backend calls only: one per pending rank
+                    // event examined, stopping at the first not-ready or error.
+                    ++queries;
+                    bool rank_complete = false;
+                    const int query_err = ops_.event_query(reap_events[r], &rank_complete);
+                    if (query_err != 0) {
+                        fail_err = query_err;
+                        break;
+                    }
+                    if (!rank_complete) {
+                        complete = false;
+                        break;
+                    }
+                }
+                if (ops_.restore_device != nullptr && !ops_.restore_device(saved)) {
+                    if (fail_err == 0) {
+                        fail_err = -1;
+                    }
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto & key = slots_[window][size_t(k)];
+                slot & s = key[reap_index];
+                // A call count, not a latency measurement: count the backend
+                // queries even when another thread faulted the pool while
+                // they ran.
+                stats_.queries += queries;
+                stats_.queries_by_kind[size_t(k)] += queries;
+                const bool still_ours = s.reaping && s.epoch == reap_epoch &&
+                                        s.pending && !s.leased && !s.quarantined;
+                if (s.reaping) {
+                    s.reaping = false;
+                }
+                if (!still_ours) {
+                    // Only this acquire could clear reaping, and a pending
+                    // unleased slot cannot be leased elsewhere. Keep the
+                    // failure path defensive: retry the remaining slots.
+                    if (disabled_.load(std::memory_order_relaxed)) {
+                        return false;
+                    }
                     continue;
                 }
-                if (try_reap_locked(s, size_t(k))) {
-                    chosen = pick_free_locked(key, bytes);
-                    break;
+                if (fail_err != 0) {
+                    quarantine_locked(s, fail_err);
+                    disabled_.store(true, std::memory_order_relaxed);
+                    publish_fatal_locked();
+                    stats_.query_fail++;
+                    return false;
                 }
                 if (disabled_.load(std::memory_order_relaxed)) {
                     return false;
                 }
-            }
-        }
-        // 6) No usable slot. Never steal a live lease and never wait unless
-        //    the caller asked for it.
-        if (chosen == nullptr) {
-            stats_.no_slot++;
-            stats_.no_slot_by_kind[size_t(k)]++;
-            // A disabled pool returned at the top of acquire; a usable free
-            // slot would have been chosen by pick_free_locked; a too-small
-            // free slot fails in grow_locked as oversize, not here. The only
-            // reachable no_slot states are therefore an unleased pending slot
-            // (retire lag) or all usable slots leased.
-            bool any_unleased_pending = false;
-            for (const auto & s : key) {
-                if (!s.leased && s.pending) {
-                    any_unleased_pending = true;
-                    break;
+                if (!complete) {
+                    continue;
                 }
+                s.pending = false;
+                s.pending_ranks = 0;
+                stats_.reaps++;
+                stats_.reaps_by_kind[size_t(k)]++;
+                slot * chosen = pick_free_locked(key, bytes);
+                if (chosen == nullptr) {
+                    // The reaped slot is free; this is defense against a
+                    // future state that frees a slot without growing it.
+                    count_no_slot_locked(key, window, k);
+                    return false;
+                }
+                return lease_slot_locked(*chosen, size_t(chosen - key.data()), window, k, bytes, out);
             }
-            if (any_unleased_pending) {
-                stats_.no_slot_pending++;
-            } else {
-                stats_.no_slot_leased++;
-            }
-            return false;
         }
-        if (!wait_slot_locked(*chosen)) {
-            return false;
-        }
-        if (!grow_locked(*chosen, bytes)) {
-            return false;
-        }
-        chosen->leased = true;
-        chosen->epoch = next_epoch_++;
-        out->host     = chosen->host;
-        out->cap      = chosen->cap;
-        out->which    = k;
-        out->window   = window;
-        out->slot     = uint32_t(chosen - key.data());
-        out->epoch    = chosen->epoch;
-        stats_.leases++;
-        stats_.leases_by_kind[size_t(k)]++;
-        return true;
     }
 
     submit_result upload(const lease & l, const void * src, size_t bytes) {
@@ -707,6 +820,18 @@ public:
                 (unsigned long long) stats_.reaps_by_kind[k],
                 (unsigned long long) stats_.queries_by_kind[k]);
         }
+        // Per-window attribution: a run with two compose workers should show
+        // leases on two window keys. One hot window with every miss is the
+        // signature of the old shared window 0.
+        for (size_t w = 0; w < kWindows; ++w) {
+            if (stats_.leases_by_window[w] == 0 && stats_.no_slot_by_window[w] == 0) {
+                continue;
+            }
+            std::fprintf(f, "TP5_STAGING_WINDOW window=%zu leases=%llu no_slot=%llu\n",
+                         w,
+                         (unsigned long long) stats_.leases_by_window[w],
+                         (unsigned long long) stats_.no_slot_by_window[w]);
+        }
         const uint64_t misses = stats_.misses + misses_fast_.load(std::memory_order_relaxed);
         std::fprintf(f,
             "TP5_STAGING leases=%llu uploads=%llu upload_bytes=%llu waits=%llu wait_ms=%.3f "
@@ -754,6 +879,10 @@ private:
         bool      pending = false;
         bool      quarantined = false;  // a copy may still read host: never reuse or free
         bool      partial_marked = false; // mark_partial already recorded this slot
+        // One non-blocking acquire is querying this slot's events without
+        // holding mutex_. Other acquires skip it instead of duplicating the
+        // device switches and queries.
+        bool      reaping = false;
         uint32_t  pending_ranks = 0;
         void *    events[kRanks] = {};
         void *    dev_ptrs[kRanks] = {};
@@ -828,81 +957,65 @@ private:
     // free slot is returned for growth.
     slot * pick_free_locked(rotation & key, size_t bytes) {
         for (auto & s : key) {
-            if (!s.leased && !s.pending && !s.quarantined && s.cap >= bytes) {
+            if (!s.leased && !s.pending && !s.quarantined && !s.reaping && s.cap >= bytes) {
                 return &s;
             }
         }
         for (auto & s : key) {
-            if (!s.leased && !s.pending && !s.quarantined) {
+            if (!s.leased && !s.pending && !s.quarantined && !s.reaping) {
                 return &s;
             }
         }
         return nullptr;
     }
 
-    // Non-blocking completion reclaim. A query error is fatal, like a failed
-    // wait: an unprovable completion keeps the slot out of rotation.
-    bool try_reap_locked(slot & s, size_t kind_index) {
-        if (!s.pending) {
-            return true;
-        }
-        if (s.leased) {
+    // Caller holds mutex_. Takes the chosen slot for this lease. A pending
+    // slot is waited first (blocking lane only); the async lane only reaches
+    // this with a free or just-reaped slot, so the wait is a no-op there.
+    bool lease_slot_locked(slot & s, size_t slot_index, uint32_t window, kind k, size_t bytes, lease * out) {
+        GGML_ASSERT(slot_index < kSlotsPerKey);
+        if (!wait_slot_locked(s)) {
             return false;
         }
-        if (ops_.event_query == nullptr) {
+        if (!grow_locked(s, bytes)) {
             return false;
         }
-        const int saved = ops_.current_device != nullptr ? ops_.current_device() : -1;
-        bool complete = true;
-        int fail_err = 0;
-        for (uint32_t r = 0; r < kRanks; ++r) {
-            if ((s.pending_ranks & (uint32_t(1) << r)) == 0) {
-                continue;
-            }
-            if (ops_.select_device != nullptr && !ops_.select_device(int(r))) {
-                fail_err = -1;
-                break;
-            }
-            if (s.events[r] == nullptr) {
-                fail_err = -1;
-                break;
-            }
-            // Queries counts backend calls only: one per pending rank event
-            // examined, stopping at the first not-ready or error. It is a
-            // call count, not a latency measurement.
-            stats_.queries++;
-            stats_.queries_by_kind[kind_index]++;
-            bool rank_complete = false;
-            const int query_err = ops_.event_query(s.events[r], &rank_complete);
-            if (query_err != 0) {
-                fail_err = query_err;
-                break;
-            }
-            if (!rank_complete) {
-                complete = false;
-                break;
-            }
-        }
-        if (ops_.restore_device != nullptr && !ops_.restore_device(saved)) {
-            if (fail_err == 0) {
-                fail_err = -1;
-            }
-        }
-        if (fail_err != 0) {
-            quarantine_locked(s, fail_err);
-            disabled_.store(true, std::memory_order_relaxed);
-            publish_fatal_locked();
-            stats_.query_fail++;
-            return false;
-        }
-        if (!complete) {
-            return false;
-        }
-        s.pending = false;
-        s.pending_ranks = 0;
-        stats_.reaps++;
-        stats_.reaps_by_kind[kind_index]++;
+        s.leased = true;
+        s.epoch  = next_epoch_++;
+        out->host   = s.host;
+        out->cap    = s.cap;
+        out->which  = k;
+        out->window = window;
+        out->slot   = uint32_t(slot_index);
+        out->epoch  = s.epoch;
+        stats_.leases++;
+        stats_.leases_by_kind[size_t(k)]++;
+        stats_.leases_by_window[window]++;
         return true;
+    }
+
+    // Caller holds mutex_. Never steal a live lease and never wait unless the
+    // caller asked for it. A disabled pool returned before this point; a
+    // usable free slot would have been chosen by pick_free_locked; a too-small
+    // free slot fails in grow_locked as oversize. The only reachable no_slot
+    // states are therefore an unleased pending slot (retire lag) or all usable
+    // slots leased.
+    void count_no_slot_locked(const rotation & key, uint32_t window, kind k) {
+        stats_.no_slot++;
+        stats_.no_slot_by_kind[size_t(k)]++;
+        stats_.no_slot_by_window[window]++;
+        bool any_unleased_pending = false;
+        for (const auto & s : key) {
+            if (!s.leased && s.pending) {
+                any_unleased_pending = true;
+                break;
+            }
+        }
+        if (any_unleased_pending) {
+            stats_.no_slot_pending++;
+        } else {
+            stats_.no_slot_leased++;
+        }
     }
 
     bool wait_slot_locked(slot & s) {

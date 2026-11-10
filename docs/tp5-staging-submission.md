@@ -487,10 +487,11 @@ its events were not all complete). A quarantined/faulted pool is disabled at
 acquire entry, so a fault is not counted as `no_slot`; a free slot is chosen
 by `pick_free_locked` and a too-small slot fails as `oversize`, so there is
 no third class. The dump also reports `leases/no_slot/reaps/queries` per kind
-on `TP5_STAGING_KIND` lines. The global `misses` counter remains the
+on `TP5_STAGING_KIND` lines and `leases/no_slot` per window on
+`TP5_STAGING_WINDOW` lines. The global `misses` counter remains the
 note_source pointer check, not a staging miss. The test pins the split and
-the per-kind sums against a deterministic lease collision and a deterministic
-pending miss. It also asserts the frozen v1 `api` prefix at compile time
+the per-kind and per-window sums against a deterministic lease collision and
+a deterministic pending miss. It also asserts the frozen v1 `api` prefix at compile time
 and covers a clean rejection after one rank was queued: `mark_partial` stops
 the pool, `submission_pending` is true, `first_error` stays 0, the slot is
 quarantined, and later upload/enqueue/wait/enter_submit/acquire calls fail. A
@@ -504,7 +505,9 @@ before reclaiming another, the synchronous path issues no queries, and
 `pending_ranks` can hold 1..16 ranks. Use `no_slot_leased`,
 `no_slot_pending` and the per-kind counters directly. The earlier
 five-rank/five-query inverse applied only to the five-rank normal run; it is
-not a code invariant.
+not a code invariant. The async acquire queries outside `mutex_` and applies
+the result only if the slot epoch and pending state still match, so a query
+count is the same backend-call count but no longer measures lock hold time.
 
 The two union index inputs (`union_inp_k_idxs`, `union_inp_v_idxs`) have
 dedicated kinds. Both are graph inputs on the same graph; before this change
@@ -514,14 +517,32 @@ generic input, so eligibility is unchanged. Fixed limits: 4 MiB total pinned
 pool (`kMaxPoolBytes`), 2 MiB per request (`kMaxStagingBytes`), 2 slots per
 (window, kind), and 64 KiB per generic/union slot. The split is not free: it
 adds two double buffers, i.e. up to 4 x 64 KiB = 256 KiB of additional pinned
-capacity in the active window 0 (up to 16 slot records and 1 MiB across all
-four window arrays), plus up to one lazily created event per rank per new slot
-(5 active ranks -> up to 20 additional events for the four window-0 slots).
+capacity per active window (up to 16 slot records and 1 MiB across all four
+window arrays), plus up to one lazily created event per rank per new slot
+(5 active ranks -> up to 20 additional events per active window).
 The 4 MiB cap still bounds pinned bytes; the extra event handles and slot
 metadata are outside that byte cap. No GPU run has measured whether this
 reduces `no_slot`; the CPU test only proves the mapping and per-kind
 independence. Reuse still requires every recorded rank event to complete; the
 split adds no synchronization and does not reuse a slot earlier.
+
+The 512x2 run that motivated the split recorded 3131.5 leases and 371.5 async
+misses (10.6% of eligible copies). All misses were in the async lane. That
+binary had no union kinds, so `inp_embd`, `union_inp_k_idxs` and
+`union_inp_v_idxs` all classified as generic in the same graph, and both
+compose workers passed staging window 0. With two slots per key, the third
+generic acquire of a graph, or the second worker's lease while the first
+worker was between acquire and release, found both slots unavailable and the
+async lane fell back. The union split removes two of the three generic inputs.
+The thread-keyed window below removes the cross-worker sharing. The dump now
+prints `TP5_STAGING_WINDOW` leases/no_slot per window, and the existing
+`no_slot_leased`/`no_slot_pending` split says whether a remaining miss is a
+lease collision or retire lag. The next GPU run can therefore confirm both
+effects instead of relying on the aggregate count. The 512 verbose reject
+lines in that run were emitted during weight load, before the measured decode;
+the decode path only evaluates the cached diagnostic flag. They do not
+explain the 7% decode regression. The submit-path cost is consistent with the
+lock hold across the retire queries, which the async acquire now avoids.
 
 The CPU test also covers 1/5/16 pending-rank reap query counts, a synchronous
 all-leased miss with zero queries, and the four-window union-kind budget
@@ -543,12 +564,39 @@ only the destination. The dependency is ggml-backend.cpp's input-copy loop
 correct kind classification and the real INPUT flag in the sync lane without
 name parsing. Not implemented here.
 
-Per-window staging is not wired. The compose worker's `tl_tp5_window`
-(`fork/tp5-compose/src/runtime.cpp`) is a real per-window thread identity,
-but it lives in the compose module and is not visible to ggml-base. Passing
-it in requires a registered hook; this change does not guess a window and
-keeps the existing window-0 behavior. A per-window split needs that hook and
-a separate measurement.
+Per-window staging is wired through the calling thread. The compose runtime
+runs one worker thread per service window (`tl_tp5_window`,
+`fork/tp5-compose/src/runtime.cpp`), and that worker submits the graph-input
+copies for its own window on the same thread. The Meta layer assigns the first
+thread that acquires a staging lease window 0, the next window 1, and so on
+from a process-wide atomic counter; the id is cached in a `thread_local`.
+Threads that never stage an input never take an id. The lease carries the id,
+so acquire, upload, enqueue, wait and release all address the same
+(window, kind) key. Limits: a process with more staging threads than
+`kWindows` wraps and shares a key (the old behavior for those threads); a
+window recreated on a new thread takes a new id, so its old pending slots stay
+in the old key until a later acquire with that id reaps them. Both are
+capacity/performance effects, not correctness changes. The compose
+`tl_tp5_window` value itself is still not read: the mapping is by thread,
+which matches the one-worker-per-window runtime. A future runtime that
+dispatches one window's copies from several threads would need an explicit
+hook instead of this inference.
+
+The async acquire no longer holds `mutex_` across the per-rank event queries
+and device switches. It marks one pending slot `reaping`, snapshots its epoch,
+rank mask and event handles under the lock, queries outside the lock, then
+re-locks and applies the result only if the epoch and pending state still
+match. A blocking acquire skips `reaping` slots and, if every otherwise usable
+pending slot is being reaped, drops the lock and retries; the query is bounded
+and the reaper only needs the lock to publish its result. This keeps the
+blocking `event_sync` under `mutex_`, which is the premise of the
+`note_source` deadlock proof, while removing the process-global lock hold from
+the async retire probe. Query counts and the `no_slot` split are unchanged.
+If the reaper leases the slot before the blocking acquire retries, the
+blocking acquire observes a transient lease collision and falls back; the
+async lane owns the slot. That race needs a concurrent blocking and
+non-blocking acquire on the same (window, kind), which the current Meta lanes
+do not produce, and it is a capacity miss, not a correctness change.
 
 The Meta partial test builds a real Meta backend over two CPU child devices and
 injects a v3 staging table whose enqueue queues rank 0 and rejects rank 1. It
@@ -630,8 +678,9 @@ run with diagnostics off observes the same copies, leases, pending/fault state
 and owner transitions. This removes diagnostic work from the default path but
 makes no measured performance claim. The rejection summary touches only
 `ggml-backend-meta.cpp`; the `note_source` call-site gate also touches
-`ggml-cuda.cu`. The slot-pressure work owns `staging.h`/`acquire` and is not
-modified.
+`ggml-cuda.cu`. The slot-pressure work now also changes `staging.h`/`acquire`
+(out-of-lock retire queries and per-window keys); the diagnostic gate itself
+is unchanged.
 
 ### Example lifetime and dump ordering
 

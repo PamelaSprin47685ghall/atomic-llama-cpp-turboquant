@@ -755,6 +755,14 @@ int test_no_slot_attribution() {
     CHECK(no_slot_sum == s.no_slot);
     CHECK(reaps_sum == s.reaps);
     CHECK(queries_sum == s.queries);
+    uint64_t window_leases = 0;
+    uint64_t window_no_slot = 0;
+    for (size_t w = 0; w < kWindows; ++w) {
+        window_leases  += s.leases_by_window[w];
+        window_no_slot += s.no_slot_by_window[w];
+    }
+    CHECK(window_leases == s.leases);
+    CHECK(window_no_slot == s.no_slot);
     CHECK(s.no_slot_leased + s.no_slot_pending == s.no_slot);
     return 0;
 }
@@ -1263,6 +1271,10 @@ int test_four_window_union_budget() {
 
     auto s = p.snapshot();
     CHECK(s.leases == uint64_t(kWindows) * 2 * 2);
+    for (uint32_t w = 0; w < kWindows; ++w) {
+        CHECK(s.leases_by_window[w] == 4);
+        CHECK(s.no_slot_by_window[w] == 0);
+    }
     CHECK(p.pool_bytes() == max_bytes);
     CHECK(s.oversize == 0);
     CHECK(s.no_slot == 0);

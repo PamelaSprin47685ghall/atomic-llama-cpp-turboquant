@@ -264,7 +264,7 @@
     },
     {
       "path": "ggml/src/ggml-backend-meta.cpp",
-      "sha256": "0b26b6ff63772da72738ce71290ae0920f95ae1f9f2e02b6fa309efcb980a229",
+      "sha256": "a12a6bfe04e6051df3c94e0c9ac1e0370e2ad1dff07ad7711ea3f5921b90db14",
       "mode": "100644",
       "consumers": [
         "public meta backend tensor transfers",
@@ -852,23 +852,23 @@
     },
     {
       "path": "ggml/src/ggml-cuda/staging.h",
-      "sha256": "2726b628aebec43b200298e7c9605509abb2836d1e759122d22969f2c1afb4ec",
+      "sha256": "17c97a0872deabd4f93c35f1d854500580887ee763182ecc9b79fb2bd6459ea0",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose persistent pinned H2D staging pool (WS4)",
         "WS4 staging pool CPU test"
       ],
-      "reason": "Declare the staging pool API and host-side lease/slot state used by the meta backend and the CPU test harness. Declare the tri-state submit_result API and make note_source wait-free: it publishes the submit gate, takes the pool lock only by try_lock, and skips with a fast miss when the gate or pool lock is held. Add backend_ops::event_query and try_reap_locked: acquire(wait_pending=false) polls the recorded events of pending slots, skips an active lease, quarantines a query error as fatal, and records query_fail/reaps/queries. Add the v2 mark_partial entry, the v3 kind_count capability, and partial statistic: a later clean rejection after at least one queued rank stops the pool, quarantines the slot and records the destination as unknown with first_error unchanged. Version 2 appends mark_partial and version 3 appends kind_count after the previous version's last field (no earlier field moves) and the CPU pool test asserts that prefix at compile time. Reject v1 and v2 at registration (v1 cannot publish partial work; v2 cannot advertise its kind domain); mark_partial is idempotent per leased slot so concurrent duplicate publications count one destination. Document that mark_partial idempotence is lease-scoped: a call after release cannot find the slot.",
+      "reason": "Declare the staging pool API and host-side lease/slot state used by the meta backend and the CPU test harness. Declare the tri-state submit_result API and make note_source wait-free: it publishes the submit gate, takes the pool lock only by try_lock, and skips with a fast miss when the gate or pool lock is held. Add backend_ops::event_query: acquire(wait_pending=false) polls the recorded events of pending slots outside the pool lock, claims one slot with a reaping flag, skips an active lease, quarantines a query error as fatal, and records query_fail/reaps/queries. Add per-window lease/no_slot counters and a reaping state that keeps the blocking wait under the pool lock. Add the v2 mark_partial entry, the v3 kind_count capability, and partial statistic: a later clean rejection after at least one queued rank stops the pool, quarantines the slot and records the destination as unknown with first_error unchanged. Version 2 appends mark_partial and version 3 appends kind_count after the previous version's last field (no earlier field moves) and the CPU pool test asserts that prefix at compile time. Reject v1 and v2 at registration (v1 cannot publish partial work; v2 cannot advertise its kind domain); mark_partial is idempotent per leased slot so concurrent duplicate publications count one destination. Document that mark_partial idempotence is lease-scoped: a call after release cannot find the slot.",
       "removal_condition": "Remove with the WS4 staging pool implementation."
     },
     {
       "path": "tests/test-tp5-staging-pool.cpp",
-      "sha256": "aa3b45e969a6163e2434ddb5d147396fe41e8cc2926452ca5e9243660be580b6",
+      "sha256": "eaa0adf4ee9f1156f6784869d3313b909a21fc7e68a08520fff3f71fa8b9d1ee",
       "mode": "100644",
       "consumers": [
         "WS4 staging pool CPU test"
       ],
-      "reason": "Cover staging lease reuse, tri-state upload/enqueue, quarantine and fatal fail-stop, submit-gate ordering, device wait selection, and the async reclaim cases: partial rank completion, active-lease exclusion, event re-record, and pending-rank preservation (45/45 in the CPU harness). Cover partial rejection publication: the pool stops, submission_pending is true, no native error is invented, the slot is quarantined and no later submit is accepted. Mirror the frozen v1 api prefix and static-assert that v2 and v3 fields are appended; cover partial rejection publication, the fatal submit gate and refusal to acquire after the stop. Assert the pool is clean before mark_partial so the state transition is attributable to it. Add a submit-gate race that blocks mark_partial until release and a two-thread duplicate-publication case that counts one unknown destination and one partial fault.",
+      "reason": "Cover staging lease reuse, tri-state upload/enqueue, quarantine and fatal fail-stop, submit-gate ordering, device wait selection, and the async reclaim cases: partial rank completion, active-lease exclusion, event re-record, and pending-rank preservation (45/45 in the CPU harness). Check that the per-window lease/no_slot counters sum to the global totals. Cover partial rejection publication: the pool stops, submission_pending is true, no native error is invented, the slot is quarantined and no later submit is accepted. Mirror the frozen v1 api prefix and static-assert that v2 and v3 fields are appended; cover partial rejection publication, the fatal submit gate and refusal to acquire after the stop. Assert the pool is clean before mark_partial so the state transition is attributable to it. Add a submit-gate race that blocks mark_partial until release and a two-thread duplicate-publication case that counts one unknown destination and one partial fault.",
       "removal_condition": "Remove with the WS4 staging pool test target."
     },
     {
@@ -965,7 +965,7 @@
     },
     {
       "path": "docs/tp5-staging-submission.md",
-      "sha256": "5178b28ea78801246300a6bacabcfe0d7a53dd02dcab5c49d75b777497f398db",
+      "sha256": "f88cf6276dae29b403bef688ed9d3d52f3482d1cef1c40b19c4dc04d6b20db9c",
       "mode": "100644",
       "consumers": [
         "tq-tp5-compose staging/Meta integration maintainers"
