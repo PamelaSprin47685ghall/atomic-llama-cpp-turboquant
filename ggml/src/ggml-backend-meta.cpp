@@ -4126,24 +4126,6 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
             const int64_t row_count = size   / row_stride;
             GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
 
-            const int64_t blck_size = ggml_blck_size(tensor->type);
-            if (tensor->ne[1] == 1) {
-                for (size_t s = 0; s < split_state.n_segments; s++) {
-                    for (size_t r = 0; r < split_state.nr[s]; r++) {
-                        for (size_t j = 0; j < n_bufs; j++) {
-                            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                            GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
-                            const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
-                            ggml_backend_tensor_set(simple_tensor, (const char *) data + offset_data,
-                                simple_offsets[j], nbytes);
-                            offset_data       += nbytes;
-                            simple_offsets[j] += nbytes;
-                        }
-                    }
-                }
-                GGML_ASSERT(offset_data == size);
-                return;
-            }
             for (size_t s = 0; s < split_state.n_segments; s++) {
                 for (size_t r = 0; r < split_state.nr[s]; r++) {
                     for (size_t j = 0; j < n_bufs; j++) {
@@ -4645,24 +4627,6 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             const int64_t row_count = size   / row_stride;
             GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
 
-            const int64_t blck_size = ggml_blck_size(tensor->type);
-            if (tensor->ne[1] == 1) {
-                for (size_t s = 0; s < split_state.n_segments; s++) {
-                    for (size_t r = 0; r < split_state.nr[s]; r++) {
-                        for (size_t j = 0; j < n_bufs; j++) {
-                            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                            GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
-                            const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
-                            ggml_backend_tensor_get(simple_tensor, (char *) data + offset_data,
-                                simple_offsets[j], nbytes);
-                            offset_data       += nbytes;
-                            simple_offsets[j] += nbytes;
-                        }
-                    }
-                }
-                GGML_ASSERT(offset_data == size);
-                return;
-            }
             for (size_t s = 0; s < split_state.n_segments; s++) {
                 for (size_t r = 0; r < split_state.nr[s]; r++) {
                     for (size_t j = 0; j < n_bufs; j++) {
@@ -4891,6 +4855,12 @@ struct ggml_backend_meta_context {
     };
     std::string                 name;
     std::vector<backend_config> backend_configs;
+    // Common registry of the child backends. A Meta backend cannot use one
+    // staging owner across children from different DSOs.
+    ggml_backend_reg_t          child_reg = nullptr;
+    std::atomic<const ggml_cuda_staging::api *> child_provider{nullptr};
+    std::atomic<uint64_t>       child_provider_epoch{0};
+    provider_hold_ref           child_provider_hold;
     ggml_context_ptr            ctx;
     std::vector<ggml_cgraph *>  cgraphs_aux;
     std::vector<ggml_tensor *>  nodes_aux;
@@ -4921,6 +4891,7 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    ggml_backend_comm_drain_t            comm_drain     = nullptr;
 
     const ggml_relay_provider_i * relay_i = nullptr;
     const ggml_relay_wire_provider_i * relay_wire_i = nullptr;
@@ -4965,6 +4936,19 @@ struct ggml_backend_meta_context {
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
+        for (size_t i = 0; i < n_devs; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_meta_dev_simple_dev(meta_dev, i);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            if (reg == nullptr || (child_reg != nullptr && child_reg != reg)) {
+                child_reg = nullptr;
+                break;
+            }
+            child_reg = reg;
+        }
+        const ggml_cuda_staging::api * child_provider_ptr =
+            child_provider_hold.acquire(child_reg);
+        child_provider.store(child_provider_ptr, std::memory_order_release);
+        child_provider_epoch.store(g_provider_epoch.load(std::memory_order_acquire), std::memory_order_release);
         relay_mode = params != nullptr && (std::strcmp(params, "tp5-relay") == 0 ||
                                           std::strcmp(params, "tp5-relay-native") == 0);
         cpu_staged_f32 = params != nullptr && std::strcmp(params, "quantized-f32") == 0;
@@ -5096,6 +5080,10 @@ struct ggml_backend_meta_context {
             }
         }
         if (comm_ctx != nullptr) {
+            comm_drain = (ggml_backend_comm_drain_t)
+                ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])),
+                    "ggml_backend_comm_drain");
             comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");

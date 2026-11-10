@@ -447,7 +447,7 @@
     },
     {
       "path": "ggml/include/ggml-backend.h",
-      "sha256": "842dcc032d6d9b139ff16e9ea4bee0a9878847d66a9846984b8b12407a70677f",
+      "sha256": "40f902b4ecc47cef7e4f3613707e49e4728c32bdb4d00524921ced73ab37acfb",
       "mode": "100644",
       "consumers": [
         "fork/batch-compose",
@@ -571,7 +571,7 @@
     },
     {
       "path": "ggml/src/ggml-backend-meta.cpp",
-      "sha256": "8a7efad8e8c58881846b58f98b5f15161175e1da321368e7fffad1ad059b1c12",
+      "sha256": "6384b90805a6065c5380c7fbdfb426cbca32aed83c3e2c3f6e66e8c6ec3f049f",
       "mode": "100644",
       "consumers": [
         "public meta backend tensor transfers",
