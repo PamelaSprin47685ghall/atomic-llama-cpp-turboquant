@@ -42,6 +42,7 @@ int g_failures = 0;
 
 struct fake_staging_state {
     bool pending            = false;
+    bool configured         = true;
     int  partial_after      = 0; // 0: never reject; N: reject enqueue N+1
     bool merge_wait_mode    = true;
     int  acquire_calls      = 0;
@@ -58,9 +59,9 @@ struct fake_staging_state {
 
 fake_staging_state g_fake;
 
-bool fake_enabled()    { return !g_fake.pending; }
+bool fake_enabled()    { return g_fake.configured && !g_fake.pending; }
 bool fake_usable()     { return !g_fake.pending; }
-bool fake_configured() { return true; }
+bool fake_configured() { return g_fake.configured; }
 bool fake_merge_wait() { return g_fake.merge_wait_mode; }
 
 bool fake_acquire(uint32_t window, kind k, size_t bytes, lease * out) {

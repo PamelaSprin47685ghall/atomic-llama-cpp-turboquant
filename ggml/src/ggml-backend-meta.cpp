@@ -1904,6 +1904,13 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
             const int64_t i_start =  offset        /chunk_size_full;
             const int64_t i_stop  = (offset + size)/chunk_size_full;
             const ggml_cuda_staging::api * st = staging_api();
+            // configured(), not enabled(): a configured pool keeps the gate
+            // even after a fault, because the fallback copy must not race the
+            // fatal publication. An unconfigured pool can never accept a
+            // submission, so it has no fatal publication to order against.
+            // A missing configured hook is not proof of an unconfigured pool,
+            // so the gate stays.
+            const bool staging_gate = st != nullptr && (st->configured == nullptr || st->configured());
             ggml_cuda_staging::lease staged_lease;
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
             bool staged = false;
@@ -1921,7 +1928,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
                 }
             }
             const uint8_t * src_base = staged ? staged_lease.host : static_cast<const uint8_t *>(data);
-            if (st != nullptr) {
+            if (staging_gate) {
                 if (!st->enter_submit()) {
                     if (staged) {
                         st->release(&staged_lease);
@@ -1941,7 +1948,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
                 ggml_backend_tensor_set_2d(simple_tensor, (const char *) src_base + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
                 offset_j += chunk_size_j;
             }
-            if (st != nullptr) {
+            if (staging_gate) {
                 st->leave_submit();
             }
             if (staged) {
@@ -1955,8 +1962,13 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            g_staging_meta_diag.mirrored.fetch_add(1, std::memory_order_relaxed);
+            const bool diag = staging_diag_enabled();
+            if (diag) {
+                g_staging_meta_diag.mirrored.fetch_add(1, std::memory_order_relaxed);
+            }
             const ggml_cuda_staging::api * st = staging_api();
+            // configured(), not enabled(): a faulted pool must keep the gate.
+            const bool staging_gate = st != nullptr && (st->configured == nullptr || st->configured());
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
             const bool staging_on = st != nullptr && st->enabled();
             // The blocking copy path passes the original source as
@@ -1975,24 +1987,28 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
                  size == ggml_nbytes(tensor));
             const bool staging_hit = staging_on && staging_shape_ok &&
                 staging_eligible(staging_src, size, &staging_kind);
-            if (st == nullptr) {
-                g_staging_meta_diag.api_null.fetch_add(1, std::memory_order_relaxed);
-            } else if (!staging_on) {
-                g_staging_meta_diag.disabled.fetch_add(1, std::memory_order_relaxed);
-            } else if (!staging_hit) {
-                g_staging_meta_diag.not_eligible.fetch_add(1, std::memory_order_relaxed);
-                staging_log_reject("sync", staging_src, size,
-                                   staging_shape_ok ? nullptr : "layout");
-            } else {
-                g_staging_meta_diag.eligible.fetch_add(1, std::memory_order_relaxed);
-                if (staging_kind == ggml_cuda_staging::kind::generic) {
-                    g_staging_meta_diag.generic.fetch_add(1, std::memory_order_relaxed);
+            if (diag) {
+                if (st == nullptr) {
+                    g_staging_meta_diag.api_null.fetch_add(1, std::memory_order_relaxed);
+                } else if (!staging_on) {
+                    g_staging_meta_diag.disabled.fetch_add(1, std::memory_order_relaxed);
+                } else if (!staging_hit) {
+                    g_staging_meta_diag.not_eligible.fetch_add(1, std::memory_order_relaxed);
+                    staging_log_reject("sync", staging_src, size,
+                                       staging_shape_ok ? nullptr : "layout");
+                } else {
+                    g_staging_meta_diag.eligible.fetch_add(1, std::memory_order_relaxed);
+                    if (staging_kind == ggml_cuda_staging::kind::generic) {
+                        g_staging_meta_diag.generic.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
             if (staging_hit) {
                 ggml_cuda_staging::lease staged_lease;
                 if (st->acquire(kStagingWindow, staging_kind, size, &staged_lease)) {
-                    g_staging_meta_diag.lease_ok.fetch_add(1, std::memory_order_relaxed);
+                    if (diag) {
+                        g_staging_meta_diag.lease_ok.fetch_add(1, std::memory_order_relaxed);
+                    }
                     const int upload_result = st->upload(&staged_lease, data, size);
                     if (upload_result == int(ggml_cuda_staging::submit_result::fatal)) {
                         st->release(&staged_lease);
@@ -2082,10 +2098,12 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
                     }
                     st->release(&staged_lease);
                 } else {
-                    g_staging_meta_diag.lease_fail.fetch_add(1, std::memory_order_relaxed);
+                    if (diag) {
+                        g_staging_meta_diag.lease_fail.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
-            if (st != nullptr) {
+            if (staging_gate) {
                 if (!st->enter_submit()) {
                     staging_record_fatal("sync-disabled", st);
                     return;
@@ -2095,7 +2113,7 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);
             }
-            if (st != nullptr) {
+            if (staging_gate) {
                 st->leave_submit();
             }
         } break;
@@ -2651,8 +2669,13 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            g_staging_meta_diag.async_mirrored.fetch_add(1, std::memory_order_relaxed);
+            const bool diag = staging_diag_enabled();
+            if (diag) {
+                g_staging_meta_diag.async_mirrored.fetch_add(1, std::memory_order_relaxed);
+            }
             const ggml_cuda_staging::api * st = staging_api();
+            // configured(), not enabled(): a faulted pool must keep the gate.
+            const bool staging_gate = st != nullptr && (st->configured == nullptr || st->configured());
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
             const bool staging_on = st != nullptr && st->enabled();
             // staging_meta is the scheduler's real source tensor; its name and
@@ -2668,16 +2691,18 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                  size == ggml_nbytes(tensor));
             const bool staging_hit = staging_on && staging_shape_ok &&
                 staging_eligible(staging_src, size, &staging_kind);
-            if (st == nullptr) {
-                g_staging_meta_diag.async_api_null.fetch_add(1, std::memory_order_relaxed);
-            } else if (!staging_on) {
-                g_staging_meta_diag.async_disabled.fetch_add(1, std::memory_order_relaxed);
-            } else if (!staging_hit) {
-                g_staging_meta_diag.async_not_eligible.fetch_add(1, std::memory_order_relaxed);
-                staging_log_reject("async", staging_src, size,
-                                   staging_shape_ok ? nullptr : "layout");
-            } else {
-                g_staging_meta_diag.async_eligible.fetch_add(1, std::memory_order_relaxed);
+            if (diag) {
+                if (st == nullptr) {
+                    g_staging_meta_diag.async_api_null.fetch_add(1, std::memory_order_relaxed);
+                } else if (!staging_on) {
+                    g_staging_meta_diag.async_disabled.fetch_add(1, std::memory_order_relaxed);
+                } else if (!staging_hit) {
+                    g_staging_meta_diag.async_not_eligible.fetch_add(1, std::memory_order_relaxed);
+                    staging_log_reject("async", staging_src, size,
+                                       staging_shape_ok ? nullptr : "layout");
+                } else {
+                    g_staging_meta_diag.async_eligible.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             if (staging_hit) {
                 bool ranks_ok = true;
@@ -2690,7 +2715,9 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                 // Never wait a pending slot here: the async lane must not block
                 // the pipeline. A miss falls back to the pageable path.
                 if (ranks_ok && st->acquire_nowait(kStagingWindow, staging_kind, size, &staged_lease)) {
-                    g_staging_meta_diag.async_lease_ok.fetch_add(1, std::memory_order_relaxed);
+                    if (diag) {
+                        g_staging_meta_diag.async_lease_ok.fetch_add(1, std::memory_order_relaxed);
+                    }
                     const int upload_result = st->upload(&staged_lease, data, size);
                     if (upload_result == int(ggml_cuda_staging::submit_result::fatal)) {
                         st->release(&staged_lease);
@@ -2739,10 +2766,12 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                         st->release(&staged_lease);
                     }
                 } else if (ranks_ok) {
-                    g_staging_meta_diag.async_lease_fail.fetch_add(1, std::memory_order_relaxed);
+                    if (diag) {
+                        g_staging_meta_diag.async_lease_fail.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
-            if (st != nullptr) {
+            if (staging_gate) {
                 if (!st->enter_submit()) {
                     staging_record_fatal("async-disabled", st);
                     return;
@@ -2752,7 +2781,7 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                 ggml_backend_tensor_set_async(
                     ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
             }
-            if (st != nullptr) {
+            if (staging_gate) {
                 st->leave_submit();
             }
         } break;

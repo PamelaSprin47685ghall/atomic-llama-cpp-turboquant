@@ -958,11 +958,23 @@ static bool ggml_tq_convert_q8() {
     return val == 1;
 }
 
+// The pool's hit/miss counters are read only by the exit dump that
+// GGML_TP5_STAGING_DIAG=1 registers. Skip the pointer check and its
+// try_lock when no dump will read them. This must match the flag cached by
+// staging.cu's dump registration.
+static bool ggml_cuda_staging_diag_enabled() {
+    static const bool on = [] {
+        const char * v = std::getenv("GGML_TP5_STAGING_DIAG");
+        return v != nullptr && strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    if (ggml_cuda_staging::enabled()) {
+    if (ggml_cuda_staging_diag_enabled() && ggml_cuda_staging::enabled()) {
         ggml_cuda_staging::global_pool().note_source(data, size);
     }
     // TQ4_1S → q8_0 load-time conversion (opt-in: GGML_TQ_CONVERT_Q8=1)
@@ -1008,7 +1020,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    if (ggml_cuda_staging::enabled()) {
+    if (ggml_cuda_staging_diag_enabled() && ggml_cuda_staging::enabled()) {
         ggml_cuda_staging::global_pool().note_source(data, n_copies == 0 ? size : stride_data * (n_copies - 1) + size);
     }
     CUDA_CHECK(cudaMemcpy2DAsync(
@@ -3917,7 +3929,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
 
-    if (ggml_cuda_staging::enabled()) {
+    if (ggml_cuda_staging_diag_enabled() && ggml_cuda_staging::enabled()) {
         ggml_cuda_staging::global_pool().note_source(data, size);
     }
     // The fallback path must not inherit the caller's device: the stream and
@@ -3947,7 +3959,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
 
-    if (ggml_cuda_staging::enabled()) {
+    if (ggml_cuda_staging_diag_enabled() && ggml_cuda_staging::enabled()) {
         ggml_cuda_staging::global_pool().note_source(data, n_copies == 0 ? size : stride_data * (n_copies - 1) + size);
     }
     ggml_cuda_set_device(cuda_ctx->device);

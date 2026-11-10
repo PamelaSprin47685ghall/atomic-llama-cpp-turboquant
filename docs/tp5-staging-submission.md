@@ -5,6 +5,22 @@ completion is then unknown: the destination must not be replayed and the
 resources must stay alive. This note records the delivered boundary and its
 limits.
 
+## Verification scope
+
+- HIP: one real gfx1030 `hipcc -fsyntax-only` compile of `ggml-cuda.cu` with
+  the production compile parameters passed. This is syntax-only; it does not
+  link, load a device, or run a GPU.
+- CPU: the candidate tree ran `test-tp5-staging-sync-src`,
+  `test-tp5-staging-meta-partial`, and `test-tp5-staging-note-source-lock`;
+  each passed once. DevOps then ran `test-tp5-staging-sync-src` once against
+  the current main staging diff in `/tmp/tmp.PFMEB9VxfG`; it passed. This note
+  does not rerun the tests.
+- Two observed staging failures remain in their original state and are not
+  fixed: `test-tp5-staging-reject-summary` and
+  `test-tp5-staging-reject-concurrent` fail because their fake API lacks
+  `kind_count`. They are not claimed as passing, and this note does not claim
+  a clean full staging suite.
+
 ## Capability negotiation
 
 The backend exposes two optional functions through the existing
@@ -597,9 +613,16 @@ second copy of them classified those union rejections as `other`.
 Cost: the hot path performs one relaxed increment and no I/O; the example is
 written once per class with no allocation. The summary costs at most one line per
 `(lane, reason)` at exit and holds no lock while printing. With the flag off,
-`staging_log_reject` returns after the cached flag check, as before. This
-change touches only `ggml-backend-meta.cpp`; the slot-pressure work owns
-`staging.h`/`acquire` and is not modified.
+`staging_log_reject` returns after the cached flag check, the Meta copy paths
+skip every `g_staging_meta_diag` increment, and the CUDA set paths do not call
+`note_source()`. The `TP5_STAGING_META` counters and the pool `hits`/`misses`
+pointer check are read only by the dump registered under the same flag, so a
+run with diagnostics off observes the same copies, leases, pending/fault state
+and owner transitions. This removes diagnostic work from the default path but
+makes no measured performance claim. The rejection summary touches only
+`ggml-backend-meta.cpp`; the `note_source` call-site gate also touches
+`ggml-cuda.cu`. The slot-pressure work owns `staging.h`/`acquire` and is not
+modified.
 
 ### Example lifetime and dump ordering
 
