@@ -238,6 +238,15 @@ and whose child bytes are unchanged by a second copy.
   covered by that abort. On a clean state the destructor frees the scheduler
   **before** the backend members are destroyed, matching the actual reverse
   member order.
+  The relay snapshot is retried for up to 100 ms because its try-lock can
+  lose to an ordinary courier publish; a transient loss no longer aborts a
+  healthy epoch. Three facts retain the context: a snapshot that still fails,
+  an unfinished epoch, or an outstanding CPU borrow reported by the optional
+  `ggml_backend_relay_borrow_snapshot()` query
+  (`borrowed_channel != UINT32_MAX`). That query is also retried for ordinary
+  contention. Abort does not revoke a borrow, so only publishing the saved
+  `INPUT_READY` view returns it. The provider never releases a borrow that a
+  CPU reader may still own.
 - **Model**: `llama_model` carries a live-context reference count and a
   retained-context count. The live count and the free request are read and
   changed under a lifetime mutex; the retained count is atomic and is

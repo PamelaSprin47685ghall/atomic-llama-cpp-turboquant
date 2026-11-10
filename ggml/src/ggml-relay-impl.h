@@ -2,7 +2,7 @@
 
 #include "ggml-relay.h"
 
-#define GGML_RELAY_PROVIDER_ABI_VERSION 3
+#define GGML_RELAY_PROVIDER_ABI_VERSION 4
 
 // Internal backend capability. No model, request or B-library types cross it.
 // HIP owns buffers, queues, system-scope flags and completion observations.
@@ -39,6 +39,9 @@ struct ggml_relay_provider_i {
                        const ggml_relay_plan_key * key);
     // ABI 3: optional plan-cache diagnostic. Returns false when unavailable.
     bool (*plan_snapshot)(void * provider, ggml_relay_plan_snapshot * snapshot);
+    // ABI 4: optional CPU borrow/drain facts. False on contention or when the
+    // provider predates this query.
+    bool (*borrow_snapshot)(void * provider, ggml_relay_borrow_status * status);
 };
 
 typedef const ggml_relay_provider_i * (*ggml_backend_relay_get_interface_t)(void);

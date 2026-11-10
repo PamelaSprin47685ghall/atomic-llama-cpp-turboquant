@@ -10086,11 +10086,37 @@ void llama_free(llama_context * ctx) {
     }
     llama_model * model = const_cast<llama_model *>(&ctx->get_model());
     bool retain = false;
+    const char * retain_reason = "an async/native submission is still unproven";
     if (ctx->get_tp5_relay_backend() != nullptr) {
         ggml_relay_status status = {};
         ggml_backend_t backend = ctx->get_tp5_relay_backend();
-        if (!ggml_backend_relay_snapshot(backend, &status) ||
-            (status.epoch != 0 && !status.finished)) {
+        // Snapshot's try-lock can lose to a live courier publish. Retry that
+        // ordinary contention briefly instead of aborting a healthy epoch.
+        bool have_snapshot = false;
+        const int64_t snapshot_deadline_us = ggml_time_us() + 100000;
+        do {
+            have_snapshot = ggml_backend_relay_snapshot(backend, &status);
+        } while (!have_snapshot && ggml_time_us() < snapshot_deadline_us);
+        if (have_snapshot && status.failed) {
+            LLAMA_LOG_ERROR("%s: relay failed before free: code=%d detail=%s\n",
+                            __func__, status.error_code, status.error);
+        }
+        // The borrow query is optional (an ABI 3 provider lacks it). Retry
+        // ordinary mutex contention; if it stays unavailable, keep the
+        // snapshot-only decision and let destroy retain on an unproved borrow.
+        ggml_relay_borrow_status borrow = {};
+        bool have_borrow = false;
+        if (have_snapshot) {
+            const int64_t borrow_deadline_us = ggml_time_us() + 100000;
+            do {
+                have_borrow = ggml_backend_relay_borrow_snapshot(backend, &borrow);
+            } while (!have_borrow && ggml_time_us() < borrow_deadline_us);
+        }
+        const bool borrow_outstanding = have_borrow && borrow.borrowed_channel != UINT32_MAX;
+        if (!have_snapshot || (status.epoch != 0 && !status.finished) || borrow_outstanding) {
+            if (borrow_outstanding) {
+                retain_reason = "a relay CPU borrow is still outstanding";
+            }
             ggml_backend_relay_abort(backend, GGML_STATUS_ABORTED);
             // Scheduler buffers and memory are also native readers' owners.
             // Do not enter an unbounded synchronize or release them on failure.
@@ -10110,7 +10136,7 @@ void llama_free(llama_context * ctx) {
             LLAMA_LOG_ERROR("%s: context is already retained; duplicate free ignored\n", __func__);
             return;
         }
-        LLAMA_LOG_ERROR("%s: retaining whole context: an async/native submission is still unproven\n", __func__);
+        LLAMA_LOG_ERROR("%s: retaining whole context: %s\n", __func__, retain_reason);
         return;
     }
     delete ctx;

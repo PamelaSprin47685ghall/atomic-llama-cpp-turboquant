@@ -467,6 +467,9 @@ struct provider {
     bool                                  definition_changed = true;
     submission                            mode = submission::direct;
     ggml_relay_status                     status              = {};
+    // The current error text is only the host abort. The first real error
+    // after it may append its operation text without changing the code.
+    bool                                  abort_attributed    = false;
     bool                                  active              = false;
     bool                                  tails_attempted     = false;
     size_t                                next_channel        = 0;
@@ -523,18 +526,52 @@ int32_t read_pending_abort(provider & p) noexcept {
     return state;
 }
 
+void record_failure(provider & p, int code, const char * message) {
+    p.status.failed     = true;
+    p.status.error_code = code ? code : EIO;
+    snprintf(p.status.error, sizeof(p.status.error), "%s", message);
+}
+
+// A host abort is already the primary cause. Do not let its own recording
+// append a second "native" detail to itself.
+void fail_abort(provider & p, int32_t error) {
+    p.event_status.store(-1, std::memory_order_release);
+    if (!p.status.failed) {
+        record_failure(p, error ? error : ECANCELED, "relay aborted by host");
+        p.abort_attributed = true;
+    }
+    if (p.abort_host) {
+        store(p.abort_host, 1);
+    }
+}
+
 void fail(provider & p, int code, const char * message) {
     p.event_status.store(-1, std::memory_order_release);
     if (!p.status.failed) {
-        // Only a claimed abort may attribute this failure to the host abort.
-        // A pending error that has not claimed the sticky bit is still an
-        // in-progress abort; a concurrent non-abort failure keeps its own
-        // code/message.
-        const bool aborted = (read_abort_claim(p) & abort_claim_bit) != 0;
-        const int32_t error = aborted ? p.pending_abort.load(std::memory_order_acquire) : 0;
-        p.status.failed       = true;
-        p.status.error_code   = error ? error : (code ? code : EIO);
-        snprintf(p.status.error, sizeof(p.status.error), "%s", aborted ? "relay aborted by host" : message);
+        if ((read_abort_claim(p) & abort_claim_bit) != 0) {
+            // The host abort keeps the code, but the operation and HIP error
+            // string still reach the caller. A real failure after an abort is
+            // evidence, not noise.
+            const int32_t error = p.pending_abort.load(std::memory_order_acquire);
+            p.status.failed     = true;
+            p.status.error_code = error ? error : (code ? code : ECANCELED);
+            if (code != 0 && message != nullptr) {
+                snprintf(p.status.error, sizeof(p.status.error), "relay aborted by host; first failure: %s", message);
+            } else {
+                snprintf(p.status.error, sizeof(p.status.error), "%s", "relay aborted by host");
+            }
+        } else {
+            // A pending error that has not claimed the sticky bit is still an
+            // in-progress abort; a concurrent non-abort failure keeps its own
+            // code/message.
+            record_failure(p, code, message);
+        }
+        p.abort_attributed = false;
+    } else if (p.abort_attributed && code != 0 && message != nullptr) {
+        // The host abort won the first-error race; keep its code and append
+        // the first real operation text.
+        snprintf(p.status.error, sizeof(p.status.error), "relay aborted by host; first failure: %s", message);
+        p.abort_attributed = false;
     }
     if (p.abort_host) {
         store(p.abort_host, 1);
@@ -546,7 +583,7 @@ void consume_abort(provider & p) {
         return;
     }
     const int32_t error = p.pending_abort.load(std::memory_order_acquire);
-    fail(p, error ? error : ECANCELED, "relay aborted by host");
+    fail_abort(p, error);
 }
 
 // True when an abort is already claimed or its pending error is published.
@@ -559,7 +596,24 @@ bool abort_requested(provider & p) {
     }
     const int32_t pending = read_pending_abort(p);
     if (pending) {
-        fail(p, pending, "relay aborted by host");
+        fail_abort(p, pending);
+        return true;
+    }
+    return false;
+}
+
+// Cheap fail-closed check for hot submission and polling paths. A plain
+// acquire load can miss an abort that becomes visible immediately after it;
+// the success claim CAS still decides that race. Cold entry points use
+// abort_requested(), whose no-op RMW reads the latest modification order.
+bool abort_visible(provider & p) {
+    if (p.abort_claim.load(std::memory_order_acquire) & abort_claim_bit) {
+        consume_abort(p);
+        return true;
+    }
+    const int32_t pending = p.pending_abort.load(std::memory_order_acquire);
+    if (pending) {
+        fail_abort(p, pending);
         return true;
     }
     return false;
@@ -788,10 +842,23 @@ void observe(provider & p, bool query_native = true) {
             const uint64_t error = load(&c.host_control->error[r]);
             if (error) {
                 char detail[sizeof(p.status.error)];
-                std::snprintf(detail, sizeof(detail), "HIP relay wait failed channel=%zu rank=%u epoch=%llu device_code=%llu",
-                              i, r, static_cast<unsigned long long>(p.status.epoch),
+                const char * kind = "unknown device error";
+                int          code = EIO;
+                if (error == 1) {
+                    kind = "abort";
+                    code = ECANCELED;
+                } else if (error == 2) {
+                    kind = "future generation";
+                    code = EPROTO;
+                } else if (error == 3) {
+                    kind = "wait timeout";
+                    code = ETIMEDOUT;
+                }
+                std::snprintf(detail, sizeof(detail),
+                              "HIP relay %s channel=%zu rank=%u epoch=%llu device_code=%llu",
+                              kind, i, r, static_cast<unsigned long long>(p.status.epoch),
                               static_cast<unsigned long long>(error));
-                fail(p, ETIMEDOUT, detail);
+                fail(p, code, detail);
             }
             const uint64_t ready = (c.ready_seen & bit) ? p.status.epoch : load(&c.host_control->ready[r]);
             const uint64_t ack   = load(&c.host_control->ack[r]);
@@ -1506,7 +1573,11 @@ bool prepare_impl(void * opaque, ggml_tensor * const * terminals, size_t count, 
     if (abort_requested(p)) {
         return false;
     }
-    if (!idle(p) || p.status.failed) {
+    if (p.status.failed) {
+        return false;
+    }
+    if (!idle(p)) {
+        fail(p, EBUSY, "relay prepare requires an idle provider");
         return false;
     }
     if (!terminals || count == 0 || count > channel_capacity) {
@@ -1638,7 +1709,15 @@ bool begin(provider & p) {
     if (abort_requested(p)) {
         return false;
     }
-    if (!idle(p) || p.status.failed || p.status.channels == 0) {
+    if (p.status.failed) {
+        return false;
+    }
+    if (!idle(p)) {
+        fail(p, EBUSY, "relay begin requires an idle provider");
+        return false;
+    }
+    if (p.status.channels == 0) {
+        fail(p, EINVAL, "relay begin has no prepared channels");
         return false;
     }
     if (p.status.epoch == UINT64_MAX) {
@@ -1686,7 +1765,9 @@ bool begin(provider & p) {
 }
 
 void graph_begin(provider & p, uint32_t r, uint64_t compute_nodes) {
-    consume_abort(p);
+    if (abort_visible(p)) {
+        return;
+    }
     if (!p.active || p.tails_attempted || p.status.failed || r >= ranks || p.rank[r].graph_pending) {
         fail(p, EINVAL, "invalid relay graph_begin ordering");
         return;
@@ -1700,7 +1781,9 @@ void graph_begin(provider & p, uint32_t r, uint64_t compute_nodes) {
 }
 
 void graph_accepted(provider & p, uint32_t r) {
-    consume_abort(p);
+    if (abort_visible(p)) {
+        return;
+    }
     if (!p.active || p.tails_attempted || r >= ranks || !p.rank[r].graph_pending) {
         fail(p, EINVAL, "invalid relay graph_accepted ordering");
         return;
@@ -1717,15 +1800,16 @@ void graph_accepted(provider & p, uint32_t r) {
 }
 
 bool enqueue(provider & p, uint32_t index) {
-    consume_abort(p);
+    if (abort_visible(p)) {
+        return false;
+    }
     if (!p.active || p.tails_attempted || p.status.failed || index != p.next_channel || index >= p.status.channels) {
         fail(p, EINVAL, "invalid relay channel enqueue ordering");
         return false;
     }
     auto &         c      = p.channels[index];
     for (uint32_t r = 0; r < ranks; ++r) {
-        consume_abort(p);
-        if (p.status.failed) {
+        if (abort_visible(p)) {
             return false;
         }
         if (p.rank[r].graph_pending || p.rank[r].accepted_graphs != p.next_channel + 1 || !select(p, r)) {
@@ -1790,7 +1874,9 @@ bool enqueue(provider & p, uint32_t index) {
 }
 
 bool finish(provider & p) {
-    consume_abort(p);
+    // A pending or claimed abort denies new instantiate/launch work below.
+    // Captures and tails must still be drained.
+    abort_requested(p);
     if (!p.active || p.tails_attempted) {
         fail(p, EINVAL, "relay finish without an active unsealed epoch");
         return false;
@@ -1811,7 +1897,7 @@ bool finish(provider & p) {
         // Observe an abort between the EndCapture and instantiate phases. The
         // EndCapture loop above must still end every capture, but no new
         // instantiate/launch work starts after an abort is visible here.
-        consume_abort(p);
+        abort_requested(p);
         for (uint32_t r = 0; r < ranks; ++r) {
             if (p.rank[r].accepted_graphs != p.status.channels + 1 || p.rank[r].graph_pending) {
                 fail(p, EIO, "relay capture is missing stages");
@@ -1819,7 +1905,7 @@ bool finish(provider & p) {
         }
         // No launch until all five complete executables exist. Failure leaves
         // partially created graph handles owned for checked destruction.
-        consume_abort(p);
+        abort_requested(p);
         if (!p.status.failed) {
             // Each job owns one rank. All jobs finish before any graph launch.
             // Async futures also wait if worker creation throws.
@@ -1854,13 +1940,12 @@ bool finish(provider & p) {
             p.frame_instantiates += instantiated;
             // An abort during the blocking instantiate jobs is observed here;
             // the launch loop below must not start after it.
-            consume_abort(p);
+            abort_requested(p);
         }
     }
     if (p.mode != submission::direct && !p.status.failed) {
         for (uint32_t r = 0; r < ranks; ++r) {
-            consume_abort(p);
-            if (p.status.failed || !select(p, r)) {
+            if (abort_requested(p) || p.status.failed || !select(p, r)) {
                 break;
             }
             const uint32_t bit = 1u << r;
@@ -1898,7 +1983,7 @@ bool finish(provider & p) {
         fail(p, EIO, "relay frame has incomplete or unknown submissions");
     }
     p.active = false;
-    consume_abort(p);
+    abort_requested(p);
     if (p.plan_pinned) {
         p.plan_pinned = false;
         if (!p.plan_cache.release(p.status.plan_generation)) {
@@ -2068,7 +2153,15 @@ bool submit(void * opaque, ggml_cgraph * const * graphs, size_t stages) {
     if (abort_requested(p)) {
         return false;
     }
-    if (!idle(p) || p.status.failed || !graphs || stages != p.status.channels + 1) {
+    if (p.status.failed) {
+        return false;
+    }
+    if (!idle(p)) {
+        fail(p, EBUSY, "relay submit requires an idle provider");
+        return false;
+    }
+    if (!graphs || stages != p.status.channels + 1) {
+        fail(p, EINVAL, "relay submit stage count does not match the prepared plan");
         return false;
     }
     const uint64_t uid = graphs[0] ? graphs[0]->uid : 0;
@@ -2295,8 +2388,7 @@ int poll_event(void * opaque, Event * event) {
     if (!lock.owns_lock()) {
         return 0;
     }
-    consume_abort(p);
-    if (p.status.failed) {
+    if (abort_visible(p) || p.status.failed) {
         return -1;
     }
     if (p.borrowed != std::numeric_limits<size_t>::max()) {
@@ -2405,7 +2497,11 @@ bool publish_event(void * opaque, const Event * event) {
     // A generic abort alone cannot revoke a concurrently executing CPU reader.
     p.borrowed = std::numeric_limits<size_t>::max();
     observe(p, false);
-    if (p.status.failed || !p.status.sealed || !c.offered || c.published) {
+    // A pending abort that has not claimed the sticky bit is still an abort
+    // request. Fail closed after the borrow is returned, so no success
+    // generation follows it. A success CAS that races past this check is
+    // still ordered by the claim word.
+    if (abort_visible(p) || p.status.failed || !p.status.sealed || !c.offered || c.published) {
         return false;
     }
     // Claim this publication on the abort/success word. The CAS is the
@@ -2450,8 +2546,7 @@ bool snapshot(void * opaque, ggml_relay_status * status) {
     // epoch released, and event_status==0. Epoch 0 is settled by definition;
     // after prepare, status.channels may change before begin without touching
     // outputs_released, so the explicit count comparison is required.
-    if ((read_abort_claim(p) & abort_claim_bit) != 0) {
-        consume_abort(p);
+    if (abort_requested(p)) {
         // Failure is sticky, but physical drain is a separate fact. Keep
         // querying native tails and completion even in the failed state; do
         // not publish a success. This lets finished/borrow advance so a later
@@ -2472,9 +2567,9 @@ bool snapshot(void * opaque, ggml_relay_status * status) {
         return true;
     }
     observe(p);
-    if (read_abort_claim(p) & abort_claim_bit) {
-        consume_abort(p);
-    }
+    // A pending abort published during observe() must not leave this snapshot
+    // looking healthy while poll() already returns -1.
+    abort_requested(p);
     *status = p.status;
     return true;
 }
@@ -2507,6 +2602,22 @@ bool plan_snapshot(void * opaque, ggml_relay_plan_snapshot * snapshot) {
     snapshot->flushes          = stats.flushes;
     snapshot->stale_generation = stats.stale_generation;
     snapshot->pool_bytes       = p.pool_bytes;
+    return true;
+}
+
+bool borrow_snapshot(void * opaque, ggml_relay_borrow_status * status) {
+    if (!opaque || !status) {
+        return false;
+    }
+    auto &                       p = *static_cast<provider *>(opaque);
+    std::unique_lock<std::mutex> lock(p.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return false;
+    }
+    status->borrowed_channel = p.borrowed == std::numeric_limits<size_t>::max()
+        ? UINT32_MAX : uint32_t(p.borrowed);
+    status->outputs_released = uint64_t(p.outputs_released);
+    status->channels         = p.status.channels;
     return true;
 }
 
@@ -2544,8 +2655,25 @@ bool destroy(void * opaque) {
     if (!lock.owns_lock()) {
         return false;
     }
-    if (p->active || !idle(*p)) {
-        fail(*p, EBUSY, "relay destroy cannot prove CPU and native completion; retaining owners");
+    if (p->active) {
+        fail(*p, EBUSY, "relay destroy during an active epoch; retaining owners");
+        return false;
+    }
+    if (!idle(*p)) {
+        char detail[sizeof(p->status.error)];
+        if (p->borrowed != std::numeric_limits<size_t>::max()) {
+            std::snprintf(detail, sizeof(detail),
+                          "relay destroy has an outstanding CPU borrow channel=%zu; publish the saved view or retain owners",
+                          p->borrowed);
+        } else if (!p->status.finished) {
+            std::snprintf(detail, sizeof(detail),
+                          "relay destroy cannot prove native completion; retaining owners");
+        } else {
+            std::snprintf(detail, sizeof(detail),
+                          "relay destroy has unreleased outputs; retaining owners");
+        }
+        GGML_LOG_ERROR("HIP relay destroy refused: %s\n", detail);
+        fail(*p, EBUSY, detail);
         return false;
     }
     // Snapshot before the teardown flush: live plans and frames are the
@@ -2574,6 +2702,7 @@ const ggml_relay_provider_i interface = {
     abort,
     prepare_ex,
     plan_snapshot,
+    borrow_snapshot,
 };
 
 const ggml_relay_wire_provider_i wire_interface = {

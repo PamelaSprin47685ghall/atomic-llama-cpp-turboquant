@@ -2767,10 +2767,12 @@ struct ggml_backend_meta_context {
             auto get_interface = (ggml_backend_relay_get_interface_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_relay_get_interface");
             relay_i = get_interface != nullptr ? get_interface() : nullptr;
-            // ABI 3 appends prepare_ex/plan_snapshot. Accept an older provider
-            // (ABI 2) and only call the fields it actually has.
+            // ABI 3 appends prepare_ex/plan_snapshot; ABI 4 appends
+            // borrow_snapshot. Accept an older provider (ABI 2) and only call
+            // the fields it actually has.
             if (relay_i == nullptr || relay_i->abi_version < 2 ||
                 relay_i->abi_version > GGML_RELAY_PROVIDER_ABI_VERSION ||
+                (relay_i->abi_version >= 4 && !relay_i->borrow_snapshot) ||
                 !relay_i->create || !relay_i->destroy || !relay_i->prepare || !relay_i->submit ||
                 !relay_i->poll || !relay_i->publish || !relay_i->snapshot || !relay_i->abort) {
                 GGML_LOG_ERROR("%s: HIP tp5-relay capability is unavailable or incompatible\n", __func__);
@@ -5596,4 +5598,11 @@ bool ggml_backend_relay_plan_snapshot(ggml_backend_t backend, ggml_relay_plan_sn
     return ctx != nullptr && snapshot != nullptr && ctx->relay_i->abi_version >= 3 &&
            ctx->relay_i->plan_snapshot != nullptr &&
            ctx->relay_i->plan_snapshot(ctx->relay, snapshot);
+}
+
+bool ggml_backend_relay_borrow_snapshot(ggml_backend_t backend, ggml_relay_borrow_status * status) {
+    auto * ctx = ggml_backend_relay_meta_context(backend);
+    return ctx != nullptr && status != nullptr && ctx->relay_i->abi_version >= 4 &&
+           ctx->relay_i->borrow_snapshot != nullptr &&
+           ctx->relay_i->borrow_snapshot(ctx->relay, status);
 }

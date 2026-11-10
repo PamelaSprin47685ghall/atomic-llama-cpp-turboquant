@@ -138,7 +138,8 @@ struct fixture {
         }
         require(count == ranks, "this opt-in A test requires five qualified HIP devices");
         require(api && api->create && api->prepare && api->submit && api->poll &&
-                api->publish && api->snapshot && api->abort && api->destroy, "incomplete provider interface");
+                api->publish && api->snapshot && api->abort && api->destroy &&
+                api->borrow_snapshot, "incomplete provider interface");
 
         for (size_t i = 0; i < ranks; ++i) {
             auto & r = rank[i];
@@ -296,9 +297,78 @@ struct fixture {
         require(api->snapshot(provider, &status) && status.failed && status.finished &&
                 status.completed_mask == all_ranks && status.unknown_mask == 0,
                 "idle abort lost the existing native drain proof");
+        ggml_relay_borrow_status borrow_status{};
+        require(api->borrow_snapshot(provider, &borrow_status) &&
+                borrow_status.borrowed_channel == UINT32_MAX &&
+                borrow_status.outputs_released == borrow_status.channels,
+                "idle abort lost the CPU drain proof");
         require(api->destroy(provider), "provider refused completed destruction");
         provider = nullptr;
         free_consumers();
+    }
+
+    // The CPU owns a work view until it publishes the exact event. Abort makes
+    // poll and publish fail, but only the matching publish may return the
+    // borrow. A mismatched publish must keep it.
+    void abort_with_borrow(clock_type::time_point deadline) {
+        std::cerr << "phase abort_borrow prepare\n";
+        std::array<float, width> values{};
+        for (auto & r : rank) {
+            ggml_backend_tensor_set(r.input, values.data(), 0, sizeof(values));
+        }
+        prepare(false);
+        std::cerr << "phase abort_borrow submit\n";
+        require(api->submit(provider, graphs.data(), 2), "submitting the abort-borrow epoch failed");
+
+        ggml_relay_event event{};
+        for (;;) {
+            require(clock_type::now() < deadline, "abort-borrow deadline exceeded before the view");
+            const int result = api->poll(provider, &event);
+            require(result >= 0, "provider poll failed before the view");
+            if (result == 1 && event.kind == GGML_RELAY_INPUT_READY) {
+                break;
+            }
+            std::this_thread::yield();
+        }
+        borrow = event;
+        borrowed = true;
+
+        std::cerr << "phase abort_borrow abort\n";
+        api->abort(provider, ECANCELED);
+        require(api->poll(provider, &event) < 0, "poll hid the claimed abort");
+
+        ggml_relay_status status{};
+        require(api->snapshot(provider, &status), "snapshot after abort failed");
+        require(status.failed && status.error_code == ECANCELED,
+                "abort code was not visible through snapshot");
+        ggml_relay_borrow_status borrow_status{};
+        require(api->borrow_snapshot(provider, &borrow_status) &&
+                borrow_status.borrowed_channel == borrow.channel,
+                "borrow snapshot did not report the outstanding CPU borrow");
+
+        ggml_relay_event mismatched{};
+        require(!api->publish(provider, &mismatched), "mismatched publish succeeded");
+        require(api->borrow_snapshot(provider, &borrow_status) &&
+                borrow_status.borrowed_channel == borrow.channel,
+                "mismatched publish released a live CPU borrow");
+        require(!api->destroy(provider), "destroy accepted a live CPU borrow");
+
+        std::cerr << "phase abort_borrow return\n";
+        require(!api->publish(provider, &borrow), "abort publish reported success");
+        borrowed = false;
+        require(api->borrow_snapshot(provider, &borrow_status) &&
+                borrow_status.borrowed_channel == UINT32_MAX,
+                "matching publish did not return the CPU borrow");
+
+        for (;;) {
+            require(clock_type::now() < deadline, "abort-borrow native drain deadline exceeded");
+            if (api->snapshot(provider, &status) && status.finished) {
+                break;
+            }
+            std::this_thread::yield();
+        }
+        require(api->destroy(provider), "provider refused destruction after the borrow returned");
+        provider = nullptr;
     }
 
     void free_consumers() {
@@ -394,6 +464,11 @@ int main(int argc, char ** argv) {
             }
         }
         test.close();
+        // A fresh provider owns a fresh claim word. The first provider proved
+        // idle-abort visibility; this one proves the abort/borrow contract.
+        test.open();
+        test.abort_with_borrow(deadline);
+        test.free_consumers();
         std::cout << "{\"status\":\"PASS\",\"ranks\":5,\"channels\":1,\"epochs\":9,"
                      "\"binding_order\":\"A-B-A\",\"epochs_per_binding\":3,\"elements\":257,"
                      "\"input_bitwise_checks\":" << test.input_checks <<

@@ -143,6 +143,8 @@ GGML_API int  ggml_backend_relay_poll(ggml_backend_t backend, struct ggml_relay_
 // outstanding INPUT_READY view, including epoch, plan, channel and output.
 // After abort this call returns the CPU borrow, returns false, and never
 // publishes a success generation. Abort alone does not end a CPU borrow.
+// A mismatched event returns false and keeps the borrow: the provider cannot
+// prove the CPU reader stopped. Retry with the saved view.
 GGML_API bool ggml_backend_relay_publish(ggml_backend_t backend, const struct ggml_relay_event * event);
 // False also permits temporary contention; retry without holding a provider
 // view or lock. A finished epoch whose outputs are all released has no
@@ -180,9 +182,13 @@ GGML_API bool ggml_backend_relay_publish_v2(
 // then try_lock the provider mutex (non-blocking) to consume the abort into
 // status; it never waits on that lock or a HIP launch/JIT/EventRecord holder.
 // A return guarantees the claim/device word, not that status.failed is set;
-// the next consuming entry sets it. The backend must outlive this call and
-// must not be destroyed concurrently, as for any ggml_backend_t operation;
-// the claim does not protect object lifetime.
+// the next consuming entry sets it. The pending error is visible before the
+// claim bit: poll(), snapshot(), prepare/submit/begin and finish() fail closed
+// once they observe it. A host success that already passed that check and
+// wins the claim CAS is still ordered before this abort by the claim word.
+// The backend must outlive this call and must not be destroyed concurrently,
+// as for any ggml_backend_t operation; the claim does not protect object
+// lifetime.
 GGML_API void ggml_backend_relay_abort(ggml_backend_t backend, int32_t error_code);
 
 // Pillar 5: describe the next relay plan before its graph is submitted.
@@ -197,6 +203,21 @@ GGML_API void ggml_backend_meta_set_plan_key(
 // does not extend ggml_relay_status.
 GGML_API bool ggml_backend_relay_plan_snapshot(
         ggml_backend_t backend, struct ggml_relay_plan_snapshot * snapshot);
+
+// Optional CPU borrow/drain facts for the current provider epoch. Returns
+// false when the backend is not a relay, the provider predates this query, or
+// the provider mutex is temporarily contended; retry without holding a view.
+// This does not extend ggml_relay_status. borrowed_channel is UINT32_MAX when
+// no work view is outstanding. A borrow survives abort: the CPU reader may
+// still own the mapped payload. Publish the saved INPUT_READY view to return
+// it, or retain the owner. The provider never revokes a borrow on its own.
+struct ggml_relay_borrow_status {
+    uint32_t borrowed_channel;
+    uint64_t outputs_released;
+    uint64_t channels;
+};
+GGML_API bool ggml_backend_relay_borrow_snapshot(
+        ggml_backend_t backend, struct ggml_relay_borrow_status * status);
 
 #ifdef __cplusplus
 }
