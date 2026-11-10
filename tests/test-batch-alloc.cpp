@@ -130,6 +130,47 @@ static void test_init(testing & t) {
         }
     });
 
+    t.test("rejects_invalid_n_seq_id", [&](testing & t) {
+        llama_batch_allocr ba(1);
+
+        {
+            // A negative count must be refused: it would skip the seq_id walk
+            // and then reach ubatch_add() as a huge size_t reserve.
+            batch_builder bb;
+            bb.add(0, {0}, true);
+            bb.n_seq_id[0] = -1;
+            t.assert_true("negative n_seq_id", !ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+        }
+        {
+            // An oversized count must be refused before the seq_id walk reads
+            // past the caller's single-entry row.
+            batch_builder bb;
+            bb.add(0, {0}, true);
+            bb.n_seq_id[0] = 5;
+            t.assert_true("n_seq_id > n_seq_max", !ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+        }
+        {
+            // seq_id without n_seq_id: the count defaults to one. The old
+            // validation dereferenced the null n_seq_id array here.
+            batch_builder bb;
+            bb.add(0, {0}, true);
+            llama_batch batch = bb.make();
+            batch.n_seq_id = nullptr;
+            t.assert_true("seq_id without n_seq_id is accepted", ba.init(batch, vocab, nullptr, bb.n_embd, 4, false));
+            t.assert_equal("defaulted count is one", 1, ba.get_batch().n_seq_id[0]);
+        }
+        {
+            // n_seq_id without seq_id: the count is still validated because
+            // the auto-generated seq_id row is sized from it.
+            batch_builder bb;
+            bb.add(0, {0}, true);
+            llama_batch batch = bb.make();
+            batch.seq_id = nullptr;
+            batch.n_seq_id[0] = -1;
+            t.assert_true("negative n_seq_id without seq_id", !ba.init(batch, vocab, nullptr, bb.n_embd, 4, false));
+        }
+    });
+
     t.test("autofill_defaults", [&](testing & t) {
         batch_builder bb;
         for (int i = 0; i < 4; ++i) {

@@ -91,10 +91,30 @@ bool llama_batch_allocr::init(
         }
     }
 
+    // Validate the per-token sequence count before any row walk. The count is
+    // the only extent that bounds seq_id[i], and three separate failures ride
+    // on an unchecked value:
+    //   - a negative count skips the seq_id checks below,
+    //   - a count above n_seq_max reads past the caller's seq_id row,
+    //   - a count above n_seq_max reaches ubatch_add(), whose
+    //     (size_t) batch.n_seq_id[idxs[i]] sum then reserves an unbounded
+    //     seq_id_data buffer.
+    // A caller that supplies seq_id without n_seq_id keeps the documented
+    // single-default-sequence meaning instead of dereferencing null.
+    if (batch.n_seq_id) {
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (batch.n_seq_id[i] < 0 || batch.n_seq_id[i] > (int32_t) n_seq_max) {
+                LLAMA_LOG_ERROR("%s: invalid n_seq_id[%d] = %d, expected 0..%u\n", __func__, i, batch.n_seq_id[i], n_seq_max);
+                return false;
+            }
+        }
+    }
+
     if (batch.seq_id) {
         for (int32_t i = 0; i < batch.n_tokens; ++i) {
-            for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
-                if (batch.seq_id && (batch.seq_id[i][s] < 0 || batch.seq_id[i][s] >= (llama_seq_id) n_seq_max)) {
+            const int32_t n_seq_id_i = batch.n_seq_id ? batch.n_seq_id[i] : 1;
+            for (int32_t s = 0; s < n_seq_id_i; ++s) {
+                if (batch.seq_id[i][s] < 0 || batch.seq_id[i][s] >= (llama_seq_id) n_seq_max) {
                     LLAMA_LOG_ERROR("%s: invalid seq_id[%d][%d] = %d >= %d\n", __func__, i, s, batch.seq_id[i][s], (llama_seq_id) n_seq_max);
                     return false;
                 }
