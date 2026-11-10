@@ -13,6 +13,8 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
+#include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>

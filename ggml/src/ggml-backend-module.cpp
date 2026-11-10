@@ -1,7 +1,11 @@
 #include "ggml-backend-module.h"
 #include "ggml-impl.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <new>
 #include <unordered_map>

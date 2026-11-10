@@ -12,14 +12,17 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
 #include <thread>
+#include <utility>
 
 #include "llama.h"
 #include <vector>
