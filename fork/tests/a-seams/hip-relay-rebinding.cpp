@@ -99,6 +99,7 @@ struct fixture {
     void * provider = nullptr;
     bool create_attempted = false;
     bool borrowed = false;
+    uint64_t pending_token = 0;
     ggml_relay_event borrow{};
     size_t input_checks = 0;
     size_t selected_checks = 0;
@@ -323,6 +324,7 @@ struct fixture {
         uint64_t token = 0;
         require(api->submit_token(provider, graphs.data(), 2, &token) && token != 0,
                 "submitting the abort-borrow token epoch failed");
+        pending_token = token;
 
         ggml_relay_event event{};
         for (;;) {
@@ -386,6 +388,7 @@ struct fixture {
         require(api->wait_token(provider, token, &token_error) == GGML_RELAY_TOKEN_FAILED,
                 "aborted token did not report failure");
         api->release_token(provider, token);
+        pending_token = 0;
         require(api->destroy(provider), "provider refused destruction after the borrow returned");
         provider = nullptr;
     }
@@ -416,6 +419,12 @@ struct fixture {
         }
         if (provider) {
             api->abort(provider, EIO);
+            if (pending_token != 0) {
+                // The failure path does not need the token's wait proof: idle()
+                // still waits on the lane tails before destroy().
+                api->release_token(provider, pending_token);
+                pending_token = 0;
+            }
             if (borrowed) {
                 (void) api->publish(provider, &borrow);
                 borrowed = false;
