@@ -6031,6 +6031,7 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 static void ggml_cl_free(ggml_backend_t backend) {
     ggml_backend_opencl_context * ctx = (ggml_backend_opencl_context *) backend->context;
     ctx->free();
+    delete backend;
 }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS

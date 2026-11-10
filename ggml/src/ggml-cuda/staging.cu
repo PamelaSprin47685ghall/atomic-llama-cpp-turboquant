@@ -8,6 +8,8 @@
 namespace ggml_cuda_staging {
 namespace {
 
+static ggml_backend_reg_t g_provider_reg = nullptr;
+
 int hip_host_alloc(size_t bytes, void ** out) {
     void * host = nullptr;
     const cudaError_t err = cudaHostAlloc(&host, bytes, cudaHostAllocMapped | cudaHostAllocPortable);
@@ -130,6 +132,22 @@ bool api_acquire_nowait(uint32_t window, kind k, size_t bytes, lease * out) {
     return global_pool().acquire(window, k, bytes, out, /*wait_pending =*/ false);
 }
 
+bool api_owner_acquire(uint64_t run_id, uint32_t window_id, uint64_t * owner, uint64_t * generation) {
+    return global_pool().owner_acquire(run_id, window_id, owner, generation);
+}
+
+bool api_acquire_owner(uint64_t owner, uint64_t generation, kind k, size_t bytes, lease * out, bool wait_pending) {
+    return global_pool().acquire_owner(owner, generation, k, bytes, out, wait_pending);
+}
+
+int api_owner_drain(uint64_t owner, uint64_t generation) {
+    return int(global_pool().owner_drain(owner, generation));
+}
+
+bool api_owner_release(uint64_t owner, uint64_t generation) {
+    return global_pool().owner_release(owner, generation);
+}
+
 int api_upload(const lease * l, const void * src, size_t bytes) {
     if (l == nullptr) {
         return int(submit_result::rejected);
@@ -238,6 +256,10 @@ const api kApi = {
     /* .zc_enabled        = */ api_zc_enabled,
     /* .mark_partial      = */ api_mark_partial,
     /* .kind_count       = */ kKindCount,
+    /* .owner_acquire    = */ api_owner_acquire,
+    /* .acquire_owner    = */ api_acquire_owner,
+    /* .owner_drain      = */ api_owner_drain,
+    /* .owner_release    = */ api_owner_release,
 };
 
 }  // namespace
@@ -289,15 +311,12 @@ void dump() {
     ggml_backend_meta_staging_diag_dump();
 }
 
-void init() {
-    static std::atomic<bool> done{false};
-    if (done.exchange(true, std::memory_order_relaxed)) {
-        return;
-    }
-    // A rejected table does not replace an existing registration; if none is
-    // registered, staging stays unregistered and the original copy path is
-    // used. The provider keeps running and does not receive a failure state.
-    (void) ggml_backend_meta_staging_register(&kApi);
+void init(ggml_backend_reg_t reg) {
+    g_provider_reg = reg;
+    // Register on every entry: after a quiescent unload the backend registry
+    // may dlopen the same DSO again, and the provider must get a fresh tag
+    // instead of leaving old tokens pointing at an unregistered entry.
+    (void) ggml_backend_meta_staging_register_for_reg(reg, &kApi);
     static const bool diag = [] {
         const char * v = std::getenv("GGML_TP5_STAGING_DIAG");
         return v != nullptr && std::strcmp(v, "1") == 0;
@@ -305,6 +324,10 @@ void init() {
     if (diag) {
         std::atexit(dump);
     }
+}
+
+ggml_backend_reg_t provider_reg() {
+    return g_provider_reg;
 }
 
 // The pool is never destroyed: HIP may be unloaded before static destructors.

@@ -1515,3 +1515,22 @@ add_test(NAME test-meta-host-view-copy COMMAND test-meta-host-view-copy)
 set_property(TEST test-meta-host-view-copy PROPERTY LABELS "cpu;meta")
 set_property(TEST test-meta-host-view-copy PROPERTY PASS_REGULAR_EXPRESSION "META_HOST_VIEW_COPY_TEST PASS")
 set_property(TEST test-meta-host-view-copy PROPERTY FAIL_REGULAR_EXPRESSION "FAIL ")
+# TP5 staging owner-runtime retention. Real QWEN4EXP target/draft contexts
+# (self-generated CPU fixtures) drive the per-run retainer: old busy + new run,
+# release failure, delayed completion and record capacity. The staging
+# provider is a real pool with controllable events. The test takes the target
+# and draft GGUF paths; register it only when the fixture paths are known.
+add_executable(test-tp5-staging-owner-runtime test-tp5-staging-owner-runtime.cpp)
+target_link_libraries(test-tp5-staging-owner-runtime PRIVATE llama)
+target_include_directories(test-tp5-staging-owner-runtime PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/ggml/src
+    ${PROJECT_SOURCE_DIR}/fork/tp5-compose/src)
+if (MTP_DRAFTONLY_TARGET AND MTP_DRAFTONLY_DRAFT)
+    add_test(NAME test-tp5-staging-owner-runtime
+             COMMAND test-tp5-staging-owner-runtime "${MTP_DRAFTONLY_TARGET}" "${MTP_DRAFTONLY_DRAFT}")
+    set_property(TEST test-tp5-staging-owner-runtime PROPERTY LABELS "model;cpu;tp5;staging")
+    set_property(TEST test-tp5-staging-owner-runtime PROPERTY PASS_REGULAR_EXPRESSION "TP5_STAGING_OWNER_RUNTIME_TEST PASS")
+    set_property(TEST test-tp5-staging-owner-runtime PROPERTY TIMEOUT 300)
+endif()

@@ -556,6 +556,74 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // v4 staging owner credit. The provider issues a monotonic owner/generation
+    // and a finite credit window; the combiner holds the token and passes the
+    // same owner to the target and its MTP draft context. The token is opaque:
+    // it names the issuing provider and an active owner entry. Pass it
+    // unchanged to drain/release and to set_staging_owner. set_staging_owner
+    // validates that the token is active and that the issuing provider is the
+    // backend's child provider; it refuses to overwrite a different bound
+    // owner. Acquire through the _for_reg/_for_device/_for_backend forms so the
+    // provider comes from the real target, not a last-registered default.
+    // Drain is independent of the context native drain; only a drained owner
+    // may be released.
+    // Legacy form: accepted only while exactly one provider is registered.
+    GGML_API bool ggml_backend_meta_staging_owner_acquire(
+        uint64_t run_id, uint32_t window_id, uint64_t * owner, uint64_t * generation);
+    // Provider-bound acquisition: the token is issued by the staging provider
+    // of the given registry/device/backend, never by a global last-registered
+    // provider. The backend form uses the Meta backend's child provider.
+    GGML_API bool ggml_backend_meta_staging_owner_acquire_for_reg(
+        ggml_backend_reg_t reg, uint64_t run_id, uint32_t window_id,
+        uint64_t * owner, uint64_t * generation);
+    // Common child registry for a Meta device, or the device's own registry
+    // for a non-Meta device. Null means mixed children/no common provider.
+    GGML_API ggml_backend_reg_t ggml_backend_meta_staging_provider_reg_for_device(
+        ggml_backend_dev_t dev);
+    GGML_API bool ggml_backend_meta_staging_owner_acquire_for_device(
+        ggml_backend_dev_t dev, uint64_t run_id, uint32_t window_id,
+        uint64_t * owner, uint64_t * generation);
+    GGML_API bool ggml_backend_meta_staging_owner_acquire_for_backend(
+        ggml_backend_t backend, uint64_t run_id, uint32_t window_id,
+        uint64_t * owner, uint64_t * generation);
+    // Waits in bounded 100 ms steps for provider credit backpressure; returns
+    // false only for an illegal/duplicate request or an unusable provider.
+    GGML_API bool ggml_backend_meta_staging_owner_acquire_for_backend_wait(
+        ggml_backend_t backend, uint64_t run_id, uint32_t window_id,
+        uint64_t * owner, uint64_t * generation, uint32_t timeout_ms);
+    // Atomically reserves one token per unique provider in the lane set under
+    // a global acquisition order. Returns 0 OK, 1 temporary busy, 2 invalid.
+    // timeout_ms=0 waits until a running context releases credit.
+    GGML_API int ggml_backend_meta_staging_owner_acquire_set(
+        ggml_backend_t * lanes, size_t n_lanes, uint64_t run_id, uint32_t window_id,
+        uint64_t * owners, uint64_t * generations, size_t * out_count,
+        uint32_t timeout_ms);
+    GGML_API int  ggml_backend_meta_staging_owner_drain(uint64_t owner, uint64_t generation);
+    // Per-context references for a token shared by target/draft. Release is
+    // refused until every bound context unbinds.
+    GGML_API ggml_backend_reg_t ggml_backend_meta_staging_provider_reg_for_backend(
+        ggml_backend_t backend);
+    GGML_API ggml_backend_reg_t ggml_backend_meta_staging_owner_provider_reg(
+        uint64_t owner, uint64_t generation);
+    GGML_API bool ggml_backend_meta_clear_staging_owner(ggml_backend_t backend);
+    GGML_API bool ggml_backend_meta_staging_owner_context_bind(uint64_t owner, uint64_t generation);
+    GGML_API bool ggml_backend_meta_staging_owner_context_unbind(uint64_t owner, uint64_t generation);
+    GGML_BASE_API void ggml_backend_meta_staging_owner_retry_orphans(void);
+    GGML_BASE_API size_t ggml_backend_meta_staging_owner_orphan_count(void);
+    GGML_BASE_API void ggml_backend_retry_retained(void);
+    GGML_API bool ggml_backend_meta_staging_owner_context_bind_many(
+        const uint64_t * owners, const uint64_t * generations, size_t n);
+    GGML_API bool ggml_backend_meta_staging_owner_context_unbind_many(
+        const uint64_t * owners, const uint64_t * generations, size_t n);
+    GGML_API bool ggml_backend_meta_staging_owner_release(uint64_t owner, uint64_t generation);
+    GGML_API bool ggml_backend_meta_set_staging_owner(
+        ggml_backend_t backend, uint64_t owner, uint64_t generation);
+    // Validates the token's acquired run/window in addition to provider/child
+    // identity. New callers should use this form.
+    GGML_API bool ggml_backend_meta_set_staging_owner_for_run(
+        ggml_backend_t backend, uint64_t owner, uint64_t generation,
+        uint64_t run_id, uint32_t window_id);
+
     // DUALWIN-COMPOSE-EVENT (GGML_TP5_DW_COMPOSE_EVENT=1): output-copy
     // completion expressed as device events instead of a scheduler-wide
     // synchronize.

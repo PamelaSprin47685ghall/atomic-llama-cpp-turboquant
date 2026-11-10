@@ -411,7 +411,7 @@ static void ggml_backend_zdnn_free(ggml_backend_t backend) {
     ggml_backend_zdnn_context * ctx = (ggml_backend_zdnn_context *)backend->context;
 
     ggml_zdnn_free(ctx);
-    free(backend);
+    delete backend;
 }
 
 static enum ggml_status ggml_backend_zdnn_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -498,8 +498,7 @@ static ggml_backend_t ggml_backend_zdnn_device_init(ggml_backend_dev_t dev, cons
         return NULL;
     }
 
-    ggml_backend_t backend = (ggml_backend *)malloc(sizeof(ggml_backend));
-    *backend = (ggml_backend) {
+    ggml_backend_t backend = new ggml_backend {
         /* .guid       = */ ggml_backend_zdnn_guid(),
         /* .iface      = */ ggml_backend_zdnn_i,
         /* .device     = */ dev,
@@ -619,7 +618,7 @@ ggml_backend_reg_t ggml_backend_zdnn_reg(void) {
 
     {
         g_ggml_backend_zdnn_reg = (ggml_backend_reg) {
-            /* .api_version = */ GGML_ZDNN_VERSION,
+            /* .api_version = */ GGML_BACKEND_API_VERSION,
             /* .iface       = */ ggml_backend_zdnn_reg_i,
             /* .context     = */ NULL
         };

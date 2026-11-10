@@ -851,6 +851,12 @@ bool can_enqueue_async_impl(ggml_backend_t backend, ggml_tensor * tensor,
     if (!ggml_backend_is_cuda(backend)) {
         return false;
     }
+    if (backend->device == nullptr || ggml_cuda_staging::provider_reg() == nullptr ||
+            backend->device->reg != ggml_cuda_staging::provider_reg()) {
+        // A provider table from another CUDA/HIP DSO must not accept this
+        // backend even when the fixed CUDA GUID matches.
+        return false;
+    }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     if (buf == nullptr || !ggml_backend_buffer_is_cuda(buf)) {
@@ -891,6 +897,11 @@ bool can_enqueue_sync_impl(ggml_tensor * tensor, size_t offset, size_t size) {
         return false;
     }
     const auto * buf_ctx = static_cast<ggml_backend_cuda_buffer_context *>(buf->context);
+    ggml_backend_dev_t buf_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+    if (buf_dev == nullptr || ggml_cuda_staging::provider_reg() == nullptr ||
+            buf_dev->reg != ggml_cuda_staging::provider_reg()) {
+        return false;
+    }
     if (buf_ctx->device < 0 || buf_ctx->device >= int(kRanks)) {
         return false;
     }
@@ -3915,6 +3926,7 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 
     if (cuda_ctx->tp5_relay_owner != nullptr) {
         GGML_LOG_ERROR("%s: retaining relay-owned backend until native completion is proved\n", __func__);
+        ggml_backend_mark_retained(backend);
         return;
     }
     delete cuda_ctx;
@@ -8401,7 +8413,7 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     static ggml_backend_reg reg;
     static bool initialized = false;
 
-    ggml_cuda_staging::init();
+    ggml_cuda_staging::init(&reg);
 
     {
         static std::mutex mutex;

@@ -2,12 +2,14 @@
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-module.h"
 #include "ggml-relay-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 #include "ggml-cuda/staging.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -33,8 +35,737 @@
 // the table null and keeps the original copy path.
 static std::atomic<const ggml_cuda_staging::api *> g_staging_api{nullptr};
 
-extern "C" bool ggml_backend_meta_staging_register(const void * impl) {
+// Owner tokens carry the issuing provider tag in the high 16 bits. The tag is
+// assigned once per DSO/provider and never reused; the low 48 bits are the
+// provider's raw owner id. A token therefore routes to the pool that issued it
+// even after another provider registers.
+static constexpr uint32_t kProviderTagBits = 16;
+static constexpr uint64_t kOwnerRawBits    = 48;
+static constexpr uint64_t kOwnerRawMask    = (uint64_t(1) << kOwnerRawBits) - 1;
+static constexpr uint32_t kMaxProviderTag  = (uint32_t(1) << kProviderTagBits) - 1;
+
+struct provider_entry {
+    struct token_info {
+        uint64_t raw_owner = 0;
+        uint64_t generation = 0;
+        uint64_t run_id = 0;
+        uint32_t window_id = 0;
+        uint32_t context_refs = 0;
+        bool releasing = false;
+    };
+    const ggml_cuda_staging::api * api = nullptr;
+    uint16_t tag = 0;
+    ggml_backend_reg_t reg = nullptr;
+    uint32_t active_owners = 0;
+    uint32_t active_calls = 0;
+    uint32_t live_users = 0;
+    // A failed load must not erase an entry that still has an owner, token,
+    // call, or lookup. Such an entry is kept (and its module pinned) until
+    // the last reference is gone.
+    bool quarantined = false;
+    std::unordered_map<uint64_t, token_info> tokens;
+};
+static std::vector<provider_entry> g_providers;
+static std::mutex g_provider_mutex;
+static uint32_t g_next_provider_tag = 0;
+static std::atomic<uint64_t> g_provider_epoch{1};
+static std::condition_variable g_provider_cv;
+static std::mutex g_owner_acquire_mutex;
+static provider_entry * provider_entry_for_tag_locked(uint16_t tag);
+extern "C" bool ggml_backend_meta_staging_owner_release(uint64_t owner, uint64_t generation);
+
+#ifdef TP5_TEST_HOOKS
+static std::atomic<int> g_test_fail_clear_remaining{0};
+static std::atomic<int> g_test_fail_unbind_remaining{0};
+#endif
+
+static std::mutex g_orphan_owner_mutex;
+static std::mutex g_orphan_retry_mutex;
+// Each record owns a real provider credit. The table grows with retained
+// owners instead of dropping an owner at a fixed capacity; only one retry
+// batch (not the table) is bounded per call.
+static constexpr std::size_t kOrphanRetryBatch = 64;
+struct orphan_owner_record {
+    uint64_t raw_owner = 0;
+    uint64_t generation = 0;
+    uint64_t token = 0;
+    uint16_t tag = 0;
+    const ggml_cuda_staging::api * provider = nullptr;
+    ggml_backend_reg_t reg = nullptr;
+    // Keep the DSO mapped for as long as the record may call owner_drain /
+    // owner_release, even if the provider entry is quarantined or removed.
+    std::shared_ptr<void> module;
+    bool used = false;
+    bool busy = false;
+    std::chrono::steady_clock::time_point next_retry{};
+    uint32_t attempts = 0;
+};
+struct orphan_owner_pool {
+    std::vector<orphan_owner_record> records;
+    std::vector<size_t> free_slots;
+};
+static orphan_owner_pool g_orphan_pool;
+
+enum class release_result {
+    released,
+    busy,
+    failed,
+    invalid,
+};
+
+static void drop_orphan_hold(uint16_t tag);
+static bool provider_reap_quarantined_locked();
+static release_result release_token_impl(uint64_t owner, uint64_t generation);
+static release_result release_orphan_record(const orphan_owner_record & record);
+
+struct orphan_ticket {
+    std::vector<size_t> slots;
+    size_t used = 0;
+};
+
+// Reserve records before an acquire/release side effect.  The only
+// allocations happen here; a failed reservation is retryable and the caller
+// must not acquire or release an owner yet.
+static bool orphan_reserve(size_t n, orphan_ticket & ticket) {
+    if (n == 0) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(g_orphan_owner_mutex);
+    try {
+        if (g_orphan_pool.free_slots.size() < n) {
+            const size_t old = g_orphan_pool.records.size();
+            const size_t add = n - g_orphan_pool.free_slots.size();
+            g_orphan_pool.records.resize(old + add);
+            for (size_t i = old; i < old + add; ++i) {
+                g_orphan_pool.free_slots.push_back(i);
+            }
+        }
+        ticket.slots.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            if (g_orphan_pool.free_slots.empty()) {
+                ticket.slots.clear();
+                return false;
+            }
+            ticket.slots[i] = g_orphan_pool.free_slots.back();
+            g_orphan_pool.free_slots.pop_back();
+        }
+    } catch (...) {
+        ticket.slots.clear();
+        return false;
+    }
+    ticket.used = 0;
+    return true;
+}
+
+static void orphan_cancel(orphan_ticket & ticket) {
+    std::lock_guard<std::mutex> lock(g_orphan_owner_mutex);
+    for (size_t i = ticket.used; i < ticket.slots.size(); ++i) {
+        g_orphan_pool.free_slots.push_back(ticket.slots[i]);
+    }
+    ticket.slots.clear();
+    ticket.used = 0;
+}
+
+// No allocation: fill one reserved slot with the complete owner identity.
+static int orphan_commit_raw(orphan_ticket & ticket, uint64_t raw_owner,
+                             uint64_t generation, uint16_t tag, uint64_t token,
+                             const ggml_cuda_staging::api * provider,
+                             ggml_backend_reg_t reg,
+                             std::shared_ptr<void> module) {
+    {
+        std::lock_guard<std::mutex> lock(g_orphan_owner_mutex);
+        for (const auto & record : g_orphan_pool.records) {
+            if (record.used && record.raw_owner == raw_owner &&
+                record.generation == generation && record.tag == tag &&
+                record.token == token) {
+                return 2;
+            }
+        }
+        if (ticket.used >= ticket.slots.size()) {
+            return 0;
+        }
+        orphan_owner_record & record = g_orphan_pool.records[ticket.slots[ticket.used++]];
+        record = {raw_owner, generation, token, tag, provider, reg,
+                  std::move(module), true, false};
+    }
+    return 1;
+}
+
+static void drop_orphan_hold(uint16_t tag) {
+    if (tag == 0) {
+        return;
+    }
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        provider_entry * entry = provider_entry_for_tag_locked(tag);
+        if (entry != nullptr && entry->active_owners > 0) {
+            --entry->active_owners;
+            changed = provider_reap_quarantined_locked();
+        }
+    }
+    if (changed) {
+        g_provider_cv.notify_all();
+    }
+}
+
+static void drop_active_call(uint16_t tag) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        provider_entry * entry = provider_entry_for_tag_locked(tag);
+        if (entry != nullptr && entry->active_calls > 0) {
+            --entry->active_calls;
+            changed = provider_reap_quarantined_locked();
+        }
+    }
+    if (changed) {
+        g_provider_cv.notify_all();
+    }
+}
+
+static release_result release_orphan_record(const orphan_owner_record & record) {
+    if (record.token != 0) {
+        // Token path: release_token_impl drains the provider owner before it
+        // removes the token and its active_owners hold.
+        return release_token_impl(record.token, record.generation);
+    }
+    if (record.provider == nullptr || record.provider->owner_drain == nullptr ||
+            record.provider->owner_release == nullptr) {
+        return release_result::invalid;
+    }
+    const int drained = record.provider->owner_drain(record.raw_owner, record.generation);
+    if (drained == int(ggml_cuda_staging::owner_drain_result::drained)) {
+        return record.provider->owner_release(record.raw_owner, record.generation)
+            ? release_result::released
+            : release_result::failed;
+    }
+    if (drained == int(ggml_cuda_staging::owner_drain_result::invalid)) {
+        return release_result::invalid;
+    }
+    if (drained == int(ggml_cuda_staging::owner_drain_result::busy)) {
+        return release_result::busy;
+    }
+    return release_result::failed;
+}
+
+static bool orphan_commit(orphan_ticket & ticket, uint64_t token, uint64_t generation) {
+    const uint16_t tag = uint16_t(token >> kOwnerRawBits);
+    const uint64_t raw = token & kOwnerRawMask;
+    if (tag == 0) {
+        // Untagged tokens have no provider entry to retain.
+        return true;
+    }
+    const ggml_cuda_staging::api * provider = nullptr;
+    ggml_backend_reg_t reg = nullptr;
+    {
+        std::lock_guard<std::mutex> provider_lock(g_provider_mutex);
+        provider_entry * entry = provider_entry_for_tag_locked(tag);
+        if (entry == nullptr) {
+            return true; // token already released or its provider is gone
+        }
+        const auto it = entry->tokens.find(token);
+        if (it == entry->tokens.end() || it->second.generation != generation) {
+            return true;
+        }
+        provider = entry->api;
+        reg = entry->reg;
+        ++entry->active_owners;
+    }
+    std::shared_ptr<void> module;
+    if (reg != nullptr) {
+        module = ggml_backend_module::hold(reg).module;
+    }
+    const int stored = orphan_commit_raw(ticket, raw, generation, tag, token,
+                                         provider, reg, std::move(module));
+    if (stored == 0) {
+        drop_orphan_hold(tag);
+        return false;
+    }
+    if (stored == 2) {
+        drop_orphan_hold(tag);
+    }
+    return true;
+}
+
+static bool remember_orphan_owner(uint64_t owner, uint64_t generation) {
+    const uint16_t tag = uint16_t(owner >> kOwnerRawBits);
+    if (tag == 0) {
+        GGML_LOG_ERROR("%s: cannot retain an untagged owner=%" PRIu64 "\n", __func__, owner);
+        return false;
+    }
+    const ggml_cuda_staging::api * provider = nullptr;
+    ggml_backend_reg_t reg = nullptr;
+    {
+        std::lock_guard<std::mutex> provider_lock(g_provider_mutex);
+        provider_entry * entry = provider_entry_for_tag_locked(tag);
+        if (entry == nullptr) {
+            return true; // nothing left to retain
+        }
+        const auto it = entry->tokens.find(owner);
+        if (it == entry->tokens.end() || it->second.generation != generation) {
+            return true;
+        }
+        provider = entry->api;
+        reg = entry->reg;
+        ++entry->active_owners;
+    }
+    std::shared_ptr<void> module;
+    if (reg != nullptr) {
+        module = ggml_backend_module::hold(reg).module;
+    }
+    bool duplicate = false;
+    bool full = false;
+    {
+        std::lock_guard<std::mutex> lock(g_orphan_owner_mutex);
+        for (const auto & record : g_orphan_pool.records) {
+            if (record.used && record.token == owner &&
+                record.generation == generation &&
+                record.tag == uint16_t(owner >> kOwnerRawBits)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            if (g_orphan_pool.free_slots.empty()) {
+                // The failure path may be the first to need a record. Grow
+                // by one real owner record; an allocation failure keeps the
+                // provider hold and reports full below.
+                try {
+                    const size_t slot = g_orphan_pool.records.size();
+                    g_orphan_pool.records.resize(slot + 1);
+                    g_orphan_pool.free_slots.push_back(slot);
+                } catch (...) {
+                    // fall through to the full path
+                }
+            }
+            if (g_orphan_pool.free_slots.empty()) {
+                full = true;
+            } else {
+                const size_t slot = g_orphan_pool.free_slots.back();
+                g_orphan_pool.free_slots.pop_back();
+                g_orphan_pool.records[slot] = {
+                    owner & kOwnerRawMask, generation, owner, tag, provider, reg,
+                    std::move(module), true, false
+                };
+            }
+        }
+    }
+    if (duplicate) {
+        drop_orphan_hold(tag);
+        return true;
+    }
+    if (full) {
+        // Keep the extra active_owners hold. The token remains in the map,
+        // so unload stays refused; this is retention, not silent loss.
+        GGML_LOG_ERROR("%s: orphan record pool full; retaining owner=%" PRIu64
+                       " and refusing unload until it is released\n", __func__, owner);
+        return false;
+    }
+    return true;
+}
+
+static void retry_orphan_owners_bounded(
+        std::chrono::steady_clock::time_point deadline, std::size_t max_records) {
+    // Only one retry pass may run. A provider drain can call back into the
+    // host; a second pass must not race the busy marker.
+    std::unique_lock<std::mutex> retry_lock(g_orphan_retry_mutex, std::try_to_lock);
+    if (!retry_lock.owns_lock()) {
+        return;
+    }
+    std::size_t record_count = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_orphan_owner_mutex);
+        record_count = g_orphan_pool.records.size();
+    }
+    std::size_t processed = 0;
+    for (std::size_t i = 0;
+            i < record_count && processed < max_records; ++i) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
+        orphan_owner_record record;
+        std::size_t slot = SIZE_MAX;
+        {
+            std::lock_guard<std::mutex> lock(g_orphan_owner_mutex);
+            orphan_owner_record & candidate = g_orphan_pool.records[i];
+            if (!candidate.used || candidate.busy ||
+                    std::chrono::steady_clock::now() < candidate.next_retry) {
+                continue;
+            }
+            candidate.busy = true;
+            record = candidate;
+            slot = i;
+        }
+        release_result result = release_result::failed;
+        try {
+            result = release_orphan_record(record);
+        } catch (...) {
+            // A provider callback must not kill the retry worker or leave
+            // the busy marker set. Treat it as a failed attempt.
+            result = release_result::failed;
+        }
+        if (result == release_result::released || result == release_result::invalid) {
+            drop_orphan_hold(record.tag);
+            orphan_owner_record retired;
+            {
+                std::lock_guard<std::mutex> lock(g_orphan_owner_mutex);
+                retired = std::move(g_orphan_pool.records[slot]);
+                g_orphan_pool.records[slot] = {};
+                g_orphan_pool.free_slots.push_back(slot);
+            }
+            // retired (and its module reference) destructs here, outside the
+            // orphan lock.
+        } else {
+            std::lock_guard<std::mutex> lock(g_orphan_owner_mutex);
+            orphan_owner_record & candidate = g_orphan_pool.records[slot];
+            if (candidate.used) {
+                candidate.busy = false;
+                ++candidate.attempts;
+                const uint32_t shift = std::min<uint32_t>(candidate.attempts, 6);
+                const auto delay = std::chrono::milliseconds(
+                    std::min<uint64_t>(5000, uint64_t(50) << shift));
+                candidate.next_retry = std::chrono::steady_clock::now() + delay;
+            }
+        }
+        ++processed;
+    }
+}
+
+extern "C" GGML_BASE_API void ggml_backend_meta_staging_owner_retry_orphans(void) {
+    retry_orphan_owners_bounded(
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(50),
+            kOrphanRetryBatch);
+}
+
+extern "C" size_t ggml_backend_meta_staging_owner_orphan_count(void) {
+    std::lock_guard<std::mutex> lock(g_orphan_owner_mutex);
+    size_t n = 0;
+    for (const auto & record : g_orphan_pool.records) {
+        n += record.used ? 1 : 0;
+    }
+    return n;
+}
+
+static provider_entry * provider_entry_for_tag_locked(uint16_t tag) {
+    if (tag == 0) {
+        return nullptr;
+    }
+    for (provider_entry & entry : g_providers) {
+        if (entry.tag == tag) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+// Called with g_provider_mutex held. A quarantined entry is removed only
+// after every owner, token, call, and lookup is gone. Its module reference is
+// dropped under the close-defer guard so the shared-handle deleter queues the
+// close instead of running dlclose under this lock.
+static bool provider_reap_quarantined_locked() {
+    bool changed = false;
+    for (auto it = g_providers.begin(); it != g_providers.end(); ) {
+        if (!it->quarantined || it->active_owners != 0 || it->active_calls != 0 ||
+                it->live_users != 0 || !it->tokens.empty()) {
+            ++it;
+            continue;
+        }
+        const auto * removed_api = it->api;
+        if (g_staging_api.load(std::memory_order_acquire) == removed_api) {
+            const ggml_cuda_staging::api * replacement = nullptr;
+            for (const provider_entry & other : g_providers) {
+                if (&other != &*it) {
+                    replacement = other.api;
+                    break;
+                }
+            }
+            g_staging_api.store(replacement, std::memory_order_release);
+        }
+        std::shared_ptr<void> module = std::move(it->module);
+        it = g_providers.erase(it);
+        g_provider_epoch.fetch_add(1, std::memory_order_release);
+        ggml_backend_module::close_defer_begin();
+        module.reset();
+        // Do not drain under g_provider_mutex; the next host transaction
+        // closes the queued handle.
+        ggml_backend_module::close_defer_end(false);
+        changed = true;
+    }
+    return changed;
+}
+
+
+static void provider_release(ggml_backend_reg_t reg) {
+    if (reg == nullptr) {
+        return;
+    }
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        for (provider_entry & entry : g_providers) {
+            if (entry.reg == reg) {
+                if (entry.live_users > 0) {
+                    --entry.live_users;
+                }
+                break;
+            }
+        }
+        changed = provider_reap_quarantined_locked();
+    }
+    if (changed) {
+        g_provider_cv.notify_all();
+    }
+}
+
+static const ggml_cuda_staging::api * provider_for_reg(ggml_backend_reg_t reg) {
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(g_provider_mutex);
+    for (const provider_entry & entry : g_providers) {
+        if (entry.reg == reg) {
+            return entry.api;
+        }
+    }
+    return nullptr;
+}
+
+static bool provider_usable(const ggml_cuda_staging::api * api) {
+    if (api == nullptr || api->usable == nullptr) {
+        return true;
+    }
+    try {
+        return api->usable();
+    } catch (...) {
+        return false;
+    }
+}
+
+// RAII provider lifetime hold. Constructors that can throw after acquiring a
+// hold must not leak live_users; the destructor always releases.
+struct provider_hold_ref {
+    ggml_backend_reg_t reg = nullptr;
+    uint16_t tag = 0;
+    const ggml_cuda_staging::api * api = nullptr;
+    bool held = false;
+
+    provider_hold_ref() = default;
+    provider_hold_ref(const provider_hold_ref &) = delete;
+    provider_hold_ref & operator=(const provider_hold_ref &) = delete;
+    provider_hold_ref(provider_hold_ref && other) noexcept
+        : reg(other.reg), tag(other.tag), api(other.api), held(other.held) {
+        other.reg = nullptr;
+        other.tag = 0;
+        other.api = nullptr;
+        other.held = false;
+    }
+    provider_hold_ref & operator=(provider_hold_ref && other) noexcept {
+        if (this != &other) {
+            release();
+            reg = other.reg;
+            tag = other.tag;
+            api = other.api;
+            held = other.held;
+            other.reg = nullptr;
+            other.tag = 0;
+            other.api = nullptr;
+            other.held = false;
+        }
+        return *this;
+    }
+    ~provider_hold_ref() {
+        release();
+    }
+
+    void release() {
+        if (held) {
+            provider_release(reg);
+            held = false;
+        }
+    }
+
+    const ggml_cuda_staging::api * acquire(ggml_backend_reg_t new_reg,
+                                           uint16_t * out_tag = nullptr) {
+        if (held) {
+            if (reg != new_reg) {
+                return nullptr;
+            }
+            if (out_tag != nullptr) {
+                *out_tag = tag;
+            }
+            return api;
+        }
+        if (new_reg == nullptr) {
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        for (provider_entry & entry : g_providers) {
+            if (entry.reg == new_reg) {
+                ++entry.live_users;
+                reg = new_reg;
+                tag = entry.tag;
+                api = entry.api;
+                held = true;
+                if (out_tag != nullptr) {
+                    *out_tag = tag;
+                }
+                return api;
+            }
+        }
+        return nullptr;
+    }
+};
+
+static bool provider_tag_for_reg(ggml_backend_reg_t reg, uint16_t * tag,
+                                 const ggml_cuda_staging::api ** api,
+                                 provider_hold_ref * hold) {
+    if (reg == nullptr || tag == nullptr || api == nullptr || hold == nullptr) {
+        return false;
+    }
+    uint16_t found_tag = 0;
+    const auto * found_api = hold->acquire(reg, &found_tag);
+    if (found_api == nullptr) {
+        return false;
+    }
+    *tag = found_tag;
+    *api = found_api;
+    return true;
+}
+
+static bool sole_provider_entry(uint16_t * tag, const ggml_cuda_staging::api ** api,
+                                ggml_backend_reg_t * reg, provider_hold_ref * hold) {
+    if (tag == nullptr || api == nullptr || reg == nullptr || hold == nullptr) {
+        return false;
+    }
+    uint16_t found_tag = 0;
+    ggml_backend_reg_t found_reg = nullptr;
+    const ggml_cuda_staging::api * found_api = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        if (g_providers.size() != 1) {
+            return false;
+        }
+        found_tag = g_providers[0].tag;
+        found_api = g_providers[0].api;
+        found_reg = g_providers[0].reg;
+    }
+    uint16_t held_tag = 0;
+    const auto * held_api = hold->acquire(found_reg, &held_tag);
+    if (held_api == nullptr || held_api != found_api || held_tag != found_tag) {
+        return false;
+    }
+    *tag = held_tag;
+    *api = held_api;
+    *reg = found_reg;
+    return true;
+}
+
+static uint64_t owner_raw(uint64_t owner) {
+    return owner & kOwnerRawMask;
+}
+
+extern "C" uint32_t ggml_backend_meta_staging_tag_floor(void) {
+    std::lock_guard<std::mutex> lock(g_provider_mutex);
+    return g_next_provider_tag;
+}
+
+GGML_BASE_API void ggml_backend_meta_staging_attach_module(
+        ggml_backend_reg_t reg, std::shared_ptr<void> module) {
+    if (reg == nullptr || !module) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_provider_mutex);
+    for (provider_entry & entry : g_providers) {
+        if (entry.reg == reg && !entry.module) {
+            entry.module = module;
+        }
+    }
+}
+
+GGML_BASE_API void ggml_backend_meta_staging_attach_load_module(
+        ggml_backend_reg_t reg, uint32_t tag_floor, const void * module_identity,
+        std::shared_ptr<void> module) {
+    if (!module || module_identity == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_provider_mutex);
+    for (provider_entry & entry : g_providers) {
+        if (entry.tag > tag_floor && !entry.module &&
+                (reg == nullptr || entry.reg == reg)) {
+            entry.module = module;
+        }
+    }
+}
+
+// Remove the provider entries created by one load transaction after its
+// backend_init_fn failed. Only entries newer than tag_floor that hold the
+// loader's module are removed, so a provider registered by an earlier load
+// of the same DSO survives. Each module is released outside g_provider_mutex:
+// the last reference may dlclose the DSO and run its static destructors.
+extern "C" GGML_BASE_API void ggml_backend_meta_staging_rollback_load(
+        ggml_backend_reg_t reg, uint32_t tag_floor, const void * module_identity) {
+    if (module_identity == nullptr) {
+        return;
+    }
+    ggml_backend_module::close_defer_scope defer_close(false);
+    bool changed = false;
+    std::vector<std::shared_ptr<void>> released;
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        for (auto it = g_providers.begin(); it != g_providers.end(); ) {
+            if (it->tag <= tag_floor ||
+                    it->module.get() != module_identity ||
+                    (reg != nullptr && it->reg != reg)) {
+                ++it;
+                continue;
+            }
+            if (it->active_owners != 0 || it->active_calls != 0 ||
+                    it->live_users != 0 || !it->tokens.empty()) {
+                // A retained owner, token, or in-flight call still routes
+                // into this provider. Keep the entry and its module until
+                // the last reference is gone; do not strand it in the token
+                // map with a dangling api pointer.
+                it->quarantined = true;
+                changed = true;
+                ++it;
+                continue;
+            }
+            const auto * removed_api = it->api;
+            if (g_staging_api.load(std::memory_order_acquire) == removed_api) {
+                const ggml_cuda_staging::api * replacement = nullptr;
+                for (const provider_entry & other : g_providers) {
+                    if (&other != &*it) {
+                        replacement = other.api;
+                        break;
+                    }
+                }
+                g_staging_api.store(replacement, std::memory_order_release);
+            }
+            try {
+                released.push_back(std::move(it->module));
+            } catch (...) {
+                // The local module would drop under g_provider_mutex; the
+                // close-defer scope queues the handle instead of dlclosing.
+            }
+            it = g_providers.erase(it);
+            g_provider_epoch.fetch_add(1, std::memory_order_release);
+            changed = true;
+        }
+    }
+    // released destructs here, outside g_provider_mutex.
+    released.clear();
+    if (changed) {
+        g_provider_cv.notify_all();
+    }
+}
+
+static bool register_provider(ggml_backend_reg_t reg, const void * impl, const char * func) {
     if (impl == nullptr) {
+        return false;
+    }
+    if (reg == nullptr) {
+        GGML_LOG_WARN("%s: rejected provider registration (null reg)\n", func);
         return false;
     }
     // A rejected registration does not replace an existing table. If none is
@@ -64,7 +795,225 @@ extern "C" bool ggml_backend_meta_staging_register(const void * impl) {
                       unsigned(ggml_cuda_staging::kKindCount), state);
         return false;
     }
-    g_staging_api.store(api, std::memory_order_release);
+    if (api->owner_acquire == nullptr || api->acquire_owner == nullptr ||
+            api->owner_drain == nullptr || api->owner_release == nullptr) {
+        GGML_LOG_WARN("%s: rejected provider registration (missing owner credit/drain); %s\n",
+                      func, state);
+        return false;
+    }
+    const bool loading = ggml_backend_module::loading_active();
+    if (loading && !ggml_backend_module::loading_bind(reg)) {
+        GGML_LOG_WARN("%s: rejected provider registration (different reg during load)\n", func);
+        return false;
+    }
+    const ggml_backend_module_state module_state = ggml_backend_module::state(reg);
+    if (module_state == ggml_backend_module_state::unloading_backend) {
+        GGML_LOG_WARN("%s: rejected provider registration (backend is unloading or unloaded)\n", func);
+        return false;
+    }
+    if (module_state == ggml_backend_module_state::unloaded_backend && !loading) {
+        GGML_LOG_WARN("%s: rejected provider registration (backend is unloading or unloaded)\n", func);
+        return false;
+    }
+    if (module_state == ggml_backend_module_state::unknown ||
+            module_state == ggml_backend_module_state::unloaded_backend) {
+        // A provider registering from a never-published reg is a static
+        // host-owned registration (tests and statically linked backends).
+        // Publish it explicitly so later hold_user/dev_init fail closed
+        // instead of treating "unknown" as usable.
+        std::shared_ptr<void> module = loading ? ggml_backend_module::loading_handle()
+                                               : std::shared_ptr<void>{};
+        // No loader handle means this is a static provider, not a loading
+        // record. Marking it loading would make hold_user reject it forever.
+        if (!ggml_backend_module::attach(reg, module, false)) {
+            GGML_LOG_WARN("%s: rejected provider registration (cannot publish static reg)\n", func);
+            return false;
+        }
+    }
+    ggml_backend_module_ref held = ggml_backend_reg_module_hold(reg);
+    if (held.state == ggml_backend_module_state::unloading_backend ||
+            held.state == ggml_backend_module_state::unloaded_backend) {
+        GGML_LOG_WARN("%s: rejected provider registration (backend is unloading or unloaded)\n", func);
+        return false;
+    }
+    std::shared_ptr<void> module = std::move(held.module);
+
+    // Keep the new entry outside the lock: if push_back fails, its module
+    // reference must be released after g_provider_mutex is unlocked.
+    provider_entry entry;
+    bool duplicate = false;
+    bool inserted = false;
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        for (provider_entry & existing : g_providers) {
+            if (existing.api == api) {
+                if (reg != nullptr && existing.reg != nullptr && existing.reg != reg) {
+                    GGML_LOG_WARN("%s: rejected provider registration (api already bound to another reg)\n", func);
+                    return false;
+                }
+                if (existing.reg == nullptr) {
+                    existing.reg = reg;
+                }
+                if (!existing.module && module) {
+                    // Upgrade a provider registered before the loader
+                    // attached the DSO handle.
+                    existing.module = module;
+                }
+                existing.quarantined = false;
+                duplicate = true;
+                g_provider_epoch.fetch_add(1, std::memory_order_release);
+                break;
+            }
+        }
+        if (!duplicate) {
+            if (reg != nullptr) {
+                for (const provider_entry & existing : g_providers) {
+                    if (existing.reg == reg) {
+                        GGML_LOG_WARN("%s: rejected provider registration (reg already has a provider)\n", func);
+                        return false;
+                    }
+                }
+            }
+            if (g_next_provider_tag >= kMaxProviderTag) {
+                GGML_LOG_WARN("%s: rejected provider registration (provider tag space exhausted)\n", func);
+                return false;
+            }
+            entry.api = api;
+            entry.tag = uint16_t(++g_next_provider_tag);
+            entry.reg = reg;
+            entry.module = module;
+            try {
+                g_providers.push_back(std::move(entry));
+                inserted = true;
+            } catch (...) {
+                // entry (and its module reference) destructs after the lock.
+            }
+            if (inserted) {
+                g_provider_epoch.fetch_add(1, std::memory_order_release);
+            }
+        }
+        if (duplicate || inserted) {
+            // Publish while the entry is still in the table; unregister
+            // updates the pointer before erasing, so no store can resurrect
+            // an api that was already removed.
+            g_staging_api.store(api, std::memory_order_release);
+        }
+    }
+    if (!duplicate && !inserted) {
+        GGML_LOG_ERROR("%s: provider registry allocation failed\n", func);
+        return false;
+    }
+
+    // Close the register/unload window: the module may have been marked
+    // unloading after the initial hold. Remove a just-inserted entry so it
+    // cannot survive a completed unload; a duplicate is left for unregister
+    // to remove or refuse.
+    const ggml_backend_module_state after = ggml_backend_module::state(reg);
+    if (after == ggml_backend_module_state::unloading_backend ||
+            after == ggml_backend_module_state::unloaded_backend) {
+        if (inserted) {
+            ggml_backend_module::close_defer_scope defer_close(false);
+            std::shared_ptr<void> released;
+            {
+                std::lock_guard<std::mutex> lock(g_provider_mutex);
+                for (auto it = g_providers.begin(); it != g_providers.end(); ++it) {
+                    if (it->api != api || it->reg != reg) {
+                        continue;
+                    }
+                    const auto * removed_api = it->api;
+                    if (g_staging_api.load(std::memory_order_acquire) == removed_api) {
+                        const ggml_cuda_staging::api * replacement = nullptr;
+                        for (const provider_entry & other : g_providers) {
+                            if (&other != &*it) {
+                                replacement = other.api;
+                                break;
+                            }
+                        }
+                        g_staging_api.store(replacement, std::memory_order_release);
+                    }
+                    released = std::move(it->module);
+                    g_providers.erase(it);
+                    g_provider_epoch.fetch_add(1, std::memory_order_release);
+                    break;
+                }
+            }
+            g_provider_cv.notify_all();
+        }
+        GGML_LOG_WARN("%s: rejected provider registration (backend started unloading)\n", func);
+        return false;
+    }
+    return true;
+}
+
+extern "C" bool ggml_backend_meta_staging_register(const void * impl) {
+    (void) impl;
+    // Legacy registrations have no registry identity and cannot participate
+    // in child-provider validation or quiescent unload. Reject them; providers
+    // must use ggml_backend_meta_staging_register_for_reg.
+    GGML_LOG_WARN("%s: legacy provider registration unsupported; use register_for_reg\n", __func__);
+    return false;
+}
+
+extern "C" bool ggml_backend_meta_staging_register_for_reg(ggml_backend_reg_t reg, const void * impl) {
+    if (reg == nullptr) {
+        return false;
+    }
+    return register_provider(reg, impl, __func__);
+}
+
+
+extern "C" bool ggml_backend_meta_staging_unregister_reg(
+        ggml_backend_reg_t reg, bool * had_provider) {
+    if (had_provider != nullptr) {
+        *had_provider = false;
+    }
+    if (reg == nullptr) {
+        return true;
+    }
+    std::shared_ptr<void> released_module;
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        for (auto it = g_providers.begin(); it != g_providers.end(); ++it) {
+            if (it->reg != reg) {
+                continue;
+            }
+            if (had_provider != nullptr) {
+                *had_provider = true;
+            }
+            if (it->active_owners != 0 || it->active_calls != 0 ||
+                    it->live_users != 0 || !it->tokens.empty()) {
+                // A retained owner, an in-flight acquire, or a live token
+                // would outlive the registry entry. Refuse the unload
+                // instead of leaving a dangling provider or silently
+                // dropping an owner.
+                return false;
+            }
+            // Update the active api before erasing the entry: readers load
+            // it without the provider lock and must never see a pointer to
+            // an api that is no longer in the table.
+            const auto * removed_api = it->api;
+            if (g_staging_api.load(std::memory_order_acquire) == removed_api) {
+                const ggml_cuda_staging::api * replacement = nullptr;
+                for (const provider_entry & other : g_providers) {
+                    if (&other != &*it) {
+                        replacement = other.api;
+                        break;
+                    }
+                }
+                g_staging_api.store(replacement, std::memory_order_release);
+            }
+            released_module = std::move(it->module);
+            g_providers.erase(it);
+            g_provider_epoch.fetch_add(1, std::memory_order_release);
+            removed = true;
+            break;
+        }
+    }
+    if (removed) {
+        g_provider_cv.notify_all();
+    }
+    // released_module destructs here, outside the provider lock.
     return true;
 }
 
@@ -91,6 +1040,461 @@ static uint32_t staging_window() {
         next_window.fetch_add(1, std::memory_order_relaxed) % ggml_cuda_staging::kWindows;
     return window;
 }
+static void return_or_retain_owner(uint16_t tag, const ggml_cuda_staging::api * st,
+        ggml_backend_reg_t reg, uint64_t raw_owner, uint64_t raw_generation,
+        orphan_ticket & ticket) {
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        provider_entry * entry = provider_entry_for_tag_locked(tag);
+        if (entry != nullptr) {
+            // Reserve the owner while release is in flight so unregister
+            // cannot erase the entry and dlclose the provider underneath it.
+            ++entry->active_owners;
+        }
+    }
+    std::shared_ptr<void> module;
+    if (reg != nullptr) {
+        module = ggml_backend_module::hold(reg).module;
+    }
+    // Release is permitted only after an explicit drain. A provider that is
+    // busy or failed retains the credit; an invalid owner is already unknown
+    // to the provider and cannot be released by the host.
+    int drained = int(ggml_cuda_staging::owner_drain_result::invalid);
+    bool released = false;
+    try {
+        drained = st != nullptr && st->owner_drain != nullptr
+            ? st->owner_drain(raw_owner, raw_generation)
+            : int(ggml_cuda_staging::owner_drain_result::invalid);
+        if (drained == int(ggml_cuda_staging::owner_drain_result::drained) &&
+                st->owner_release != nullptr) {
+            released = st->owner_release(raw_owner, raw_generation);
+        }
+    } catch (...) {
+        drained = int(ggml_cuda_staging::owner_drain_result::failed);
+        released = false;
+    }
+    if (drained == int(ggml_cuda_staging::owner_drain_result::drained) && released) {
+        drop_orphan_hold(tag);
+        orphan_cancel(ticket);
+        return;
+    }
+    if (drained == int(ggml_cuda_staging::owner_drain_result::invalid)) {
+        drop_orphan_hold(tag);
+        orphan_cancel(ticket);
+        GGML_LOG_ERROR("%s: provider does not recognize owner=%" PRIu64
+                       "; host hold released without a provider release\n",
+                       __func__, raw_owner);
+        return;
+    }
+    const int stored = orphan_commit_raw(ticket, raw_owner, raw_generation, tag, 0,
+                                         st, reg, std::move(module));
+    if (stored == 1) {
+        orphan_cancel(ticket);
+        return;
+    }
+    if (stored == 2) {
+        // Duplicate record: it already holds the owner.
+        drop_orphan_hold(tag);
+        orphan_cancel(ticket);
+        return;
+    }
+    // No reserved slot: keep the extra active_owners hold. The provider still
+    // owns the raw credit, so unload must remain refused; dropping the hold
+    // would let the DSO be unmapped while the provider still has an owner.
+    GGML_LOG_ERROR("%s: no orphan slot for raw owner=%" PRIu64
+                   "; retaining the provider hold\n", __func__, raw_owner);
+    orphan_cancel(ticket);
+}
+
+static bool acquire_owner_from_provider(uint16_t tag, const ggml_cuda_staging::api * st,
+        ggml_backend_reg_t reg, uint64_t run_id, uint32_t window_id,
+        uint64_t * owner, uint64_t * generation) {
+    if (st == nullptr || st->owner_acquire == nullptr ||
+            owner == nullptr || generation == nullptr) {
+        return false;
+    }
+    orphan_ticket ticket;
+    if (!orphan_reserve(1, ticket)) {
+        // Retryable capacity/backpressure before any provider side effect.
+        return false;
+    }
+    bool missing = false;
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        provider_entry * entry = provider_entry_for_tag_locked(tag);
+        if (entry == nullptr || entry->api != st) {
+            missing = true;
+        } else {
+            ++entry->active_calls;
+        }
+    }
+    if (missing) {
+        orphan_cancel(ticket);
+        return false;
+    }
+
+    uint64_t raw_owner = 0;
+    uint64_t raw_generation = 0;
+    bool acquired_ok = false;
+    try {
+        acquired_ok = st->owner_acquire(run_id, window_id, &raw_owner, &raw_generation);
+    } catch (...) {
+        acquired_ok = false;
+    }
+    if (!acquired_ok) {
+        orphan_cancel(ticket);
+        drop_active_call(tag);
+        return false;
+    }
+
+    if (raw_owner == 0 || raw_owner > kOwnerRawMask) {
+        // The provider must keep its owner id in the low bits; a larger id
+        // cannot be tagged without collision. Keep active_calls held while the
+        // owner is returned so unregister cannot remove the entry first.
+        return_or_retain_owner(tag, st, reg, raw_owner, raw_generation, ticket);
+        drop_active_call(tag);
+        return false;
+    }
+
+    const uint64_t token = (uint64_t(tag) << kOwnerRawBits) | raw_owner;
+    bool needs_release = false;
+    bool acquired = false;
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        provider_entry * entry = provider_entry_for_tag_locked(tag);
+        if (entry != nullptr) {
+            if (entry->api != st) {
+                needs_release = true;
+            } else {
+                bool duplicate = false;
+                for (const auto & kv : entry->tokens) {
+                    if (kv.second.run_id == run_id && kv.second.window_id == window_id) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                bool inserted = false;
+                if (!duplicate && entry->tokens.find(token) == entry->tokens.end()) {
+                    try {
+                        entry->tokens.emplace(token, provider_entry::token_info{
+                            raw_owner, raw_generation, run_id, window_id });
+                        inserted = true;
+                    } catch (...) {
+                        inserted = false;
+                    }
+                }
+                if (inserted) {
+                    ++entry->active_owners;
+                    if (entry->active_calls > 0) {
+                        --entry->active_calls;
+                    }
+                    *owner = token;
+                    *generation = raw_generation;
+                    acquired = true;
+                } else {
+                    needs_release = true;
+                }
+            }
+        } else {
+            needs_release = true;
+        }
+    }
+    if (acquired) {
+        orphan_cancel(ticket);
+        return true;
+    }
+    if (needs_release) {
+        return_or_retain_owner(tag, st, reg, raw_owner, raw_generation, ticket);
+        drop_active_call(tag);
+    }
+    return false;
+}
+
+extern "C" bool ggml_backend_meta_staging_owner_acquire(
+        uint64_t run_id, uint32_t window_id, uint64_t * owner, uint64_t * generation) {
+    // Legacy API: without a backend selector only a single provider is
+    // unambiguous. The runtime and tests use the _for_* variants.
+    uint16_t tag = 0;
+    const ggml_cuda_staging::api * api = nullptr;
+    ggml_backend_reg_t reg = nullptr;
+    provider_hold_ref hold;
+    if (!sole_provider_entry(&tag, &api, &reg, &hold)) {
+        return false;
+    }
+    return acquire_owner_from_provider(tag, api, reg, run_id, window_id, owner, generation);
+}
+
+extern "C" bool ggml_backend_meta_staging_owner_acquire_for_reg(
+        ggml_backend_reg_t reg, uint64_t run_id, uint32_t window_id,
+        uint64_t * owner, uint64_t * generation) {
+    uint16_t tag = 0;
+    const ggml_cuda_staging::api * api = nullptr;
+    provider_hold_ref hold;
+    if (!provider_tag_for_reg(reg, &tag, &api, &hold)) {
+        return false;
+    }
+    return acquire_owner_from_provider(tag, api, reg, run_id, window_id, owner, generation);
+}
+
+extern "C" bool ggml_backend_meta_staging_owner_context_bind_many(
+        const uint64_t * owners, const uint64_t * generations, size_t n) {
+    if (owners == nullptr || generations == nullptr || n == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_provider_mutex);
+    for (size_t i = 0; i < n; ++i) {
+        const uint16_t tag = uint16_t(owners[i] >> kOwnerRawBits);
+        provider_entry * entry = provider_entry_for_tag_locked(tag);
+        if (entry == nullptr) {
+            return false;
+        }
+        const auto it = entry->tokens.find(owners[i]);
+        if (it == entry->tokens.end() || it->second.generation != generations[i] ||
+                it->second.releasing) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const uint16_t tag = uint16_t(owners[i] >> kOwnerRawBits);
+        provider_entry * entry = provider_entry_for_tag_locked(tag);
+        ++entry->tokens.find(owners[i])->second.context_refs;
+    }
+    return true;
+}
+
+extern "C" bool ggml_backend_meta_staging_owner_context_bind(
+        uint64_t owner, uint64_t generation) {
+    return ggml_backend_meta_staging_owner_context_bind_many(&owner, &generation, 1);
+}
+
+extern "C" bool ggml_backend_meta_staging_owner_context_unbind_many(
+        const uint64_t * owners, const uint64_t * generations, size_t n) {
+    if (owners == nullptr || generations == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_provider_mutex);
+    for (size_t i = 0; i < n; ++i) {
+        const uint16_t tag = uint16_t(owners[i] >> kOwnerRawBits);
+        provider_entry * entry = provider_entry_for_tag_locked(tag);
+        if (entry == nullptr) {
+            continue; // already released/unregistered: idempotent
+        }
+        const auto it = entry->tokens.find(owners[i]);
+        if (it == entry->tokens.end() || it->second.generation != generations[i]) {
+            continue;
+        }
+        if (it->second.context_refs > 0) {
+            --it->second.context_refs;
+        }
+    }
+    return true;
+}
+
+extern "C" bool ggml_backend_meta_staging_owner_context_unbind(
+        uint64_t owner, uint64_t generation) {
+    return ggml_backend_meta_staging_owner_context_unbind_many(&owner, &generation, 1);
+}
+
+static bool lookup_active_token(uint64_t owner, uint64_t generation,
+        uint16_t * tag, const ggml_cuda_staging::api ** st, ggml_backend_reg_t * reg,
+        provider_entry::token_info * info, bool * legacy) {
+    if (tag == nullptr || st == nullptr || reg == nullptr || info == nullptr || legacy == nullptr) {
+        return false;
+    }
+    *legacy = false;
+    const uint16_t token_tag = uint16_t(owner >> kOwnerRawBits);
+    std::lock_guard<std::mutex> lock(g_provider_mutex);
+    if (token_tag == 0) {
+        if (g_providers.size() != 1) {
+            return false;
+        }
+        provider_entry & entry = g_providers[0];
+        *legacy = true;
+        *tag = entry.tag;
+        *st = entry.api;
+        *reg = entry.reg;
+        *info = provider_entry::token_info{ owner, generation, 0, 0 };
+        return true;
+    }
+    provider_entry * entry = provider_entry_for_tag_locked(token_tag);
+    if (entry == nullptr) {
+        return false;
+    }
+    const auto it = entry->tokens.find(owner);
+    if (it == entry->tokens.end() || it->second.generation != generation ||
+            it->second.releasing) {
+        return false;
+    }
+    *tag = entry->tag;
+    *st = entry->api;
+    *reg = entry->reg;
+    *info = it->second;
+    return true;
+}
+
+extern "C" int ggml_backend_meta_staging_owner_drain(uint64_t owner, uint64_t generation) {
+    uint16_t tag = 0;
+    const ggml_cuda_staging::api * st = nullptr;
+    ggml_backend_reg_t reg = nullptr;
+    provider_entry::token_info info;
+    bool legacy = false;
+    if (!lookup_active_token(owner, generation, &tag, &st, &reg, &info, &legacy)) {
+        return int(ggml_cuda_staging::owner_drain_result::invalid);
+    }
+    provider_hold_ref hold;
+    if (legacy && !hold.acquire(reg)) {
+        return int(ggml_cuda_staging::owner_drain_result::invalid);
+    }
+    try {
+        return st->owner_drain != nullptr
+            ? st->owner_drain(info.raw_owner, generation)
+            : int(ggml_cuda_staging::owner_drain_result::invalid);
+    } catch (...) {
+        return int(ggml_cuda_staging::owner_drain_result::failed);
+    }
+}
+
+static release_result release_token_impl(uint64_t owner, uint64_t generation) {
+    const uint16_t tag = uint16_t(owner >> kOwnerRawBits);
+    if (tag == 0) {
+        return release_result::invalid;
+    }
+    const ggml_cuda_staging::api * st = nullptr;
+    uint64_t raw_owner = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        provider_entry * entry = provider_entry_for_tag_locked(tag);
+        if (entry == nullptr) {
+            return release_result::invalid;
+        }
+        const auto it = entry->tokens.find(owner);
+        if (it == entry->tokens.end() || it->second.generation != generation) {
+            return release_result::invalid;
+        }
+        if (it->second.context_refs != 0) {
+            // A context still references the owner. This is host backpressure,
+            // not provider busy; retry after the unbind.
+            return release_result::busy;
+        }
+        if (it->second.releasing) {
+            return release_result::busy;
+        }
+        it->second.releasing = true;
+        raw_owner = it->second.raw_owner;
+        st = entry->api;
+    }
+    int drained = int(ggml_cuda_staging::owner_drain_result::invalid);
+    bool released = false;
+    try {
+        drained = st != nullptr && st->owner_drain != nullptr
+            ? st->owner_drain(raw_owner, generation)
+            : int(ggml_cuda_staging::owner_drain_result::invalid);
+        if (drained == int(ggml_cuda_staging::owner_drain_result::drained) &&
+                st->owner_release != nullptr) {
+            released = st->owner_release(raw_owner, generation);
+        }
+    } catch (...) {
+        // A throwing provider callback must not leave releasing=true.
+        drained = int(ggml_cuda_staging::owner_drain_result::failed);
+        released = false;
+    }
+    if (drained == int(ggml_cuda_staging::owner_drain_result::drained) && released) {
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(g_provider_mutex);
+            provider_entry * entry = provider_entry_for_tag_locked(tag);
+            if (entry != nullptr) {
+                const auto it = entry->tokens.find(owner);
+                if (it != entry->tokens.end() && it->second.generation == generation) {
+                    entry->tokens.erase(it);
+                    if (entry->active_owners > 0) {
+                        --entry->active_owners;
+                    }
+                }
+                changed = provider_reap_quarantined_locked();
+            }
+        }
+        if (changed) {
+            g_provider_cv.notify_all();
+        }
+        return release_result::released;
+    }
+    if (drained == int(ggml_cuda_staging::owner_drain_result::invalid)) {
+        // The provider no longer knows the owner. Keeping the host token
+        // would block unload forever; drop the stale host state and report
+        // the provider credit as process-retained.
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(g_provider_mutex);
+            provider_entry * entry = provider_entry_for_tag_locked(tag);
+            if (entry != nullptr) {
+                const auto it = entry->tokens.find(owner);
+                if (it != entry->tokens.end() && it->second.generation == generation) {
+                    entry->tokens.erase(it);
+                    if (entry->active_owners > 0) {
+                        --entry->active_owners;
+                    }
+                }
+                changed = provider_reap_quarantined_locked();
+            }
+        }
+        if (changed) {
+            g_provider_cv.notify_all();
+        }
+        GGML_LOG_ERROR("%s: provider lost owner=%" PRIu64 "; host token dropped\n",
+                       __func__, owner);
+        return release_result::invalid;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        provider_entry * entry = provider_entry_for_tag_locked(tag);
+        if (entry != nullptr) {
+            const auto it = entry->tokens.find(owner);
+            if (it != entry->tokens.end()) {
+                it->second.releasing = false;
+            }
+        }
+    }
+    return drained == int(ggml_cuda_staging::owner_drain_result::busy)
+        ? release_result::busy
+        : release_result::failed;
+}
+
+extern "C" bool ggml_backend_meta_staging_owner_release(uint64_t owner, uint64_t generation) {
+    const uint16_t tag = uint16_t(owner >> kOwnerRawBits);
+    if (tag == 0) {
+        // Legacy direct-provider token: no token-map state to transition.
+        // Pin the provider while draining and releasing.
+        uint16_t legacy_tag = 0;
+        const ggml_cuda_staging::api * st = nullptr;
+        ggml_backend_reg_t reg = nullptr;
+        provider_entry::token_info info;
+        bool legacy = false;
+        if (!lookup_active_token(owner, generation, &legacy_tag, &st, &reg, &info, &legacy)) {
+            return false;
+        }
+        provider_hold_ref hold;
+        if (!hold.acquire(reg)) {
+            return false;
+        }
+        int drained = int(ggml_cuda_staging::owner_drain_result::invalid);
+        bool released = false;
+        try {
+            drained = st != nullptr && st->owner_drain != nullptr
+                ? st->owner_drain(info.raw_owner, generation)
+                : int(ggml_cuda_staging::owner_drain_result::invalid);
+            if (drained == int(ggml_cuda_staging::owner_drain_result::drained) &&
+                    st->owner_release != nullptr) {
+                released = st->owner_release(info.raw_owner, generation);
+            }
+        } catch (...) {
+            return false;
+        }
+        return drained == int(ggml_cuda_staging::owner_drain_result::drained) && released;
+    }
+    return release_token_impl(owner, generation) == release_result::released;
+}
+
 // Per-request inputs are bounded by this. It must cover the MTP hidden input
 // (n_env * n_embd * 4, about 1.25 MiB at 32 rows) while still allowing two
 // slots inside the 4 MiB pool. Weights stay out through the input flag.
@@ -586,6 +1990,14 @@ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t me
 ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) {
     GGML_ASSERT(n_devs <= GGML_BACKEND_META_MAX_DEVICES);
+    // The Meta registry is host-owned and is not part of the dynamic backend
+    // registry. Publish it explicitly as a static module record so dev_init's
+    // fail-closed pin lookup can find it.
+    static std::once_flag meta_reg_once;
+    std::call_once(meta_reg_once, [] {
+        std::shared_ptr<void> none;
+        (void) ggml_backend_module::attach(&ggml_backend_meta_reg, none, false);
+    });
     // TODO: this is not thread-safe - needs to be fixed
     static std::vector<std::unique_ptr<ggml_backend_meta_device_context>>         ctxs;
     static std::map<ggml_backend_meta_device_context, struct ggml_backend_device> meta_devs;
@@ -804,6 +2216,15 @@ struct ggml_backend_meta_buffer_context {
     std::map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>> split_state_cache;
 
     int debug;
+    // The provider of this buffer's simple children. Ownerless copies use this
+    // provider for the submit gate, never the last-registered provider. The
+    // epoch invalidates the cache when the registry changes.
+    ggml_backend_reg_t staging_reg = nullptr;
+    std::atomic<const ggml_cuda_staging::api *> staging_provider{nullptr};
+    std::atomic<uint64_t> staging_epoch{0};
+    // provider_hold_ref is not thread-safe; only refresh it under this lock.
+    std::mutex staging_provider_mutex;
+    provider_hold_ref staging_provider_hold;
 
     ggml_backend_meta_buffer_context(
             ggml_backend_meta_simple_tensor_container & stc_static,
@@ -2612,11 +4033,24 @@ static void ggml_backend_meta_buffer_set_tensor_impl(ggml_backend_buffer_t buffe
     GGML_ASSERT(staging_meta == nullptr ||
             (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
              split_state.n_segments == 1 && split_state.nr[0] == 1));
-
     if (tensor->view_src != nullptr && split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
         if (ggml_backend_meta_view_copy(tensor, split_state, data, nullptr, offset, size, true)) {
             return;
         }
+    }
+    auto * buffer_ctx = static_cast<ggml_backend_meta_buffer_context *>(buffer->context);
+    const uint64_t provider_epoch = g_provider_epoch.load(std::memory_order_acquire);
+    const ggml_cuda_staging::api * st = buffer_ctx != nullptr
+        ? buffer_ctx->staging_provider.load(std::memory_order_acquire) : nullptr;
+    if (buffer_ctx != nullptr &&
+            buffer_ctx->staging_epoch.load(std::memory_order_acquire) != provider_epoch) {
+        std::lock_guard<std::mutex> lock(buffer_ctx->staging_provider_mutex);
+        if (buffer_ctx->staging_epoch.load(std::memory_order_acquire) != provider_epoch) {
+            st = buffer_ctx->staging_provider_hold.acquire(buffer_ctx->staging_reg);
+            buffer_ctx->staging_provider.store(st, std::memory_order_release);
+            buffer_ctx->staging_epoch.store(provider_epoch, std::memory_order_release);
+        }
+        st = buffer_ctx->staging_provider.load(std::memory_order_acquire);
     }
 
     if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
@@ -3445,6 +4879,24 @@ struct ggml_backend_meta_context {
     size_t                      max_subgraphs = 0;
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
+    // v4 owner credit. Zero until llama_context explicitly binds the owner
+    // issued by the staging provider.
+    // Published together under staging_mutex. Readers use acquire loads:
+    // provider/raw/generation are written before valid=true and cleared
+    // after valid=false, so a reader that sees a valid owner sees a complete
+    // snapshot.
+    std::mutex                  staging_mutex;
+    std::atomic<uint64_t>       staging_owner{0};
+    std::atomic<uint64_t>       staging_raw_owner{0};
+    std::atomic<uint64_t>       staging_generation{0};
+    std::atomic<bool>           staging_owner_valid{false};
+    // Cached from the tagged owner at set time; avoids a registry lock/search
+    // on every async tensor. The provider DSO is pinned while registered.
+    std::atomic<const ggml_cuda_staging::api *> staging_provider{nullptr};
+    // Serializes child_provider_hold refresh. The hold is not thread-safe and
+    // provider_for_backend runs on multiple copy threads.
+    std::mutex                  child_provider_mutex;
+    int                         staged_nnodes = 0;
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -3553,6 +5005,28 @@ struct ggml_backend_meta_context {
         std::vector<ggml_backend_t> simple_backends;
         backend_configs.reserve(n_devs);
         simple_backends.reserve(n_devs);
+        // If a later name/vector/relay/comm operation throws, construction
+        // fails without running ~ggml_backend_meta_context. Keep the already
+        // created child backends in a local owner guard.
+        struct child_guard {
+            std::vector<ggml_backend_t> & backends;
+            std::vector<backend_config> & configs;
+            bool armed = true;
+            ~child_guard() {
+                if (!armed) {
+                    return;
+                }
+                // The completed-but-invalid object's destructor would free
+                // these raw pointers again. Drop the non-owning records
+                // before releasing the real owners here.
+                configs.clear();
+                for (ggml_backend_t child : backends) {
+                    if (child != nullptr) {
+                        ggml_backend_free(child);
+                    }
+                }
+            }
+        } guard{simple_backends, backend_configs};
         for (size_t i = 0; i < n_devs; i++) {
             ggml_backend_dev_t simple_dev = ggml_backend_meta_dev_simple_dev(meta_dev, i);
             if (cpu_staged_f32 && (ggml_backend_dev_type(simple_dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
@@ -3578,6 +5052,8 @@ struct ggml_backend_meta_context {
             valid = relay != nullptr;
             if (!valid) {
                 GGML_LOG_ERROR("%s: HIP rejected the tp5-relay runtime profile\n", __func__);
+            } else {
+                guard.armed = false;
             }
             return;
         }
@@ -3588,6 +5064,7 @@ struct ggml_backend_meta_context {
                           "F32 activations, rank-order CPU F32 SUM, synchronous host broadcast; no GPU allreduce\n",
                           __func__, n_devs);
             valid = true;
+            guard.armed = false;
             return;
         }
         if (n_devs > 1) {
@@ -3604,6 +5081,7 @@ struct ggml_backend_meta_context {
             GGML_ASSERT(comm_allreduce != nullptr);
         }
         valid = true;
+        guard.armed = false;
     }
 
     ~ggml_backend_meta_context() {
@@ -3619,29 +5097,369 @@ struct ggml_backend_meta_context {
     }
 };
 
+static ggml_backend_reg_t provider_reg_for_backend(ggml_backend_t backend) {
+    if (backend == nullptr) {
+        return nullptr;
+    }
+    if (ggml_backend_is_meta(backend)) {
+        const auto * ctx = static_cast<const ggml_backend_meta_context *>(backend->context);
+        return ctx != nullptr ? ctx->child_reg : nullptr;
+    }
+    return backend->device != nullptr ? backend->device->reg : nullptr;
+}
+
+extern "C" ggml_backend_reg_t ggml_backend_meta_staging_provider_reg_for_backend(
+        ggml_backend_t backend) {
+    return provider_reg_for_backend(backend);
+}
+
+extern "C" ggml_backend_reg_t ggml_backend_meta_staging_owner_provider_reg(
+        uint64_t owner, uint64_t generation) {
+    const uint16_t tag = uint16_t(owner >> kOwnerRawBits);
+    if (tag == 0) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(g_provider_mutex);
+    provider_entry * entry = provider_entry_for_tag_locked(tag);
+    if (entry == nullptr) {
+        return nullptr;
+    }
+    const auto it = entry->tokens.find(owner);
+    if (it == entry->tokens.end() || it->second.generation != generation) {
+        return nullptr;
+    }
+    return entry->reg;
+}
+
+extern "C" bool ggml_backend_meta_clear_staging_owner(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_meta(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_meta_context *>(backend->context);
+    if (ctx == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(ctx->staging_mutex);
+    ctx->staging_owner_valid.store(false, std::memory_order_release);
+    ctx->staging_provider.store(nullptr, std::memory_order_release);
+    ctx->staging_owner.store(0, std::memory_order_relaxed);
+    ctx->staging_raw_owner.store(0, std::memory_order_relaxed);
+    ctx->staging_generation.store(0, std::memory_order_relaxed);
+    return true;
+}
+
+extern "C" bool ggml_backend_meta_staging_owner_acquire_for_backend(
+        ggml_backend_t backend, uint64_t run_id, uint32_t window_id,
+        uint64_t * owner, uint64_t * generation) {
+    if (backend != nullptr && ggml_backend_is_meta(backend)) {
+        const auto * ctx = static_cast<const ggml_backend_meta_context *>(backend->context);
+        if (ctx != nullptr && ctx->staging_owner_valid.load(std::memory_order_acquire)) {
+            // A second credit would be unreachable behind the first bind.
+            return false;
+        }
+    }
+    return ggml_backend_meta_staging_owner_acquire_for_reg(
+        provider_reg_for_backend(backend), run_id, window_id, owner, generation);
+}
+
+extern "C" bool ggml_backend_meta_staging_owner_acquire_for_backend_wait(
+        ggml_backend_t backend, uint64_t run_id, uint32_t window_id,
+        uint64_t * owner, uint64_t * generation, uint32_t timeout_ms) {
+    if (backend == nullptr || owner == nullptr || generation == nullptr) {
+        return false;
+    }
+    const ggml_backend_reg_t reg = provider_reg_for_backend(backend);
+    uint16_t tag = 0;
+    const ggml_cuda_staging::api * api = nullptr;
+    provider_hold_ref hold;
+    if (!provider_tag_for_reg(reg, &tag, &api, &hold)) {
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout_ms == 0 ? 1 : timeout_ms);
+    for (;;) {
+        if (acquire_owner_from_provider(tag, api, reg, run_id, window_id, owner, generation)) {
+            return true;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_provider_mutex);
+            provider_entry * entry = provider_entry_for_tag_locked(tag);
+            if (entry == nullptr || entry->api != api) {
+                return false;
+            }
+            for (const auto & kv : entry->tokens) {
+                if (kv.second.run_id == run_id && kv.second.window_id == window_id) {
+                    // Duplicate active run/window is an illegal request, not
+                    // temporary credit backpressure.
+                    return false;
+                }
+            }
+        }
+        if (!provider_usable(api)) {
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::unique_lock<std::mutex> lock(g_provider_mutex);
+        g_provider_cv.wait_until(lock, deadline);
+    }
+}
+
+static bool set_staging_owner_impl(
+        ggml_backend_t backend, uint64_t owner, uint64_t generation,
+        bool validate_run, uint64_t run_id, uint32_t window_id) {
+    if (backend == nullptr || owner == 0 || generation == 0 ||
+            owner_raw(owner) == 0 || !ggml_backend_is_meta(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_meta_context *>(backend->context);
+    if (ctx == nullptr) {
+        return false;
+    }
+    const uint16_t tag = uint16_t(owner >> kOwnerRawBits);
+    if (tag == 0) {
+        // Untagged owners have no provider identity and cannot be validated
+        // against this backend's children.
+        return false;
+    }
+    const ggml_cuda_staging::api * provider = nullptr;
+    ggml_backend_reg_t provider_reg = nullptr;
+    provider_entry::token_info info;
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        provider_entry * entry = provider_entry_for_tag_locked(tag);
+        if (entry == nullptr) {
+            return false;
+        }
+        const auto it = entry->tokens.find(owner);
+        if (it == entry->tokens.end() || it->second.generation != generation ||
+                it->second.releasing) {
+            // The token was released, is stale, belongs to another run, or
+            // is already being released.
+            return false;
+        }
+        info = it->second;
+        provider = entry->api;
+        provider_reg = entry->reg;
+    }
+    if (validate_run && (info.run_id != run_id || info.window_id != window_id)) {
+        // A valid token from another run/window must not consume this
+        // backend's credit.
+        return false;
+    }
+    if (provider_reg == nullptr) {
+        // A legacy registration has no registry identity. It cannot be
+        // validated against a backend's children and must not bind.
+        return false;
+    }
+    {
+        const ggml_backend_reg_t backend_reg = provider_reg_for_backend(backend);
+        if (backend_reg == nullptr || backend_reg != provider_reg) {
+            // The owner was issued by a different DSO than the one backing
+            // this Meta backend's children. Never cross pools.
+            return false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(ctx->staging_mutex);
+        if (ctx->staging_owner_valid.load(std::memory_order_acquire)) {
+            // Overwriting an active owner would leak its credit. Require an
+            // explicit drain/release and a fresh context bind.
+            return ctx->staging_owner.load(std::memory_order_relaxed) == owner &&
+                   ctx->staging_generation.load(std::memory_order_relaxed) == generation;
+        }
+        if (!ctx->child_provider_hold.held) {
+            // The context outlives the owner release; hold the provider while
+            // it is alive so unregister cannot remove the pool under cached
+            // pointers.
+            std::lock_guard<std::mutex> child_lock(ctx->child_provider_mutex);
+            if (!ctx->child_provider_hold.held &&
+                    ctx->child_provider_hold.acquire(provider_reg) == nullptr) {
+                return false;
+            }
+        }
+        // Publish the complete snapshot before valid=true.
+        ctx->staging_provider.store(provider, std::memory_order_release);
+        ctx->staging_owner.store(owner, std::memory_order_relaxed);
+        ctx->staging_raw_owner.store(info.raw_owner, std::memory_order_relaxed);
+        ctx->staging_generation.store(generation, std::memory_order_relaxed);
+        ctx->staging_owner_valid.store(true, std::memory_order_release);
+    }
+    return true;
+}
+
+extern "C" int ggml_backend_meta_staging_owner_acquire_set(
+        ggml_backend_t * lanes, size_t n_lanes, uint64_t run_id, uint32_t window_id,
+        uint64_t * owners, uint64_t * generations, size_t * out_count,
+        uint32_t timeout_ms) {
+    if (lanes == nullptr || n_lanes == 0 || owners == nullptr || generations == nullptr ||
+            out_count == nullptr) {
+        return 2; // invalid
+    }
+    *out_count = 0;
+    size_t count = 0;
+    orphan_ticket orphan_ticket_res;
+    bool orphan_ticket_ok = false;
+    auto release_acquired = [&]() {
+        for (size_t i = 0; i < count; ++i) {
+            const release_result result =
+                release_token_impl(owners[i], generations[i]);
+            if (result == release_result::busy || result == release_result::failed) {
+                if (!orphan_commit(orphan_ticket_res, owners[i], generations[i])) {
+                    (void) remember_orphan_owner(owners[i], generations[i]);
+                }
+            }
+            // invalid: the token is already gone; there is no host state to
+            // retain and no provider owner the host can release.
+        }
+        orphan_cancel(orphan_ticket_res);
+    };
+    try {
+    struct provider_ref {
+        uint16_t tag;
+        ggml_backend_reg_t reg;
+        const ggml_cuda_staging::api * api;
+        provider_hold_ref hold;
+    };
+    std::vector<provider_ref> providers;
+    providers.reserve(n_lanes);
+    for (size_t i = 0; i < n_lanes; ++i) {
+        const ggml_backend_reg_t reg = provider_reg_for_backend(lanes[i]);
+        uint16_t tag = 0;
+        const ggml_cuda_staging::api * api = nullptr;
+        provider_hold_ref hold;
+        if (!provider_tag_for_reg(reg, &tag, &api, &hold)) {
+            return 2;
+        }
+        bool seen = false;
+        for (const auto & p : providers) {
+            if (p.tag == tag) { seen = true; break; }
+        }
+        if (!seen) {
+            providers.push_back(provider_ref{ tag, reg, api, std::move(hold) });
+        }
+    }
+    std::sort(providers.begin(), providers.end(),
+              [](const provider_ref & a, const provider_ref & b) { return a.tag < b.tag; });
+
+    orphan_ticket_ok = orphan_reserve(providers.size(), orphan_ticket_res);
+    if (!orphan_ticket_ok) {
+        return 1; // retryable: no owner acquired yet
+    }
+
+    std::lock_guard<std::mutex> acquire_lock(g_owner_acquire_mutex);
+    const auto deadline = timeout_ms == 0 ? std::chrono::steady_clock::time_point::max()
+                                          : std::chrono::steady_clock::now() +
+                                                std::chrono::milliseconds(timeout_ms);
+    for (const provider_ref & p : providers) {
+        for (;;) {
+            bool invalid = false;
+            {
+                std::lock_guard<std::mutex> lock(g_provider_mutex);
+                provider_entry * entry = provider_entry_for_tag_locked(p.tag);
+                if (entry == nullptr || entry->api != p.api) {
+                    invalid = true;
+                } else {
+                    for (const auto & kv : entry->tokens) {
+                        if (kv.second.run_id == run_id && kv.second.window_id == window_id) {
+                            invalid = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (invalid) {
+                // release_acquired() takes the provider and orphan locks;
+                // never call it while holding either.
+                release_acquired();
+                return 2;
+            }
+            uint64_t owner = 0;
+            uint64_t generation = 0;
+            if (acquire_owner_from_provider(p.tag, p.api, p.reg, run_id, window_id,
+                                            &owner, &generation)) {
+                owners[count] = owner;
+                generations[count] = generation;
+                ++count;
+                break;
+            }
+            if (!provider_usable(p.api)) {
+                release_acquired();
+                return 2;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                release_acquired();
+                return 1; // temporary busy, not invalid
+            }
+            std::unique_lock<std::mutex> lock(g_provider_mutex);
+            if (deadline == std::chrono::steady_clock::time_point::max()) {
+                g_provider_cv.wait_for(lock, std::chrono::milliseconds(100));
+            } else {
+                g_provider_cv.wait_until(lock, deadline);
+            }
+        }
+    }
+    *out_count = count;
+    orphan_cancel(orphan_ticket_res);
+    return 0;
+    } catch (...) {
+        release_acquired();
+        *out_count = 0;
+        return 3; // allocation/exception must not cross the C ABI
+    }
+}
+
+extern "C" bool ggml_backend_meta_set_staging_owner(
+        ggml_backend_t backend, uint64_t owner, uint64_t generation) {
+    return set_staging_owner_impl(backend, owner, generation, false, 0, 0);
+}
+
+extern "C" bool ggml_backend_meta_set_staging_owner_for_run(
+        ggml_backend_t backend, uint64_t owner, uint64_t generation,
+        uint64_t run_id, uint32_t window_id) {
+    return set_staging_owner_impl(backend, owner, generation, true, run_id, window_id);
+}
+
 static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) backend->context;
     return backend_ctx->name.c_str();
 }
 
-static void ggml_backend_meta_free(ggml_backend_t backend) {
+// Returns true when the owner was actually freed. A false return means the
+// owner is retained because completion is unproved; the caller must keep the
+// module that contains the retained code mapped.
+static bool ggml_backend_meta_free_impl(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    if (backend_ctx->staging_owner_valid.load(std::memory_order_acquire)) {
+        // The context still owns a provider credit. Freeing the backend would
+        // strand the token in the provider map and leave unload permanently
+        // refused; the cleanup owner must clear/unbind first.
+        GGML_LOG_ERROR("%s: retaining Meta owner: a staging owner is still bound\n", __func__);
+        return false;
+    }
     if (ggml_backend_meta_submission_failed(backend)) {
         // An accepted but unprovable async copy may still write into a child
         // buffer. Retain the whole Meta owner (context, child backends,
         // buffers) instead of freeing behind it. The process owns it until
         // exit; this is retention, not a drain claim.
         GGML_LOG_ERROR("%s: retaining Meta owner: an async submission is still unproven\n", __func__);
-        return;
+        return false;
     }
     if (backend_ctx->relay != nullptr) {
-        if (!backend_ctx->relay_i->destroy(backend_ctx->relay)) {
+        bool destroyed = false;
+        try {
+            destroyed = backend_ctx->relay_i->destroy(backend_ctx->relay);
+        } catch (...) {
+            destroyed = false;
+        }
+        if (!destroyed) {
             // A native reader may still own graph and child-backend storage.
             // Retain the entire Meta owner instead of freeing behind it.
             GGML_LOG_ERROR("%s: retaining tp5-relay owners: native completion is unproved\n", __func__);
-            return;
+            return false;
         }
         backend_ctx->relay = nullptr;
     }
@@ -3655,6 +5473,28 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
     backend_ctx->output_copy_events.clear();
     delete backend_ctx;
     delete backend;
+    return true;
+}
+
+static void ggml_backend_meta_free(ggml_backend_t backend) {
+    (void) ggml_backend_meta_free_impl(backend);
+}
+
+extern "C" {
+GGML_API bool ggml_backend_meta_free_and_report(ggml_backend_t backend) {
+    if (backend == nullptr) {
+        return true;
+    }
+    if (!ggml_backend_is_meta(backend)) {
+        ggml_backend_free(backend);
+        return true;
+    }
+    // The cleanup owner may call this outside ggml_backend_free. Keep the
+    // same close-defer contract: a module drop queues instead of dlclosing
+    // inside the Meta destructor.
+    ggml_backend_module::close_defer_scope defer_close;
+    return ggml_backend_meta_free_impl(backend);
+}
 }
 
 // staging_meta is the original graph input for a scheduler copy. The copy
@@ -3699,11 +5539,23 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
             if (diag) {
                 g_staging_meta_diag.async_mirrored.fetch_add(1, std::memory_order_relaxed);
             }
-            const ggml_cuda_staging::api * st = staging_api();
+            const auto * backend_ctx = static_cast<const ggml_backend_meta_context *>(backend->context);
+            const bool owner_valid = backend_ctx != nullptr &&
+                backend_ctx->staging_owner_valid.load(std::memory_order_acquire);
+            const ggml_cuda_staging::api * st = owner_valid
+                ? backend_ctx->staging_provider.load(std::memory_order_acquire)
+                : nullptr;
+            const uint64_t staging_raw_owner = backend_ctx != nullptr
+                ? backend_ctx->staging_raw_owner.load(std::memory_order_relaxed)
+                : 0;
+            const uint64_t staging_generation = backend_ctx != nullptr
+                ? backend_ctx->staging_generation.load(std::memory_order_relaxed)
+                : 0;
             // configured(), not enabled(): a faulted pool must keep the gate.
             const bool staging_gate = st != nullptr && (st->configured == nullptr || st->configured());
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
-            const bool staging_on = st != nullptr && st->enabled();
+            const bool staging_on = st != nullptr && st->enabled() &&
+                owner_valid;
             // staging_meta is the scheduler's real source tensor; its name and
             // INPUT flag are the identity used for classification.
             const ggml_tensor * staging_src = staging_meta != nullptr ? staging_meta : tensor;
@@ -3740,7 +5592,10 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                 ggml_cuda_staging::lease staged_lease;
                 // Never wait a pending slot here: the async lane must not block
                 // the pipeline. A miss falls back to the pageable path.
-                if (ranks_ok && st->acquire_nowait(staging_window(), staging_kind, size, &staged_lease)) {
+                if (ranks_ok && st->acquire_owner != nullptr &&
+                        st->acquire_owner(staging_raw_owner,
+                                          staging_generation,
+                                          staging_kind, size, &staged_lease, false)) {
                     if (diag) {
                         g_staging_meta_diag.async_lease_ok.fetch_add(1, std::memory_order_relaxed);
                     }
@@ -3905,6 +5760,49 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
+// Synchronize the destination under the staging submit gate. A fatal
+// publication holds the pool lock and waits for this gate, so it cannot be
+static const ggml_cuda_staging::api * provider_for_backend(ggml_backend_t backend) {
+    auto * ctx = backend != nullptr
+        ? static_cast<ggml_backend_meta_context *>(backend->context) : nullptr;
+    if (ctx != nullptr && ctx->staging_owner_valid.load(std::memory_order_acquire)) {
+        return ctx->staging_provider.load(std::memory_order_acquire);
+    }
+    if (ctx != nullptr) {
+        const uint64_t epoch = g_provider_epoch.load(std::memory_order_acquire);
+        if (ctx->child_provider_epoch.load(std::memory_order_acquire) == epoch) {
+            return ctx->child_provider.load(std::memory_order_acquire);
+        }
+        std::lock_guard<std::mutex> lock(ctx->child_provider_mutex);
+        if (ctx->child_provider_epoch.load(std::memory_order_acquire) != epoch) {
+            const ggml_cuda_staging::api * child =
+                ctx->child_provider_hold.acquire(ctx->child_reg);
+            ctx->child_provider.store(child, std::memory_order_release);
+            ctx->child_provider_epoch.store(epoch, std::memory_order_release);
+        }
+        return ctx->child_provider.load(std::memory_order_acquire);
+    }
+    // No owner: use the provider of the backend's actual children. The active
+    // provider is not a substitute; it may belong to another DSO.
+    return provider_for_reg(provider_reg_for_backend(backend));
+}
+
+// published between the gate entry and the drain. If the gate is already
+// closed, do not synchronize: the submission is unproven and a drain is not a
+// completion proof.
+static bool ggml_backend_meta_synchronize_if_proven(ggml_backend_t backend) {
+    const ggml_cuda_staging::api * st = provider_for_backend(backend);
+    if (st != nullptr) {
+        if (!st->enter_submit()) {
+            return false;
+        }
+    }
+    ggml_backend_meta_synchronize(backend);
+    if (st != nullptr) {
+        st->leave_submit();
+    }
+    return true;
+}
 // Caller-scoped observation/coordination point; no provider lock is held here.
 static thread_local bool (*tp5_meta_submit_ready_hook)(void *) = nullptr;
 static thread_local void * tp5_meta_submit_ready_userdata = nullptr;
@@ -3956,6 +5854,296 @@ static bool ggml_backend_meta_submission_failed(ggml_backend_t backend) {
            ggml_backend_meta_submission_pending(backend);
 }
 
+// Query the submission capability of either owner, including a source that is
+// not this Meta backend. A direct capability caller must not bypass a pending
+// source.
+static bool ggml_backend_meta_submission_failed_any(ggml_backend_t backend) {
+    if (backend == nullptr || backend->device == nullptr || backend->device->reg == nullptr) {
+        return false;
+    }
+    auto err = (int (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(
+        backend->device->reg, "ggml_backend_submission_error");
+    auto pending = (bool (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(
+        backend->device->reg, "ggml_backend_submission_pending");
+    return (err != nullptr && err(backend) != 0) ||
+           (pending != nullptr && pending(backend));
+}
+
+// Native drain receipt for the final scheduler query. Only DRAINED proves the
+// staging pool is clean and the gated child synchronize completed. A closed
+// gate is BUSY/FAILED, never success.
+static int ggml_backend_meta_drain(ggml_backend_t backend) {
+    if (ggml_backend_meta_submission_error(backend) != 0) {
+        return GGML_BACKEND_DRAIN_FAILED;
+    }
+    if (ggml_backend_meta_submission_pending(backend)) {
+        return GGML_BACKEND_DRAIN_BUSY;
+    }
+    // The Meta staging upload is on the child streams. A child receipt is the
+    // completion fact; a child with async work and no receipt is BUSY, never
+    // clean. A child with no async capability has no unobservable work.
+    const int n = ggml_backend_meta_n_backends(backend);
+    for (int j = 0; j < n; ++j) {
+        ggml_backend_t child = ggml_backend_meta_simple_backend(backend, j);
+        if (child == nullptr) {
+            return GGML_BACKEND_DRAIN_BUSY;
+        }
+        const ggml_backend_drain_api * api = nullptr;
+        if (child->device != nullptr && child->device->reg != nullptr) {
+            api = (const ggml_backend_drain_api *) ggml_backend_reg_get_proc_address(
+                child->device->reg, "ggml_backend_drain_v1");
+        }
+        if (api != nullptr && api->abi_version == GGML_BACKEND_DRAIN_API_VERSION &&
+                api->drain != nullptr) {
+            const int result = api->drain(child);
+            if (result != GGML_BACKEND_DRAIN_DRAINED) {
+                return result;
+            }
+        } else if (child->iface.cpy_tensor_async != nullptr ||
+                   child->iface.set_tensor_async != nullptr) {
+            return GGML_BACKEND_DRAIN_BUSY;
+        }
+    }
+    auto * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    if (backend_ctx != nullptr && backend_ctx->comm_ctx != nullptr &&
+            backend_ctx->comm_drain != nullptr) {
+        const int comm_result = backend_ctx->comm_drain(backend_ctx->comm_ctx);
+        if (comm_result != GGML_BACKEND_DRAIN_DRAINED) {
+            return comm_result;
+        }
+    }
+    if (ggml_backend_meta_submission_error(backend) != 0) {
+        return GGML_BACKEND_DRAIN_FAILED;
+    }
+    if (ggml_backend_meta_submission_pending(backend)) {
+        return GGML_BACKEND_DRAIN_BUSY;
+    }
+    return GGML_BACKEND_DRAIN_DRAINED;
+}
+
+// Blocking counterpart of cpy_tensor_async with the real destination owner.
+// The source identity is still the original tensor; the child uploads use the
+// destination backend's child backends and streams, not a buffer-only path.
+// The result separates a pure preflight rejection from a fail-stop that may
+// already have submitted work. The no-staging fallback holds the staging
+// submit gate across the source read and the destination write, so a fault
+// cannot be published between them.
+static int ggml_backend_meta_copy_tensor_sync(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, ggml_tensor * dst) {
+    if (backend_dst == nullptr || !ggml_backend_is_meta(backend_dst) ||
+            src == nullptr || dst == nullptr ||
+            !ggml_are_same_layout(src, dst)) {
+        return GGML_BACKEND_COPY_TENSOR_SYNC_REJECTED;
+    }
+    const ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+    const ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (src_buf == nullptr || dst_buf == nullptr ||
+            dst->buffer != dst_buf ||
+            !ggml_backend_buffer_is_meta(dst_buf)) {
+        return GGML_BACKEND_COPY_TENSOR_SYNC_REJECTED;
+    }
+    if (backend_dst->device == nullptr ||
+            ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst_buf)) !=
+                ggml_backend_get_device(backend_dst)) {
+        // The destination buffer is not owned by this backend instance.
+        return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+    }
+    const size_t nbytes = ggml_nbytes(src);
+    if (nbytes == 0) {
+        return GGML_BACKEND_COPY_TENSOR_SYNC_OK;
+    }
+    if (ggml_backend_meta_submission_failed_any(backend_src) ||
+            ggml_backend_meta_submission_failed(backend_dst)) {
+        // Either owner is already unproven. Do not write or replay.
+        return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+    }
+    if (src->data == nullptr || dst->data == nullptr) {
+        return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+    }
+
+    bool fast = dst->view_src == nullptr &&
+        ggml_backend_buffer_is_host(src_buf) && !ggml_backend_buffer_is_meta(src_buf) &&
+        ggml_is_contiguous(src) && ggml_is_contiguous(dst) &&
+        ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst_buf)) ==
+            ggml_backend_get_device(backend_dst);
+    if (fast) {
+        const ggml_backend_meta_split_state split_state =
+            ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
+        fast = split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+            split_state.n_segments == 1 && split_state.nr[0] == 1;
+    }
+    if (fast) {
+        ggml_backend_meta_set_tensor_async_impl(backend_dst, dst, src->data, 0, nbytes, src);
+        if (ggml_backend_meta_submission_failed(backend_dst)) {
+            // A drain is not a completion proof; the sticky state carries the
+            // fault and the caller must not fall back.
+            return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+        }
+        if (!ggml_backend_meta_synchronize_if_proven(backend_dst)) {
+            return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+        }
+        if (ggml_backend_meta_submission_failed_any(backend_src) ||
+                ggml_backend_meta_submission_failed(backend_dst)) {
+            return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+        }
+        return GGML_BACKEND_COPY_TENSOR_SYNC_OK;
+    }
+
+    // Owner-safe fallback for a view, non-mirrored split, non-contiguous or
+    // Meta/device source. It preserves the ordinary copy result but never
+    // leases a staging slot or falls back to the ownerless buffer hook.
+    if (!ggml_is_contiguous(dst)) {
+        const ggml_backend_meta_split_state split_state =
+            ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
+        if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            // The ordinary set path has no non-contiguous non-mirrored
+            // contract. Refuse instead of aborting inside the setter.
+            return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+        }
+    }
+
+    const bool src_host = ggml_backend_buffer_is_host(src_buf) &&
+        !ggml_backend_buffer_is_meta(src_buf);
+    if (!src_host) {
+        if (backend_src == nullptr || backend_src->device == nullptr ||
+                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src_buf)) !=
+                    ggml_backend_get_device(backend_src)) {
+            // The source buffer does not belong to the source backend.
+            return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+        }
+    }
+    const void * data = nullptr;
+    std::vector<uint8_t> tmp;
+    if (src_host) {
+        data = src->data;
+    } else {
+        // Synchronize the source owner before the blocking get. The
+        // destination's submit gate is not held across this get: the set path
+        // takes it only for the write, avoiding a gate/stream lock cycle.
+        if (ggml_backend_is_meta(backend_src)) {
+            if (!ggml_backend_meta_synchronize_if_proven(backend_src)) {
+                return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+            }
+        } else if (backend_src->device->reg != nullptr) {
+            auto api = (const ggml_backend_synchronize_if_proven_api *)
+                ggml_backend_reg_get_proc_address(backend_src->device->reg,
+                                                  "ggml_backend_synchronize_if_proven_v1");
+            if (api != nullptr &&
+                    api->abi_version == GGML_BACKEND_SYNCHRONIZE_IF_PROVEN_API_VERSION &&
+                    api->sync != nullptr) {
+                if (!api->sync(backend_src)) {
+                    return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+                }
+            } else {
+                if (ggml_backend_meta_submission_failed_any(backend_src)) {
+                    return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+                }
+                ggml_backend_synchronize(backend_src);
+                if (ggml_backend_meta_submission_failed_any(backend_src)) {
+                    return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+                }
+            }
+        }
+        tmp.resize(nbytes);
+        ggml_backend_tensor_get(src, tmp.data(), 0, nbytes);
+        if (ggml_backend_meta_submission_failed_any(backend_src)) {
+            // The source became unproven during the read. Do not write dst.
+            return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+        }
+        data = tmp.data();
+    }
+    if (data == nullptr) {
+        return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+    }
+
+    // The destination write is the only part under the submit gate.
+    const ggml_cuda_staging::api * st = provider_for_backend(backend_dst);
+    const bool gate_held = st != nullptr;
+    if (gate_held && !st->enter_submit()) {
+        return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+    }
+    ggml_backend_meta_buffer_set_tensor_impl(dst->buffer, dst, data, 0, nbytes,
+                                             nullptr, /*allow_staging=*/ false,
+                                             /*submit_gate_held=*/ gate_held);
+    if (gate_held) {
+        st->leave_submit();
+    }
+    if (ggml_backend_meta_submission_failed_any(backend_src) ||
+            ggml_backend_meta_submission_failed(backend_dst)) {
+        return GGML_BACKEND_COPY_TENSOR_SYNC_FAIL_STOP;
+    }
+    return GGML_BACKEND_COPY_TENSOR_SYNC_OK;
+}
+
+// Ownerless no-staging copy for the public blocking copy. It preserves the
+// ordinary result but never leases a staging slot. The public caller has no
+// backend owner, so an unproven pool is a fail-stop rather than a reason to
+// stage. The buffer caches the provider of its simple children; the active
+// provider is never a substitute. Owner-bound callers use the v2 capability so
+// the gate and submission state follow their token.
+static bool ggml_backend_meta_copy_tensor_no_staging(
+        const ggml_tensor * src, ggml_tensor * dst) {
+    if (src == nullptr || dst == nullptr || !ggml_are_same_layout(src, dst)) {
+        return false;
+    }
+    const ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+    const ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (src_buf == nullptr || dst_buf == nullptr ||
+            dst->buffer != dst_buf || !ggml_backend_buffer_is_meta(dst_buf)) {
+        return false;
+    }
+    auto * dst_ctx = static_cast<ggml_backend_meta_buffer_context *>(dst_buf->context);
+    const uint64_t provider_epoch = g_provider_epoch.load(std::memory_order_acquire);
+    const ggml_cuda_staging::api * st = dst_ctx != nullptr
+        ? dst_ctx->staging_provider.load(std::memory_order_acquire) : nullptr;
+    if (dst_ctx != nullptr &&
+            dst_ctx->staging_epoch.load(std::memory_order_acquire) != provider_epoch) {
+        std::lock_guard<std::mutex> lock(dst_ctx->staging_provider_mutex);
+        if (dst_ctx->staging_epoch.load(std::memory_order_acquire) != provider_epoch) {
+            st = dst_ctx->staging_provider_hold.acquire(dst_ctx->staging_reg);
+            dst_ctx->staging_provider.store(st, std::memory_order_release);
+            dst_ctx->staging_epoch.store(provider_epoch, std::memory_order_release);
+        }
+        st = dst_ctx->staging_provider.load(std::memory_order_acquire);
+    }
+    if (st != nullptr) {
+        if (st->first_error != nullptr && st->first_error() != 0) {
+            return false;
+        }
+        if (st->submission_pending != nullptr && st->submission_pending()) {
+            return false;
+        }
+    }
+    const size_t nbytes = ggml_nbytes(src);
+    if (nbytes == 0) {
+        return true;
+    }
+    const void * data = nullptr;
+    std::vector<uint8_t> tmp;
+    if (ggml_backend_buffer_is_host(src_buf) && !ggml_backend_buffer_is_meta(src_buf)) {
+        data = src->data;
+    } else {
+        tmp.resize(nbytes);
+        ggml_backend_tensor_get(src, tmp.data(), 0, nbytes);
+        data = tmp.data();
+    }
+    if (data == nullptr) {
+        return false;
+    }
+    ggml_backend_meta_buffer_set_tensor_impl(dst->buffer, dst, data, 0, nbytes,
+                                             nullptr, /*allow_staging=*/ false,
+                                             /*submit_gate_held=*/ false);
+    if (st != nullptr) {
+        if (st->first_error != nullptr && st->first_error() != 0) {
+            return false;
+        }
+        if (st->submission_pending != nullptr && st->submission_pending()) {
+            return false;
+        }
+    }
+    return true;
+}
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     const int64_t diag_start = ggml_time_us();
     if (ggml_backend_meta_submission_failed(backend)) {

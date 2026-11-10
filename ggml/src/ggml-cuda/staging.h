@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -31,12 +32,12 @@ constexpr uint32_t kSlotsPerKey  = 2;   // double buffer
 // previous version's last field, but the meta layer accepts only the current
 // version and checks the version before reading any later field. v1 cannot
 // publish a partial submission; v2 has mark_partial but no kind domain; v3
-// adds kind_count. A mixed v1/v2/v3 install is explicitly unsupported and
-// the registration is rejected; an existing registration is unchanged, and a
-// first rejection leaves staging unregistered (the original copy path is
-// used) instead of sending kind values the provider does not understand. This
-// is not a claim of equivalent performance.
-constexpr uint32_t kApiVersion   = 3;
+// adds kind_count; v4 adds owner-issued credit and explicit drain. A mixed
+// version install is explicitly unsupported and the registration is rejected;
+// an existing registration is unchanged, and a first rejection leaves staging
+// unregistered (the original copy path is used). This is not a claim of
+// equivalent performance.
+constexpr uint32_t kApiVersion   = 4;
 
 enum class kind : uint32_t {
     tokens  = 0,
@@ -182,6 +183,26 @@ struct lease {
     uint32_t  window = 0;
     uint32_t  slot   = 0;
     uint64_t  epoch  = 0;
+    // v4 owner credit. Zero for the legacy window-only acquire path.
+    uint64_t  owner      = 0;
+    uint64_t  generation = 0;
+};
+
+// Result of an explicit owner drain. Only drained permits release; busy and
+// failed leave the owner and its credit/window resources in place.
+enum class owner_drain_result : int {
+    drained = 0,
+    busy    = 1,  // a lease is still active; no new leases are admitted
+    failed  = 2,  // a pending event could not be proven complete; retained
+    invalid = 3,  // unknown owner/generation or not active/draining
+};
+
+enum class owner_phase {
+    free,
+    active,
+    draining,
+    drained,
+    failed,
 };
 
 // Primitives supplied by the GPU backend. The pool calls them with its own
@@ -250,6 +271,9 @@ public:
     explicit pool(backend_ops ops, size_t max_bytes = kMaxPoolBytes)
         : ops_(ops), max_bytes_(max_bytes) {}
     ~pool() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        shutting_down_ = true;
+        drain_done_.wait(lock, [this] { return active_drains_ == 0; });
         for (auto & win : slots_) {
             for (auto & key : win) {
                 for (auto & s : key) {
@@ -285,8 +309,14 @@ public:
     // only when wait_pending is true; the async lane passes false so it never
     // blocks a pipeline on an in-flight event and falls back instead.
     bool acquire(uint32_t window, kind k, size_t bytes, lease * out, bool wait_pending = true) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return acquire_locked(window, k, bytes, out, wait_pending);
+    }
+
+    // Caller holds mutex_. The public acquire wrapper and the v4 owner path
+    // share this body.
+    bool acquire_locked(uint32_t window, kind k, size_t bytes, lease * out, bool wait_pending) {
         if (out == nullptr || bytes == 0 || window >= kWindows || size_t(k) >= kKindCount) {
-            std::lock_guard<std::mutex> lock(mutex_);
             stats_.invalid++;
             return false;
         }
@@ -480,6 +510,213 @@ public:
         }
     }
 
+    // v4: the pool issues a monotonic owner token and one of the four finite
+    // credit windows. run_id/window_id are caller hints for duplicate
+    // detection only; the identity and the credit come from the pool.
+    bool owner_acquire(uint64_t run_id, uint32_t window_id, uint64_t * owner, uint64_t * generation) {
+        if (owner == nullptr || generation == nullptr || run_id == 0 || window_id >= kWindows) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (disabled_.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        for (auto & o : owners_) {
+            if (o.phase != owner_phase::free) {
+                continue;
+            }
+            o.run_id = run_id;
+            o.window_id = window_id;
+            o.owner = next_owner_id_++;
+            o.generation = next_generation_++;
+            o.window = uint32_t(&o - owners_.data());
+            o.phase = owner_phase::active;
+            *owner = o.owner;
+            *generation = o.generation;
+            return true;
+        }
+        return false; // finite credit exhausted
+    }
+
+    bool acquire_owner(uint64_t owner, uint64_t generation, kind k, size_t bytes, lease * out, bool wait_pending) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        owner_credit * oc = find_owner_locked(owner, generation);
+        if (oc == nullptr || oc->phase != owner_phase::active) {
+            return false;
+        }
+        if (!acquire_locked(oc->window, k, bytes, out, wait_pending)) {
+            return false;
+        }
+        out->owner = owner;
+        out->generation = generation;
+        return true;
+    }
+
+    // Explicit drain. It admits no new lease after the owner enters draining.
+    // A still-leased slot is busy, not success. A failed wait retains the
+    // owner and its credit/window; only drained permits release.
+    owner_drain_result owner_drain(uint64_t owner, uint64_t generation) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (shutting_down_) {
+            return owner_drain_result::invalid;
+        }
+        owner_credit * oc = find_owner_locked(owner, generation);
+        if (oc == nullptr) {
+            return owner_drain_result::invalid;
+        }
+        if (oc->phase == owner_phase::drained) {
+            return owner_drain_result::drained;
+        }
+        if (oc->phase == owner_phase::failed) {
+            return owner_drain_result::failed;
+        }
+        if (oc->phase != owner_phase::active && oc->phase != owner_phase::draining) {
+            return owner_drain_result::invalid;
+        }
+        oc->phase = owner_phase::draining;
+        if (disabled_.load(std::memory_order_relaxed) || unknown_count_ > 0) {
+            oc->phase = owner_phase::failed;
+            return owner_drain_result::failed;
+        }
+        auto & window = slots_[oc->window];
+        struct pending_snapshot {
+            slot *   s;
+            uint32_t ranks;
+            void *   events[kRanks];
+        };
+        std::array<pending_snapshot, kKindCount * kSlotsPerKey> pending = {};
+        size_t n_pending = 0;
+        for (auto & by_kind : window) {
+            for (auto & s : by_kind) {
+                if (s.leased) {
+                    return owner_drain_result::busy;
+                }
+                if (s.quarantined || s.partial_marked) {
+                    oc->phase = owner_phase::failed;
+                    return owner_drain_result::failed;
+                }
+                if (s.pending) {
+                    pending[n_pending++] = { &s, s.pending_ranks, {} };
+                    for (uint32_t r = 0; r < kRanks; ++r) {
+                        pending[n_pending - 1].events[r] = s.events[r];
+                    }
+                }
+            }
+        }
+        if (n_pending == 0) {
+            oc->phase = owner_phase::drained;
+            return owner_drain_result::drained;
+        }
+        // Never hold the process-wide pool mutex while waiting for a slow
+        // owner's events: another owner must remain able to acquire/release.
+        const int saved = ops_.current_device != nullptr ? ops_.current_device() : -1;
+        int fail_err = 0;
+        slot * fail_slot = nullptr;
+        active_drains_++;
+        lock.unlock();
+        for (size_t i = 0; i < n_pending && fail_err == 0; ++i) {
+            for (uint32_t r = 0; r < kRanks; ++r) {
+                if ((pending[i].ranks & (uint32_t(1) << r)) == 0) {
+                    continue;
+                }
+                if (ops_.select_device != nullptr && !ops_.select_device(int(r))) {
+                    fail_err = -1;
+                    fail_slot = pending[i].s;
+                    break;
+                }
+                if (pending[i].events[r] == nullptr || ops_.event_sync == nullptr) {
+                    fail_err = -1;
+                    fail_slot = pending[i].s;
+                    break;
+                }
+                const int sync_err = ops_.event_sync(pending[i].events[r]);
+                if (sync_err != 0) {
+                    fail_err = sync_err;
+                    fail_slot = pending[i].s;
+                    break;
+                }
+            }
+        }
+        if (ops_.restore_device != nullptr && !ops_.restore_device(saved) && fail_err == 0) {
+            fail_err = -1;
+            fail_slot = pending[0].s;
+        }
+        lock.lock();
+        auto finish = [this] {
+            if (active_drains_ > 0) {
+                --active_drains_;
+            }
+            drain_done_.notify_all();
+        };
+        oc = find_owner_locked(owner, generation);
+        if (oc == nullptr || oc->phase != owner_phase::draining) {
+            finish();
+            return owner_drain_result::invalid;
+        }
+        if (fail_err != 0) {
+            if (fail_slot != nullptr) {
+                quarantine_locked(*fail_slot, fail_err);
+            }
+            disabled_.store(true, std::memory_order_relaxed);
+            publish_fatal_locked();
+            stats_.wait_fail++;
+            oc->phase = owner_phase::failed;
+            finish();
+            return owner_drain_result::failed;
+        }
+        if (disabled_.load(std::memory_order_relaxed) || unknown_count_ > 0) {
+            oc->phase = owner_phase::failed;
+            finish();
+            return owner_drain_result::failed;
+        }
+        for (size_t i = 0; i < n_pending; ++i) {
+            slot * s = pending[i].s;
+            if (s->leased) {
+                finish();
+                return owner_drain_result::busy;
+            }
+            if (s->quarantined || s->partial_marked) {
+                oc->phase = owner_phase::failed;
+                finish();
+                return owner_drain_result::failed;
+            }
+            if (s->pending && s->pending_ranks != pending[i].ranks) {
+                finish();
+                return owner_drain_result::busy;
+            }
+        }
+        for (size_t i = 0; i < n_pending; ++i) {
+            pending[i].s->pending = false;
+            pending[i].s->pending_ranks = 0;
+        }
+        oc->phase = owner_phase::drained;
+        finish();
+        return owner_drain_result::drained;
+    }
+
+    bool owner_release(uint64_t owner, uint64_t generation) {
+        if (owner == 0 || generation == 0) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        owner_credit * oc = find_owner_locked(owner, generation);
+        if (oc != nullptr) {
+            if (oc->phase != owner_phase::drained) {
+                return false; // busy/failed/active: retain the credit
+            }
+            oc->phase = owner_phase::free;
+            released_[released_next_] = {owner, generation};
+            released_next_ = (released_next_ + 1) % released_.size();
+            return true;
+        }
+        for (const auto & r : released_) {
+            if (r.owner == owner && r.generation == generation) {
+                return true; // idempotent repeat, no second free
+            }
+        }
+        return false;
+    }
+
     submit_result upload(const lease & l, const void * src, size_t bytes) {
         if (src == nullptr || bytes == 0) {
             return submit_result::rejected;
@@ -643,6 +880,13 @@ public:
         if (s == nullptr) {
             stats_.stale_release++;
             return;
+        }
+        if (l.owner != 0) {
+            owner_credit * oc = find_owner_locked(l.owner, l.generation);
+            if (oc == nullptr || oc->window != l.window) {
+                stats_.stale_release++;
+                return;
+            }
         }
         s->leased = false;
         stats_.releases++;
@@ -970,6 +1214,28 @@ private:
         int err = 0;
     };
 
+    struct owner_credit {
+        uint64_t    run_id     = 0;
+        uint32_t    window_id  = 0;
+        uint64_t    owner      = 0;
+        uint64_t    generation = 0;
+        uint32_t    window     = 0;
+        owner_phase phase      = owner_phase::free;
+    };
+    struct released_token {
+        uint64_t owner      = 0;
+        uint64_t generation = 0;
+    };
+
+    owner_credit * find_owner_locked(uint64_t owner, uint64_t generation) {
+        for (auto & o : owners_) {
+            if (o.owner == owner && o.generation == generation && o.phase != owner_phase::free) {
+                return &o;
+            }
+        }
+        return nullptr;
+    }
+
     void record_unknown_locked(const void * dst, int rank, int err) {
         if (unknown_count_ < unknown_.size()) {
             unknown_[unknown_count_++] = { dst, rank, err };
@@ -1183,6 +1449,9 @@ private:
     }
 
     mutable std::mutex mutex_;
+    bool shutting_down_ = false;
+    uint32_t active_drains_ = 0;
+    std::condition_variable drain_done_;
     std::mutex submit_mutex_;
     // True while enter_submit owns the gate. Published for note_source, which
     // must not touch submit_mutex_ on the owning thread.
@@ -1198,6 +1467,11 @@ private:
     stats stats_;
     std::array<unknown_work, 16> unknown_ = {};
     size_t unknown_count_ = 0;
+    std::array<owner_credit, kWindows> owners_ = {};
+    uint64_t next_owner_id_ = 1;
+    uint64_t next_generation_ = 1;
+    std::array<released_token, 8> released_ = {};
+    size_t released_next_ = 0;
     std::array<std::array<rotation, kKindCount>, kWindows> slots_ = {};
 };
 
@@ -1207,7 +1481,8 @@ bool enabled();
 bool configured();
 bool usable();
 bool merge_wait_enabled();
-void init();
+void init(ggml_backend_reg_t reg);
+ggml_backend_reg_t provider_reg();
 bool zc_enabled();
 void dump();
 
@@ -1266,6 +1541,14 @@ struct api {
     // kind_count is smaller than its own kKindCount instead of sending kind
     // values the provider would treat as invalid.
     uint32_t kind_count;
+    // v4 only, appended after kind_count. The pool issues a monotonic owner
+    // token and a finite credit window. run_id/window_id are caller hints for
+    // duplicate detection; the identity and credit are pool-issued.
+    bool (*owner_acquire)(uint64_t run_id, uint32_t window_id, uint64_t * owner, uint64_t * generation);
+    bool (*acquire_owner)(uint64_t owner, uint64_t generation, kind k, size_t bytes,
+                          lease * out, bool wait_pending);
+    int  (*owner_drain)(uint64_t owner, uint64_t generation);
+    bool (*owner_release)(uint64_t owner, uint64_t generation);
 };
 
 // Defined by the CUDA/HIP backend.
@@ -1281,8 +1564,13 @@ submit_result enqueue_sync_impl(const lease & l, ggml_tensor * tensor,
 
 extern "C" {
 // Implemented in ggml-backend-meta.cpp (ggml-base). The GPU backend calls it
-// once from its registry entry point. No-op when the meta layer is absent.
-GGML_BACKEND_API bool ggml_backend_meta_staging_register(const void * impl);
-GGML_BACKEND_API const void * ggml_backend_meta_staging_get();
-GGML_BACKEND_API void ggml_backend_meta_staging_diag_dump();
+// from its registry entry point, including after a quiescent unload/reload;
+// a reload gets a fresh provider tag. No-op when the meta layer is absent.
+GGML_BASE_API bool ggml_backend_meta_staging_register(const void * impl);
+GGML_BASE_API bool ggml_backend_meta_staging_register_for_reg(
+        ggml_backend_reg_t reg, const void * impl);
+GGML_BASE_API bool ggml_backend_meta_staging_unregister_reg(
+        ggml_backend_reg_t reg, bool * had_provider);
+GGML_BASE_API const void * ggml_backend_meta_staging_get();
+GGML_BASE_API void ggml_backend_meta_staging_diag_dump();
 }

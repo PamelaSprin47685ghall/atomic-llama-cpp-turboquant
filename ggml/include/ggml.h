@@ -187,6 +187,24 @@
 #    define GGML_API extern
 #endif
 
+// ggml-base owns the backend module-handle table. The registry (ggml) and
+// backend instances (ggml-base) both pin handles through it, so the symbol
+// must be exported by ggml-base and imported by its callers. Keeping this
+// separate from GGML_API avoids a ggml-base -> ggml reverse dependency.
+#ifdef GGML_SHARED
+#    if defined(_WIN32) && !defined(__MINGW32__)
+#        ifdef GGML_BASE_BUILD
+#            define GGML_BASE_API __declspec(dllexport)
+#        else
+#            define GGML_BASE_API __declspec(dllimport)
+#        endif
+#    else
+#        define GGML_BASE_API __attribute__ ((visibility ("default")))
+#    endif
+#else
+#    define GGML_BASE_API
+#endif
+
 // TODO: support for clang
 #ifdef __GNUC__
 #    define GGML_DEPRECATED(func, hint) func __attribute__((deprecated(hint)))

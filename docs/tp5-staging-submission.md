@@ -37,10 +37,128 @@ change, so an older plugin cannot be read past its end.
   - true while the destination may still be in flight.
   - never clears for an unprovable submission.
 
-Only the meta backend implements them today, from the **process-global**
-staging pool. The functions ignore the backend argument: one staging fault in
-one Meta context makes every Meta backend report the error/pending state until
-process exit. Other backends report `0`/`false`.
+Only the meta backend implements them today, from the staging pool of the
+provider that issued the owner token. The pool is a function-local static in
+each CUDA/HIP DSO (`staging.cu`), so it is per-DSO, not a process-global
+singleton. `ggml_backend_meta_staging_register_for_reg` binds an api table to
+the DSO's `ggml_backend_reg_t`; the legacy `ggml_backend_meta_staging_register`
+is rejected because it has no registry identity; the registry keeps the api, registry, a
+monotonic non-reused tag, the active token map, and owner/in-flight counters.
+Registering the same api/reg is idempotent. The active pointer is kept only
+for the legacy `staging_get` diagnostic; no ownerless operation uses it, and
+the legacy acquire requires exactly one provider rather than using the active
+pointer.
+
+`ggml_backend_load_all_from_path` loads `cuda` and `hip` independently and can
+also dlopen an arbitrary `GGML_BACKEND_PATH` (`ggml-backend-reg.cpp`). If two
+CUDA/HIP DSOs or a relocated package are present, each registers its own pool
+and registry. The owner APIs `..._acquire_for_reg`, `..._acquire_for_device`,
+and `..._acquire_for_backend` select the provider from the target's real
+registry/device/child backends, never from the last registration. A Meta
+backend caches the common child registry at construction; mixed children
+(CUDA+HIP+CPU or otherwise) have no common provider and therefore no staging
+owner, no credit consumption, and the normal copy path. A CPU model device has
+no staging provider and acquires no credit. A runtime model whose devices
+span more than one provider likewise acquires no owner and keeps the exact
+ordinary copy path; it logs the disabled optimization rather than failing the
+model or binding one provider's token to another provider's children. The
+legacy `ggml_backend_meta_staging_owner_acquire` is accepted only while exactly
+one provider exists.
+
+A successful acquire inserts the token into the provider's active token map
+with its raw owner, generation, run and window. `owner_drain`/`owner_release`
+require that active entry and the matching generation; `set_staging_owner`
+requires it too, rejects an unknown/released/stale token, and rejects
+overwriting a different already-bound owner. `llama_context` logs and leaves
+staging disabled if the bind is not applicable to that backend; it does not
+fail context initialization. New callers bind after construction with
+`llama_tp5_context_staging_bind(ctx, owner, generation, run_id, window_id)`;
+this validates the token's acquired run/window without changing the
+`llama_context_params` ABI. The old params owner path remains for old callers
+without run/window validation. Duplicate active `(run, window)` acquisition is
+rejected and the just-acquired raw owner is returned. The
+owner-aware upload/enqueue/wait/release, the submission error/pending queries,
+`copy_tensor_sync`, and the submit gate all route through the token's provider.
+The Meta context caches the provider and raw owner at bind time, so the async
+tensor path takes no registry lock or linear search.
+
+Ownerless paths do not use the active provider. `submission_error`,
+`submission_pending`, and `synchronize_if_proven` use the Meta backend's common
+child provider; the public no-staging copy uses the buffer's common child
+provider. Both caches carry the registry epoch and refresh on
+register/unregister. If there is no common provider, the capability reports
+clean/no-gate and the ordinary copy runs; no foreign pool fault can pollute a
+CPU or mixed Meta backend.
+
+Provider lifetime is code-enforced. A dynamic load owns the DSO handle from
+`dl_load_library` through `backend_init_fn` and registration. A provider that
+registers from its init function receives a shared reference to that handle,
+and a failed init rolls back exactly the provider entries created by that
+transaction. `ggml_backend_unload` marks the registry entry unloading and calls
+`ggml_backend_meta_staging_unregister_reg`; if an owner, token, or in-flight
+acquire is live, the unload is refused, logged, and the mark is cleared. A
+quiescent unload removes the provider and the registry entry, then drops the
+registry reference outside the registry lock. Backend instances pin the DSO
+and count as live users, so unload is refused while any instance exists.
+Provider entries, tokens, cleanup records, and orphan records hold shared
+module references. Shared handles use a deferred-close queue: a drop that
+occurs inside provider free code or a registry transaction is queued and
+closed only after the transaction unlocks. Device-bearing and staging DSOs
+keep their mapping for process lifetime so a model/device/buffer pointer
+obtained before unload cannot point into unmapped code. Reloading the DSO
+registers a fresh monotonic tag; the old tag is gone, so old tokens are
+invalid and cannot ABA into the new pool. A static backend has no module
+handle, which is a legal lifetime; a dynamic reg removed by unload is recorded
+so callers can tell it apart from a static backend. The tag space is 16 bits
+(65535 lifetime registrations); exhaustion is reported. The raw owner must fit
+in 48 bits. If encoding fails, the just-acquired raw owner is drained and
+released; a busy/failed drain is retained in the orphan-record table and the
+provider's owner count stays nonzero, so unload remains refused. The table
+grows by one real owner record per retained credit rather than dropping an
+owner at a fixed capacity. Orphan retry is a single bounded batch with
+per-record backoff, never an unbounded spin. Legacy untagged tokens are
+accepted only by drain/release
+when exactly one provider exists; untagged `set_staging_owner` is rejected.
+The backend ABI remains version 2 and `struct ggml_backend` keeps its
+four-field C layout. Module and user pins live in a host-owned ggml-base side
+table keyed by backend pointer. `ggml_backend_free` takes the pin before
+`iface.free` and releases or re-inserts it afterwards, so a provider that does
+not delete the backend object (OpenCL) and a Meta owner that reports
+unproven completion both keep a named owner instead of stranding users.
+
+Staging-only context receipt: `llama_tp5_context_staging_drain` queries
+every context backend (main scheduler, prefab/shape-plan schedulers, relay,
+CPU/ordinary async copies) through `ggml_backend_drain_v1`, then the scheduler
+`has_unproven_final` state, then the bound staging owner drain. Values are
+`DRAINED=0`, `BUSY=1`, `FAILED=2`, `DRAINED_WITH_ERROR=3`, `UNKNOWN=4`. Only
+DRAINED is a clean reuse proof; BUSY/FAILED retain; DRAINED_WITH_ERROR is safe
+only for recycling old resources; UNKNOWN means an actual async producer has no
+drain receipt or the owner cannot be resolved. The owner drain is queried even
+when a backend reports DRAINED_WITH_ERROR. A context with no staging lane/owner returns DRAINED as
+"no staging scope" and is not retained by this receipt; ordinary Metal/
+Vulkan/SYCL/vocab-only contexts therefore keep their normal free path. For a
+staging context, the relay backend itself must have a receipt; missing receipts
+on unrelated ordinary backends are out of staging scope and are covered only by
+the non-clearing scheduler pending query. The wrapper does not call a void synchronize and
+does not clear a sticky state; it is a completion receipt for these staging
+producers, not a general proof that every context resource, request, ordinary
+D2D copy, checkpoint backend or memory backend is retired. It samples an
+odd/even context submission epoch before and after the drain and returns
+UNKNOWN if a graph submission is active or the epoch changes; it never holds a
+lock across eval/abort callbacks or waits. `llama_free` only invokes this
+staging receipt when the context has a relay lane or bound owner; other
+contexts keep the pre-existing free path. External tensor_set_async/
+copy_async and checkpoint submitters are not linearized by this epoch; the
+caller must join them and combine their own receipts. `llama_tp5_context_staging_owner` returns the bound
+owner/generation for diagnostics/retention; the token remains combiner-owned.
+This is the public receipt for staging-related COW/server call sites only as
+an additional staging gate. It is not a checkpoint ordinary-D2D completion
+receipt, does not cover external memory backends, and does not bind request
+ownership beyond the staging owner run/window. It must be combined with the
+memory/checkpoint/ordinary-D2D completion evidence for seq_rm/seq_cp/seq_add or
+slot retirement; a staging DRAINED never replaces those receipts. A checkpoint
+keeps its per-backend event record/wait (or a future explicit memory backend
+producer registration).
 
 The CUDA backend's host-only staging `api` table is versioned. Version 2 added
 `mark_partial` after the complete v1 prefix; version 3 appends `kind_count`

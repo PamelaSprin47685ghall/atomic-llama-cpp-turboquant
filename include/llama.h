@@ -496,6 +496,14 @@ extern "C" {
         // ordinary or flash attention; no host-routed compute is admitted.
         // Two contexts may share one read-only model; no adapters are admitted.
         bool tp5_relay;
+
+        // v4 staging owner credit, issued by the meta owner wrapper as an
+        // opaque active token bound to its provider. Pass the token unchanged;
+        // zero disables staging for this context and the normal non-staging
+        // copy path remains. The target and its MTP draft context receive the
+        // same owner/generation.
+        uint64_t tp5_owner;
+        uint64_t tp5_owner_generation;
     };
 
     struct llama_model_tensor_override {

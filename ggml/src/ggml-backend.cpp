@@ -10,6 +10,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-module.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 #include "ggml-backend-moe-cache.h"
@@ -361,9 +362,9 @@ const char * ggml_backend_name(ggml_backend_t backend) {
     return backend->iface.get_name(backend);
 }
 
-void ggml_backend_free(ggml_backend_t backend) {
+bool ggml_backend_free_and_report(ggml_backend_t backend) {
     if (backend == NULL) {
-        return;
+        return true;
     }
 
     // A scheduler retained under this backend owns copy slots whose native
@@ -374,16 +375,76 @@ void ggml_backend_free(ggml_backend_t backend) {
         (void) ggml_backend_sched_drain_retained(backend);
         if (ggml_backend_sched_retained_count(backend) != 0) {
             GGML_LOG_ERROR("%s: backend owner still holds a retained scheduler; not freeing\n", __func__);
-            return;
+            return false;
         }
     }
 
     if (!ggml_backend_quiesce(backend)) {
         GGML_LOG_ERROR("%s: backend owner could not prove begin/pending quiescence; not freeing\n", __func__);
-        return;
+        return false;
     }
 
-    backend->iface.free(backend);
+    // The host-owned pin is independent of whether the provider deletes the
+    // backend object. Take it before the provider call so a provider that
+    // retains the backend (or does not delete it) cannot leave users/module
+    // state behind.
+    ggml_backend_module::ggml_backend_pin pin;
+    const bool pinned = ggml_backend_module::take_backend(backend, &pin);
+    if (!pinned && ggml_backend_module::backend_free_in_progress(backend)) {
+        // A retry pass owns this backend's single-flight marker. It already
+        // took (or will take) the pin; do not dereference or free behind it.
+        return true;
+    }
+    // Save the registry identity before provider free: a retained branch must
+    // not dereference a backend the provider may have partially deleted.
+    ggml_backend_dev_t saved_device = backend->device;
+    const ggml_backend_reg_t saved_reg =
+        saved_device != nullptr ? saved_device->reg : nullptr;
+
+    // The provider's free function may delete the backend, which drops the
+    // module reference. If that is the last reference, dlclose must not run
+    // inside provider code; the shared-handle deleter queues it instead.
+    ggml_backend_module::close_defer_scope defer_close;
+    bool retained = false;
+    try {
+        if (ggml_backend_is_meta(backend)) {
+            // Meta reports whether completion was proved. A false result means
+            // the object was not deleted and must keep its pin. Clear the
+            // cached owner first so a retained token can be unbound/released
+            // by the cleanup owner; a failed clear keeps the pin.
+            const bool cleared = ggml_backend_meta_clear_staging_owner(backend);
+            retained = !cleared || !ggml_backend_meta_free_and_report(backend);
+        } else {
+            backend->iface.free(backend);
+            retained = ggml_backend_module::consume_retained(backend);
+        }
+    } catch (...) {
+        // A provider free exception leaves completion unproved. Keep the pin
+        // rather than releasing users/module behind a partially freed object.
+        retained = true;
+    }
+    if (pinned) {
+        if (retained) {
+            ggml_backend_module::put_back(backend, std::move(pin));
+        } else {
+            ggml_backend_module::release_pin(std::move(pin));
+        }
+    } else if (retained && saved_reg != nullptr) {
+        // Direct-init providers have no pin yet. A retained object still
+        // needs a user count and module reference so unload cannot remove its
+        // registry entry. Use the pre-free identity, not backend->device.
+        ggml_backend_module::ggml_backend_pin late;
+        if (ggml_backend_module::hold_user(saved_reg, &late)) {
+            ggml_backend_module::put_back(backend, std::move(late));
+        } else {
+            GGML_LOG_ERROR("%s: cannot pin a retained direct-init backend\n", __func__);
+        }
+    }
+    return !retained;
+}
+
+void ggml_backend_free(ggml_backend_t backend) {
+    (void) ggml_backend_free_and_report(backend);
 }
 
 bool ggml_backend_quiesce(ggml_backend_t backend) {
@@ -907,7 +968,38 @@ ggml_backend_reg_t ggml_backend_dev_backend_reg(ggml_backend_dev_t device) {
 
 ggml_backend_t ggml_backend_dev_init(ggml_backend_dev_t device, const char * params) {
     GGML_ASSERT(device);
-    return device->iface.init_backend(device, params);
+    const ggml_backend_reg_t reg = device->reg;
+    ggml_backend_module::ggml_backend_pin pin;
+    if (!ggml_backend_module::hold_user(reg, &pin)) {
+        // Unknown/unloading/unloaded regs are not usable. Never fall through
+        // to init_backend without a pin.
+        return nullptr;
+    }
+    ggml_backend_t backend = nullptr;
+    try {
+        backend = device->iface.init_backend(device, params);
+    } catch (...) {
+        ggml_backend_module::release_pin(std::move(pin));
+        return nullptr;
+    }
+    if (backend == nullptr) {
+        ggml_backend_module::release_pin(std::move(pin));
+        return nullptr;
+    }
+    bool attached = false;
+    try {
+        attached = ggml_backend_module::attach_backend(backend, &pin);
+    } catch (...) {
+        attached = false;
+    }
+    if (!attached) {
+        // The side table allocation failed. Free the backend and release the
+        // user slot; never publish an unpinned backend.
+        ggml_backend_free(backend);
+        ggml_backend_module::release_pin(std::move(pin));
+        return nullptr;
+    }
+    return backend;
 }
 
 ggml_backend_buffer_type_t ggml_backend_dev_buffer_type(ggml_backend_dev_t device) {

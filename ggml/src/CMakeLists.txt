@@ -201,6 +201,7 @@ add_library(ggml-base
             ggml-alloc.c
             ggml-backend.cpp
             ggml-backend-meta.cpp
+            ggml-backend-module.cpp
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
@@ -215,6 +216,9 @@ set_target_properties(ggml-base PROPERTIES
 )
 
 target_include_directories(ggml-base PRIVATE .)
+if (LLAMA_TP5_TEST_HOOKS)
+    target_compile_definitions(ggml-base PUBLIC TP5_TEST_HOOKS)
+endif()
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()
@@ -516,4 +520,7 @@ if (BUILD_SHARED_LIBS)
         target_compile_definitions(${target} PRIVATE GGML_BUILD)
         target_compile_definitions(${target} PUBLIC  GGML_SHARED)
     endforeach()
+    # The module table is defined in ggml-base. Its callers in ggml and in the
+    # backend plugins import it; ggml-base exports it.
+    target_compile_definitions(ggml-base PRIVATE GGML_BASE_BUILD)
 endif()

@@ -1,5 +1,6 @@
 #include "llama-memory-hybrid-idx.h"
 #include "llama-context.h"
+#include "tp5-cleanup-owner.h"
 
 #include "../ggml/src/ggml-backend-moe-cache.h"
 #include "../ggml/src/ggml-backend-impl.h"
@@ -36,6 +37,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <new>
+#include <cstdlib>
 #include <cstdio>
 #include <cinttypes>
 #include <cmath>
@@ -214,11 +217,114 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+namespace {
+struct tp5_cleanup_traits {
+    using backend_type = ggml_backend;
+    using backend_ptr  = ggml_backend_ptr;
+    static bool clear(ggml_backend * backend) {
+        // The failed-construction path skips ~llama_context, so restore the
+        // host barrier the normal destructor would have run. This waits for
+        // child streams; it is not a completion proof for a provider that
+        // has no submission capability, so release() below still retains on
+        // unproved completion.
+        ggml_backend_synchronize(backend);
+        if (!ggml_backend_is_meta(backend)) {
+            // Ordinary child backends have no staging owner to clear.
+            return true;
+        }
+        return ggml_backend_meta_clear_staging_owner(backend);
+    }
+    static bool unbind(std::uint64_t owner, std::uint64_t generation) {
+        return ggml_backend_meta_staging_owner_context_unbind(owner, generation);
+    }
+    static void retry_orphans() {
+        ggml_backend_meta_staging_owner_retry_orphans();
+        ggml_backend_retry_retained();
+    }
+    static bool release(backend_ptr & backend) {
+        ggml_backend_t raw = backend.get();
+        if (raw == nullptr) {
+            return true;
+        }
+        // Pin-aware free: takes the host pin, calls the provider, and either
+        // releases the pin or puts it back on retention.
+        if (!ggml_backend_free_and_report(raw)) {
+            // Keep the unique_ptr owning the retained backend so the cleanup
+            // slot can retry; never release the raw pointer on failure.
+            return false;
+        }
+        (void) backend.release();
+        return true;
+    }
+    static ggml_backend_module_ref module_hold(ggml_backend * backend) {
+        ggml_backend_reg_t reg =
+            ggml_backend_meta_staging_provider_reg_for_backend(backend);
+        return ggml_backend_reg_module_hold(reg);
+    }
+};
+
+struct tp5_unarmed_node {
+    ggml_backend_ptr backend;
+    tp5_unarmed_node * next = nullptr;
+};
+
+std::mutex & tp5_unarmed_mutex() {
+    static std::mutex * mutex = new std::mutex();
+    return *mutex;
+}
+
+tp5_unarmed_node *& tp5_unarmed_head() {
+    static tp5_unarmed_node * head = nullptr;
+    return head;
+}
+
+#ifdef TP5_TEST_HOOKS
+std::atomic<int> g_tp5_test_fail_after_bind{0};
+extern "C" void llama_tp5_test_fail_after_bind_once(void) {
+    g_tp5_test_fail_after_bind.store(1, std::memory_order_release);
+}
+#endif
+
+using tp5_cleanup = tq::tp5::cleanup_owner<tp5_cleanup_traits>;
+
+tp5_cleanup & tp5_cleanup_instance() {
+    static auto * owner = new tp5_cleanup();
+    static std::once_flag once;
+    std::call_once(once, [] {
+        // Runs before provider/static destructors registered earlier.
+        std::atexit([] { tp5_cleanup_instance().shutdown(); });
+    });
+    return *owner;
+}
+
+#ifdef TP5_TEST_HOOKS
+extern "C" bool llama_tp5_test_cleanup_idle(void) {
+    return tp5_cleanup_instance().idle();
+}
+#endif
+} // namespace
+
+ggml_backend_ptr llama_context::detach_backend_for_cleanup(
+        llama_context * self, ggml_backend_t backend) {
+    if (self == nullptr || backend == nullptr) {
+        return {};
+    }
+    for (auto & owned : self->backends) {
+        if (owned.get() == backend) {
+            return std::move(owned);
+        }
+    }
+    return {};
+}
+
 llama_context::llama_context(const llama_model & model, llama_context_params params) :
     model(model),
+    tp5_cleanup_gate(std::make_shared<std::atomic<bool>>(false)),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    tp5_cleanup_instance().retry_now();
+
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -894,6 +1000,160 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                        cparams.n_ctx_seq, hparams.n_ctx_train);
     }
 
+    // If a later constructor step throws after the context_refs bind, the
+    // object destructor does not run; unbind the refs here so a failed
+    // construction cannot strand the provider owner reference.
+    struct tp5_owner_ref_guard {
+        llama_context * self;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> * refs;
+        std::vector<ggml_backend_t> lanes;
+        std::vector<ggml_backend_module_ref> lane_modules;
+        std::vector<std::unique_ptr<tp5_unarmed_node>> unarmed_spares;
+        std::size_t lane_count = 0;
+        std::size_t record_count = 0;
+        std::shared_ptr<std::atomic<bool>> gate;
+        tp5_cleanup::reservation res;
+        bool armed = false;
+        bool committed = false;
+        tp5_owner_ref_guard(llama_context * s,
+                            std::vector<std::pair<std::uint64_t, std::uint64_t>> * r,
+                            std::shared_ptr<std::atomic<bool>> release_gate,
+                            std::size_t count)
+            : self(s), refs(r), record_count(count), gate(std::move(release_gate)) {
+            // Reserve every failure record, lane slot, and terminal owner
+            // node before any native backend exists. A later failure path
+            // only moves already-owned resources.
+            lanes.reserve(record_count);
+            lane_modules.reserve(record_count);
+            unarmed_spares.reserve(record_count);
+            for (std::size_t i = 0; i < record_count; ++i) {
+                auto * node = new (std::nothrow) tp5_unarmed_node{};
+                if (node == nullptr) {
+                    throw std::runtime_error("tp5 unarmed owner reservation failed");
+                }
+                unarmed_spares.emplace_back(node);
+            }
+            if (record_count != 0 &&
+                !tp5_cleanup_instance().reserve(record_count * 3 + 1, res)) {
+                throw std::runtime_error("tp5 cleanup record reservation failed");
+            }
+        }
+        bool add_lane(ggml_backend_t lane) {
+            if (lane == nullptr) {
+                return false;
+            }
+            if (std::find(lanes.begin(), lanes.end(), lane) != lanes.end()) {
+                return true;
+            }
+            if (lane_count >= record_count) {
+                LLAMA_LOG_ERROR("%s: cleanup lane capacity exhausted\n", __func__);
+                return false;
+            }
+            try {
+                lanes.push_back(lane);
+                lane_modules.push_back(tp5_cleanup_traits::module_hold(lane));
+            } catch (...) {
+                lanes.pop_back();
+                return false;
+            }
+            ++lane_count;
+            return true;
+        }
+        bool retain_unarmed(ggml_backend_ptr && owned) {
+            if (!owned) {
+                return true;
+            }
+            if (unarmed_spares.empty()) {
+                return false;
+            }
+            std::unique_ptr<tp5_unarmed_node> node = std::move(unarmed_spares.back());
+            unarmed_spares.pop_back();
+            node->backend = std::move(owned);
+            std::lock_guard<std::mutex> lock(tp5_unarmed_mutex());
+            node->next = tp5_unarmed_head();
+            tp5_unarmed_head() = node.release();
+            return true;
+        }
+        void commit() {
+            committed = true;
+            tp5_cleanup_instance().commit(res);
+        }
+        bool retain_unarmed(ggml_backend_ptr && owned) {
+            if (!owned) {
+                return true;
+            }
+            // Nodes were pre-reserved in the constructor before any native
+            // backend existed. Never call provider free while the context gate
+            // is still closed.
+            if (unarmed_spares.empty()) {
+                return false;
+            }
+            std::unique_ptr<tp5_unarmed_node> node = std::move(unarmed_spares.back());
+            unarmed_spares.pop_back();
+            node->backend = std::move(owned);
+            std::lock_guard<std::mutex> lock(tp5_unarmed_mutex());
+            node->next = tp5_unarmed_head();
+            tp5_unarmed_head() = node.release();
+            return true;
+        }
+        ~tp5_owner_ref_guard() {
+            if (committed) {
+                return;
+            }
+            std::size_t pos = 0;
+            for (std::size_t i = 0; i < lane_count && pos < res.count; ++i) {
+                ggml_backend_ptr owned =
+                    llama_context::detach_backend_for_cleanup(self, lanes[i]);
+                if (!owned) {
+                    continue;
+                }
+                const bool unloaded = lane_modules[i].state ==
+                    ggml_backend_module_state::unloaded_backend;
+                bool placed = tp5_cleanup_instance().arm_backend(
+                        res, pos, std::move(owned), false, gate,
+                        lane_modules[i].module, unloaded);
+                if (!placed) {
+                    placed = tp5_cleanup_instance().force_backend(
+                            res, pos, std::move(owned), false, gate,
+                            lane_modules[i].module, unloaded);
+                }
+                if (!placed) {
+                    placed = tp5_cleanup_instance().retain_backend(
+                            std::move(owned), gate, lane_modules[i].module, unloaded);
+                }
+                if (!placed) {
+                    if (!retain_unarmed(std::move(owned))) {
+                        LLAMA_LOG_ERROR("%s: cannot retain cleanup backend; leaving raw process-owned\n", __func__);
+                        (void) owned.release();
+                    }
+                }
+                ++pos;
+            }
+            if (armed && pos < res.count) {
+                for (const auto & ref : *refs) {
+                    if (pos >= res.count) {
+                        LLAMA_LOG_ERROR("%s: cleanup token reservation exhausted\n", __func__);
+                        break;
+                    }
+                    bool token_placed =
+                        tp5_cleanup_instance().arm_token(res, pos, ref.first, ref.second);
+                    if (!token_placed) {
+                        token_placed = tp5_cleanup_instance().force_token(
+                            res, pos, ref.first, ref.second);
+                    }
+                    if (!token_placed) {
+                        if (!tp5_cleanup_instance().retain_token(ref.first, ref.second)) {
+                            LLAMA_LOG_ERROR("%s: could not retain cleanup token\n", __func__);
+                        }
+                    }
+                    ++pos;
+                }
+            }
+            tp5_cleanup_instance().commit(res);
+        }
+    } owner_ref_guard{this, &tp5_owner_refs, tp5_cleanup_gate.gate,
+                          params.tp5_owner != 0 ? model.devices.size() + 2 : 0};
+
     if (!hparams.vocab_only) {
         // GPU backends
         for (const auto & dev : model.devices) {
@@ -914,6 +1174,42 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                     throw std::runtime_error("tp5-relay capability is unavailable on the initialized Meta backend");
                 }
                 backend_tp5_relay = backend;
+                if (params.tp5_owner != 0) {
+                    const bool owner_ok = ggml_backend_meta_set_staging_owner(
+                        backend, params.tp5_owner, params.tp5_owner_generation);
+                    if (owner_ok) {
+                        tp5_owner = params.tp5_owner;
+                        tp5_owner_generation = params.tp5_owner_generation;
+                        tp5_owner_bound = true;
+                        if (!owner_ref_guard.add_lane(backend)) {
+                            throw std::runtime_error("failed to track tp5 cleanup lane");
+                        }
+                        tp5_relay_lanes.push_back(backend);
+                    } else {
+                        // The owner was issued by a different provider than
+                        // this backend's children, is stale, or would
+                        // overwrite a bound owner. Keep the context usable
+                        // and disable staging for this backend; the normal
+                        // copy path remains.
+                        LLAMA_LOG_WARN("%s: staging owner not applicable to backend %s; staging disabled\n",
+                                       __func__, ggml_backend_name(backend));
+                    }
+                }
+            }
+        }
+        if (params.tp5_owner != 0 && tp5_owner_bound && tp5_owner_refs.empty()) {
+            if (ggml_backend_meta_staging_owner_context_bind(
+                    tp5_owner, tp5_owner_generation)) {
+                tp5_owner_refs.emplace_back(tp5_owner, tp5_owner_generation);
+                owner_ref_guard.armed = true;
+            } else {
+                for (ggml_backend_t lane : tp5_relay_lanes) {
+                    (void) ggml_backend_meta_clear_staging_owner(lane);
+                }
+                tp5_owner_bound = false;
+                tp5_owner = 0;
+                tp5_owner_generation = 0;
+                LLAMA_LOG_WARN("%s: legacy params staging owner could not be referenced; staging disabled\n", __func__);
             }
         }
 
@@ -1393,9 +1689,41 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+#ifdef TP5_TEST_HOOKS
+    if (g_tp5_test_fail_after_bind.exchange(0, std::memory_order_acq_rel) != 0 &&
+        params.tp5_owner != 0) {
+        if (!tp5_relay_lanes.empty()) {
+            if (!owner_ref_guard.add_lane(tp5_relay_lanes.front())) {
+                throw std::runtime_error("failed to track forced tp5 cleanup lane");
+            }
+        }
+        if (owner_ref_guard.lane_count != 0) {
+            tp5_owner_bound = true;
+            tp5_owner_refs.emplace_back(params.tp5_owner, params.tp5_owner_generation);
+            owner_ref_guard.armed = true;
+            throw std::runtime_error("tp5 test failure after owner bind");
+        }
+    }
+#endif
+
+    owner_ref_guard.armed = false;
+    owner_ref_guard.commit();
 }
 
 llama_context::~llama_context() {
+    if (!unbind_tp5_owner()) {
+        // The context is going away but the token refs were not decremented.
+        // Move every ref to the cleanup owner so the worker can retry the
+        // idempotent unbind instead of stranding context_refs forever.
+        for (const auto & ref : tp5_owner_refs) {
+            if (!tp5_cleanup_instance().retain_token(ref.first, ref.second)) {
+                LLAMA_LOG_ERROR("%s: cannot retain tp5 token for cleanup\n", __func__);
+            }
+        }
+        tp5_owner_refs.clear();
+        tp5_owner_bound = false;
+    }
     if (has_unproven()) {
         // llama_free retains the whole context (and increments the model's
         // retained-context count); a direct delete cannot keep the external
@@ -3257,6 +3585,40 @@ bool llama_context::has_unproven() const {
         }
     }
     return false;
+}
+
+bool llama_context::unbind_tp5_owner() {
+    if (has_unproven()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> owner_lock(tp5_owner_mutex);
+    if (!tp5_owner_bound) {
+        return false;
+    }
+    bool clear_ok = true;
+    for (ggml_backend_t lane : tp5_relay_lanes) {
+        clear_ok = ggml_backend_meta_clear_staging_owner(lane) && clear_ok;
+    }
+    if (!clear_ok) {
+        // A lane may still reference the token; keep the local identity so a
+        // later unbind can retry instead of allowing a premature release.
+        return false;
+    }
+    bool unbind_ok = true;
+    for (const auto & r : tp5_owner_refs) {
+        unbind_ok = ggml_backend_meta_staging_owner_context_unbind(r.first, r.second) && unbind_ok;
+    }
+    if (!unbind_ok) {
+        // Ref identities are idempotent; keep them for retry.
+        return false;
+    }
+    tp5_owner_refs.clear();
+    tp5_owner_bound = false;
+    tp5_owner = 0;
+    tp5_owner_generation = 0;
+    tp5_owner_run_id = 0;
+    tp5_owner_window_id = 0;
+    return true;
 }
 
 bool llama_context::retain_for_process() {

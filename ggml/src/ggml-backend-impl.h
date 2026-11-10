@@ -3,10 +3,62 @@
 // ggml-backend internal header
 
 #include "ggml-backend.h"
+#ifdef __cplusplus
+#include <memory>
+#endif
 
 #ifdef  __cplusplus
+// How the registry knows the module behind a backend reg. A static backend
+// has no DSO handle, which is a legal lifetime; an unloaded dynamic backend
+// has no handle because its code may be gone. Callers must not conflate the
+// two.
+enum class ggml_backend_module_state : unsigned char {
+    unknown,            // never registered by this process (test/external reg)
+    static_backend,     // registered without a DSO handle
+    dynamic_backend,    // registered from a DSO, handle held
+    unloading_backend,  // unload in progress, handle held
+    unloaded_backend,   // a registered dynamic backend was removed
+};
+
+struct ggml_backend_module_ref {
+    std::shared_ptr<void> module;
+    ggml_backend_module_state state = ggml_backend_module_state::unknown;
+};
+
+GGML_BASE_API ggml_backend_module_ref ggml_backend_reg_module_hold(ggml_backend_reg_t reg);
+
+// Attach the loader's module reference to provider entries that were created
+// before the loader published the handle (a self-registering DSO). The
+// failed-load variant fills every entry created by the transaction, so a
+// quarantined provider keeps the DSO mapped.
+GGML_BASE_API void ggml_backend_meta_staging_attach_module(
+        ggml_backend_reg_t reg, std::shared_ptr<void> module);
+GGML_BASE_API void ggml_backend_meta_staging_attach_load_module(
+        ggml_backend_reg_t reg, uint32_t tag_floor, const void * module_identity,
+        std::shared_ptr<void> module);
+// Pin-aware free. Returns true only when the backend was actually freed;
+// false means it was retained and its host pin was put back.
+GGML_BASE_API bool ggml_backend_free_and_report(ggml_backend_t backend);
+
 extern "C" {
 #endif
+
+    // Provider free callbacks that retain the backend object call this before
+    // returning; ggml_backend_free keeps the host pin for the retained object.
+    // C linkage so C providers can use the same contract.
+    GGML_BASE_API void ggml_backend_mark_retained(ggml_backend_t backend);
+
+    // Internal: free a Meta backend and report whether it was actually freed.
+    // A false return means the owner was retained because completion is
+    // unproved; the caller must keep the provider module mapped.
+    GGML_BASE_API bool ggml_backend_meta_free_and_report(ggml_backend_t backend);
+
+    // Loader transaction: snapshot the provider tag counter before
+    // backend_init_fn and remove only the provider entries created after it
+    // when init fails.
+    GGML_BASE_API uint32_t ggml_backend_meta_staging_tag_floor(void);
+    GGML_BASE_API void ggml_backend_meta_staging_rollback_load(
+            ggml_backend_reg_t reg, uint32_t tag_floor, const void * module_identity);
 
     #define GGML_BACKEND_API_VERSION 2
 
@@ -112,6 +164,34 @@ extern "C" {
 
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
+
+    // Optional drain receipt negotiated under the name
+    // "ggml_backend_drain_v1". Only DRAINED is a native completion fact; a
+    // missing or failed receipt never clears a sticky submission.
+    enum ggml_backend_drain_result {
+        GGML_BACKEND_DRAIN_DRAINED = 0,
+        GGML_BACKEND_DRAIN_BUSY    = 1,
+        GGML_BACKEND_DRAIN_FAILED  = 2,
+        // Physically drained, but a submission recorded a data error. The
+        // context is being destroyed, not replayed; the resources are safe to
+        // release.
+        GGML_BACKEND_DRAIN_DRAINED_WITH_ERROR = 3,
+    };
+    #define GGML_BACKEND_DRAIN_API_VERSION 1
+    struct ggml_backend_drain_api {
+        uint32_t abi_version;
+        int (*drain)(ggml_backend_t backend);
+    };
+
+    // Optional gated synchronize capability negotiated under the name
+    // "ggml_backend_synchronize_if_proven_v1". The backend must not drain an
+    // unproven submission: it synchronizes under its own ownership gate and
+    // returns false without synchronizing when the submission is unproven.
+    #define GGML_BACKEND_SYNCHRONIZE_IF_PROVEN_API_VERSION 1
+    struct ggml_backend_synchronize_if_proven_api {
+        uint32_t abi_version;
+        bool (*sync)(ggml_backend_t backend);
+    };
 
     //
     // Backend (stream)

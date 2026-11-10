@@ -107,6 +107,28 @@ struct llama_context {
 
     ggml_backend_t get_tp5_relay_backend() const { return backend_tp5_relay; }
     ggml_backend_t get_quantized_matmul_f32_backend() const { return backend_quantized_matmul_f32; }
+    bool has_staging_scope() const {
+        std::lock_guard<std::mutex> lock(tp5_owner_mutex);
+        return backend_tp5_relay != nullptr || !tp5_relay_lanes.empty() || tp5_owner_bound;
+    }
+    bool has_bound_owner() const {
+        std::lock_guard<std::mutex> lock(tp5_owner_mutex);
+        return tp5_owner_bound;
+    }
+    bool get_tp5_owner(uint64_t & owner, uint64_t & generation) const {
+        std::lock_guard<std::mutex> lock(tp5_owner_mutex);
+        if (!tp5_owner_bound) {
+            return false;
+        }
+        owner = tp5_owner;
+        generation = tp5_owner_generation;
+        return true;
+    }
+    bool unbind_tp5_owner();
+    size_t tp5_lane_count() const { return tp5_relay_lanes.size(); }
+    ggml_backend_t tp5_lane(size_t index) const {
+        return index < tp5_relay_lanes.size() ? tp5_relay_lanes[index] : nullptr;
+    }
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -460,6 +482,11 @@ private:
     llama_union_rebind_result union_rebind_n_outputs(llm_graph_result * res, const llm_graph_params & params, const llama_union_tensor_set & set);
 
 public:
+    // Internal failure-path helper: move backend ownership out of the
+    // context so the cleanup owner can keep it alive until clear() succeeds.
+    static ggml_backend_ptr detach_backend_for_cleanup(llama_context * self,
+                                                       ggml_backend_t backend);
+
     // The constructor creates this state only when the binder gate is on.
     llama_nkv_ctx_state & union_binder_state_get();
 
@@ -505,6 +532,22 @@ private:
     //
 
     const llama_model & model;
+
+    // Destroyed after every later member.  A failed constructor moves backend
+    // ownership to the cleanup worker, which must not free it until this
+    // sentinel opens the gate (scheduler/prefab still reference backends).
+    struct tp5_cleanup_gate_holder {
+        std::shared_ptr<std::atomic<bool>> gate;
+        tp5_cleanup_gate_holder() = default;
+        explicit tp5_cleanup_gate_holder(std::shared_ptr<std::atomic<bool>> g)
+            : gate(std::move(g)) {}
+        ~tp5_cleanup_gate_holder() {
+            if (gate) {
+                gate->store(true, std::memory_order_release);
+            }
+        }
+    };
+    tp5_cleanup_gate_holder tp5_cleanup_gate;
 
     llama_cparams cparams;
 
@@ -633,6 +676,16 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_t backend_tp5_relay = nullptr;
     ggml_backend_t backend_quantized_matmul_f32 = nullptr;
+    // The staging owner bound to backend_tp5_relay. The public context drain
+    // wrapper uses the same owner/drain receipt as the staging provider.
+    uint64_t tp5_owner = 0;
+    uint64_t tp5_owner_generation = 0;
+    bool tp5_owner_bound = false;
+    std::vector<ggml_backend_t> tp5_relay_lanes;
+    std::vector<std::pair<uint64_t, uint64_t>> tp5_owner_refs;
+    uint64_t tp5_owner_run_id = 0;
+    uint32_t tp5_owner_window_id = 0;
+    mutable std::mutex tp5_owner_mutex;
     std::vector<ggml_backend_ptr> backends;
 
     // training

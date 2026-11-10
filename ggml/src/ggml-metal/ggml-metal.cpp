@@ -499,7 +499,7 @@ static void ggml_backend_metal_free(ggml_backend_t backend) {
 
     ggml_metal_free(ctx);
 
-    free(backend);
+    delete backend;
 }
 
 static void ggml_backend_metal_synchronize(ggml_backend_t backend) {
@@ -609,9 +609,7 @@ ggml_backend_t ggml_backend_metal_init(void) {
         return NULL;
     }
 
-    ggml_backend_t backend = (ggml_backend_t) malloc(sizeof(ggml_backend));
-
-    *backend = {
+    ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_metal_guid(),
         /* .interface = */ ggml_backend_metal_i,
         /* .device    = */ dev,
@@ -703,9 +701,7 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         return NULL;
     }
 
-    ggml_backend_t backend = (ggml_backend_t) malloc(sizeof(ggml_backend));
-
-    *backend = {
+    ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_metal_guid(),
         /* .interface = */ ggml_backend_metal_i,
         /* .device    = */ dev,
