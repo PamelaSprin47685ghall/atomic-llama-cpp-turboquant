@@ -63,7 +63,21 @@ static const ggml_cuda_staging::api * staging_api() {
     return g_staging_api.load(std::memory_order_acquire);
 }
 
-static constexpr uint32_t kStagingWindow = 0;
+// The compose runtime runs one worker thread per service window, and each
+// worker submits the graph-input copies for its own window on that thread.
+// Key the pool by that thread instead of sending every worker to window 0:
+// two concurrent workers then no longer share the two slots of a kind, which
+// was the cross-window no_slot. A thread that never stages an input never
+// takes an id. The pool has kWindows keys; a process with more staging
+// threads than that wraps and shares a key, which is the old behaviour for
+// those threads, not a correctness change. The lease carries the id, so
+// acquire, upload, enqueue, wait and release all address the same key.
+static uint32_t staging_window() {
+    static std::atomic<uint32_t> next_window{0};
+    static thread_local const uint32_t window =
+        next_window.fetch_add(1, std::memory_order_relaxed) % ggml_cuda_staging::kWindows;
+    return window;
+}
 // Per-request inputs are bounded by this. It must cover the MTP hidden input
 // (n_env * n_embd * 4, about 1.25 MiB at 32 rows) while still allowing two
 // slots inside the 4 MiB pool. Weights stay out through the input flag.
@@ -1765,7 +1779,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             ggml_cuda_staging::kind staging_kind = ggml_cuda_staging::kind::generic;
             bool staged = false;
             if (st != nullptr && st->enabled() && staging_eligible(tensor, size, &staging_kind) &&
-                    st->acquire(kStagingWindow, staging_kind, size, &staged_lease)) {
+                    st->acquire(staging_window(), staging_kind, size, &staged_lease)) {
                 const int upload_result = st->upload(&staged_lease, data, size);
                 if (upload_result == int(ggml_cuda_staging::submit_result::fatal)) {
                     st->release(&staged_lease);
@@ -1832,7 +1846,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             }
             if (staging_hit) {
                 ggml_cuda_staging::lease staged_lease;
-                if (st->acquire(kStagingWindow, staging_kind, size, &staged_lease)) {
+                if (st->acquire(staging_window(), staging_kind, size, &staged_lease)) {
                     g_staging_meta_diag.lease_ok.fetch_add(1, std::memory_order_relaxed);
                     const int upload_result = st->upload(&staged_lease, data, size);
                     if (upload_result == int(ggml_cuda_staging::submit_result::fatal)) {
@@ -2485,7 +2499,7 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                 ggml_cuda_staging::lease staged_lease;
                 // Never wait a pending slot here: the async lane must not block
                 // the pipeline. A miss falls back to the pageable path.
-                if (ranks_ok && st->acquire_nowait(kStagingWindow, staging_kind, size, &staged_lease)) {
+                if (ranks_ok && st->acquire_nowait(staging_window(), staging_kind, size, &staged_lease)) {
                     g_staging_meta_diag.async_lease_ok.fetch_add(1, std::memory_order_relaxed);
                     const int upload_result = st->upload(&staged_lease, data, size);
                     if (upload_result == int(ggml_cuda_staging::submit_result::fatal)) {
