@@ -54,3 +54,27 @@ opt-in for experiments only.
 
 No GPU run, build, or runtime change was made while writing this record; the
 numbers are the devops-light-runner's measured output for the commit above.
+
+## Side effects / numerics (byte-level)
+
+- The candidate `b11ad6dbb` (libllama `0.0.2619`) 32x2 tape
+  `out-32x2-logits-b11ad6dbb/report.json.logits.f32le` (sha256 `8a701790...`)
+  is byte-identical to the existing 044-line integration-off tape: bitwise
+  0 differences, `max_abs = 0`, argmax mismatches 0, non-finite values 0.
+- Against the formal reference `8035d0c2...`: 64 rows, vocabulary 248320, and
+  the token stream and row metadata are identical, but 2,234,876 values
+  differ, `max_abs = 0.491052`, and 2,106,669 values exceed the
+  `.002 + .001|ref|` gate; argmax mismatches are 0 and non-finite values are 0.
+- Attribution: the reference tape was produced by a different binary,
+  `mtp-hc-row-tail-candidate-20261025` (`libllama.so.0.0.2451`, build receipt
+  `source_sha256=bd619a5b85a62fbe4804bad8fb45ea2add8310995c11fd160f52f150df614a75`,
+  2026-10-25T03:46:31Z). Its 39 behavior environment variables match the
+  `run-32x2.sh` set item by item (33 entries); the only differences are six
+  trace/audit variables and `LD_LIBRARY_PATH`. The existing
+  `smoke-summary.json` also records that the 044-line off arm (`8a701790`) does
+  not match `8035d0c2`.
+
+**本候选相对 044 线无数值漂移（逐字节相同）；`8035d0c2` 与 044 线的差异属于 044 与 2026-10-25 candidate 之间的既有源码差异，本分支的 7 个性能/生命周期提交不引入数值变化。**
+
+`8035d0c2` is a historical tape from another binary; it is not a numerical
+gate for this candidate.
