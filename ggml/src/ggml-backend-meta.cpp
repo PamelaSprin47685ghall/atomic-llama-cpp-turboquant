@@ -2650,6 +2650,31 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return true;
     };
 
+    // A split along AXIS_0 is normally incompatible with a per-row operator:
+    // the reduction domain itself would be cut across children. It is harmless
+    // when at most one child owns data (the others are empty slices): every
+    // child then holds complete rows. This is the layout llama's GDN/conv-state
+    // views produce (one rank owns all channels of a segment).
+    auto split_axis0_single_owner = [&](const ggml_backend_meta_split_state & ss) -> bool {
+        if (ss.axis != GGML_BACKEND_SPLIT_AXIS_0) {
+            return false;
+        }
+        size_t owners = 0;
+        for (size_t j = 0; j < n_bufs; ++j) {
+            int64_t total = 0;
+            for (size_t s = 0; s < ss.n_segments; ++s) {
+                total += int64_t(ss.ne[s*n_bufs + j]) * ss.nr[s];
+            }
+            if (total != 0) {
+                ++owners;
+                if (owners > 1) {
+                    return false;
+                }
+            }
+        }
+        return owners <= 1;
+    };
+
     auto split_state_diag = [&](const ggml_backend_meta_split_state & ss) -> std::string {
         std::string nr_all;
         for (uint32_t s = 0; s < ss.n_segments; ++s) {
@@ -2714,7 +2739,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     // Some ops process data on a per-row bases:
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && !split_axis0_single_owner(src_ss[0])) {
             // A per-row operator cannot consume a row-split source locally: each
             // child owns only part of the rows. Fail closed and name the tensor
             // and the source state instead of aborting the process.
@@ -3073,11 +3098,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
-        if (src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
-                src_ss[1].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
-                src_ss[2].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
-                src_ss[3].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
-                src_ss[4].axis != GGML_BACKEND_SPLIT_AXIS_1) {
+        for (size_t i = 0; i < 5; ++i) {
+            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+                continue;
+            }
+            if (split_axis0_single_owner(src_ss[i])) {
+                // One child owns all channels of the segment, so every child
+                // holds complete rows; the output keeps that owner sequence.
+                return src_ss[i];
+            }
             // Fail closed instead of aborting: init_tensor_impl turns UNKNOWN
             // into GGML_STATUS_FAILED with the TP5_META_SPLIT_UNKNOWN
             // diagnostic.
@@ -3087,7 +3116,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // so a head-aligned split on the input cache lands on axis 2 here.
         if (src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_2 &&
                 src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_1 &&
-                src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_0) {
+                src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_0 &&
+                !split_axis0_single_owner(src_ss[5])) {
             return unsupported_state("GATED_DELTA_NET", src_ss);
         }
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
@@ -6538,7 +6568,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
                 bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
-                GGML_ASSERT(bcj.nodes[i]);
+                if (bcj.nodes[i] == nullptr) {
+                    GGML_LOG_ERROR("TP5_META_CHILD_NODE_UNSUPPORTED name='%s' op=%s rank=%zu node_index=%d\n",
+                            ggml_get_name(node), ggml_op_name(node->op), j, i);
+                    if (backend_ctx->relay_mode) {
+                        backend_ctx->relay_i->abort(backend_ctx->relay, GGML_STATUS_FAILED);
+                    }
+                    return GGML_STATUS_FAILED;
+                }
             }
         }
 
