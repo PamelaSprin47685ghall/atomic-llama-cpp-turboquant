@@ -2652,9 +2652,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (a.axis != b.axis) {
             return false;
         }
-        // Negative axes (MIRRORED / PARTIAL / UNKNOWN) carry no owner runs:
-        // two states with the same negative axis are the same state.
-        if (a.axis < 0) {
+        // Non-dimension axes (MIRRORED=10 / PARTIAL=11 / NONE=98 /
+        // UNKNOWN=99) carry no owner runs: two states with the same
+        // non-dimension axis are the same state.
+        if (a.axis < 0 || a.axis >= GGML_MAX_DIMS) {
             return true;
         }
         // Compare the expanded canonical (owner, run length) sequence. The
@@ -2673,11 +2674,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto merge_owner_states = [&](const ggml_backend_meta_split_state & a,
                                   const ggml_backend_meta_split_state & b) -> ggml_backend_meta_split_state {
         ggml_backend_meta_split_state out = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
-        if (a.axis != b.axis || a.axis >= GGML_MAX_DIMS) {
+        if (a.axis != b.axis) {
             return out;
         }
-        if (a.axis < 0) {
-            // Same negative axis (MIRRORED/PARTIAL): nothing to merge.
+        if (a.axis < 0 || a.axis >= GGML_MAX_DIMS) {
+            // Same non-dimension axis (MIRRORED/PARTIAL/NONE/UNKNOWN):
+            // nothing to merge.
             return a;
         }
         std::vector<std::pair<size_t, int64_t>> ra, rb;
