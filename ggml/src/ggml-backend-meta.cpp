@@ -3401,6 +3401,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 if (tensor->src[i] == nullptr || src_ss[i].axis < 0 || src_ss[i].axis >= GGML_MAX_DIMS) {
                     continue;
                 }
+                // A degenerate single-owner source (all of its data on one
+                // child) imposes no per-child width ratio on the output: only
+                // that child computes, the others are empty slices. Skip the
+                // ratio identity for it instead of failing it.
+                if (split_axis0_single_owner(src_ss[i])) {
+                    first_src_split_by_axis = false;
+                    continue;
+                }
                 if (first_src_split_by_axis) {
                     for (size_t j = 0; j < n_bufs; j++) {
                         // Take over ratio from src:
@@ -3418,15 +3426,34 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         }
                     }
                 } else {
-                    GGML_ASSERT(split_state.n_segments == 1);
+                    if (split_state.n_segments != 1) {
+                        GGML_LOG_ERROR("TP5_META_RATIO_MISMATCH name='%s' op=%s axis=%d n_segments=%u "
+                                       "src_index=%zu src_op=%s src_axis=%d\n",
+                                       ggml_get_name(tensor), ggml_op_name(tensor->op),
+                                       (int) split_state.axis, split_state.n_segments, i,
+                                       ggml_op_name(tensor->src[i]->op), (int) src_ss[i].axis);
+                        return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+                    }
                     for (size_t j = 0; j < n_bufs; j++) {
                         // Assert that ratio is consistent:
                         int64_t sum = 0;
                         for (size_t s = 0; s < src_ss[i].n_segments; s++) {
                             sum += src_ss[i].ne[s*n_bufs + j] * src_ss[i].nr[s];
                         }
-                        GGML_ASSERT(split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
-                                                                 == sum * tensor->ne[split_state.axis]);
+                        if (split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis] !=
+                                sum * tensor->ne[split_state.axis]) {
+                            GGML_LOG_ERROR("TP5_META_RATIO_MISMATCH name='%s' op=%s axis=%d child=%zu "
+                                           "src_index=%zu src_op=%s src_axis=%d out_ne=%lld out_nr=%u "
+                                           "src_ne=%lld src_nr=%u tensor_ne=%lld src0{axis=%d,nseg=%u}\n",
+                                           ggml_get_name(tensor), ggml_op_name(tensor->op),
+                                           (int) split_state.axis, j, i,
+                                           ggml_op_name(tensor->src[i]->op), (int) src_ss[i].axis,
+                                           (long long) split_state.ne[j], split_state.nr[0],
+                                           (long long) tensor->src[i]->ne[src_ss[i].axis], src_ss[i].nr[0],
+                                           (long long) tensor->ne[split_state.axis],
+                                           (int) src_ss[0].axis, src_ss[0].n_segments);
+                            return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+                        }
                     }
                 }
                 first_src_split_by_axis = false;
