@@ -2287,7 +2287,12 @@ struct ggml_backend_meta_buffer_context {
     // Shared model buffers are read by independent context workers. Only
     // cache lookup/invalidation/commit holds this lock, never recursion or HIP.
     std::mutex split_state_mutex;
-    std::map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>> split_state_cache;
+    struct split_state_cache_entry {
+        ggml_backend_meta_split_state state;
+        char signature[nbtc];
+        bool explicit_ne = false;
+    };
+    std::map<std::pair<const ggml_tensor *, bool>, split_state_cache_entry> split_state_cache;
 
     int debug;
     // The provider of this buffer's simple children. Ownerless copies use this
@@ -3109,7 +3114,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
     };
 
+    // Diagnostic-only: remember whether the last split-state computation filled
+    // exact per-child ne before the ratio takeover. Stored with the cache entry
+    // for the TOTAL_MISMATCH diagnostic; never used by split semantics.
+    bool last_has_explicit_ne = false;
+
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
+        last_has_explicit_ne = false;
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
@@ -3389,6 +3400,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 }
             }
         }
+        last_has_explicit_ne = has_explicit_ne;
         if (!exact_view && !has_explicit_ne && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
             const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
@@ -3460,10 +3472,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         std::lock_guard<std::mutex> lock(buf_ctx->split_state_mutex);
         auto it = buf_ctx->split_state_cache.find(key);
         if (it != buf_ctx->split_state_cache.end()) {
-            if (memcmp(it->second.second, tensor, sizeof(it->second.second)) != 0) {
+            if (memcmp(it->second.signature, tensor, sizeof(it->second.signature)) != 0) {
                 buf_ctx->split_state_cache.clear();
             } else {
-                ret = it->second.first;
+                ret = it->second.state;
                 cached = true;
             }
         }
@@ -3476,8 +3488,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         {
             std::lock_guard<std::mutex> lock(buf_ctx->split_state_mutex);
             auto & entry = buf_ctx->split_state_cache[key];
-            entry.first = ret;
-            memcpy(entry.second, tensor, sizeof(entry.second));
+            entry.state = ret;
+            memcpy(entry.signature, tensor, sizeof(entry.signature));
+            entry.explicit_ne = last_has_explicit_ne;
         }
         if (buf_ctx->debug > 0) {
             std::string srcs_info;
@@ -3623,9 +3636,82 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             ne_split_sum += child_ne[j];
         }
         if (ne_split_sum != tensor->ne[split_dim]) {
-            GGML_LOG_ERROR("TP5_META_SPLIT_TOTAL_MISMATCH name='%s' op=%s axis=%d child_sum=%lld tensor_ne=%lld\n",
-                    ggml_get_name(tensor), ggml_op_name(tensor->op), split_dim,
-                    (long long) ne_split_sum, (long long) tensor->ne[split_dim]);
+            // Diagnostic-only: no split semantics change. The explicit_ne flag
+            // is recorded with the cached split state by calculate_split_state.
+            bool explicit_ne = false;
+            {
+                std::lock_guard<std::mutex> lock(buf_ctx->split_state_mutex);
+                auto it = buf_ctx->split_state_cache.find(
+                        std::pair<const ggml_tensor *, bool>(tensor, true));
+                if (it != buf_ctx->split_state_cache.end()) {
+                    explicit_ne = it->second.explicit_ne;
+                }
+            }
+            std::string nr_all;
+            for (uint32_t s = 0; s < split_state.n_segments; ++s) {
+                if (s != 0) nr_all += ",";
+                nr_all += std::to_string(split_state.nr[s]);
+            }
+            std::string seg_ne;
+            for (uint32_t s = 0; s < split_state.n_segments; ++s) {
+                if (s != 0) seg_ne += " ";
+                seg_ne += "seg" + std::to_string(s) + ":(";
+                for (size_t j = 0; j < n_simple_bufs; ++j) {
+                    if (j != 0) seg_ne += ",";
+                    seg_ne += std::to_string(split_state.ne[s*n_simple_bufs + j]);
+                }
+                seg_ne += ")";
+            }
+            const std::vector<ggml_backend_meta_split_group> & diag_groups =
+                    !split_groups.empty() ? split_groups : exact_groups;
+            std::string group_periods;
+            for (size_t g = 0; g < diag_groups.size(); ++g) {
+                if (g != 0) group_periods += ",";
+                group_periods += std::to_string(diag_groups[g].periods);
+            }
+            const ggml_tensor * src0 = tensor->src[0];
+            std::string src0_desc;
+            if (src0 == nullptr) {
+                src0_desc = "src0_op=none src0_axis=-1 src0_ne=[0,0,0,0] src0_nr0=0 src0_seg_ne=[]";
+            } else {
+                const bool src0_meta = src0->buffer != nullptr && ggml_backend_buffer_is_meta(src0->buffer);
+                const ggml_backend_meta_split_state src0_ss = src0_meta
+                        ? ggml_backend_meta_get_split_state(src0, /*assume_sync =*/ true)
+                        : ggml_backend_meta_split_state{GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+                const size_t src0_bufs = src0_meta
+                        ? ggml_backend_meta_buffer_n_bufs(src0->buffer) : 0;
+                std::string src0_seg_ne;
+                for (uint32_t s = 0; s < src0_ss.n_segments && src0_bufs != 0; ++s) {
+                    if (s != 0) src0_seg_ne += " ";
+                    src0_seg_ne += "seg" + std::to_string(s) + ":(";
+                    for (size_t j = 0; j < src0_bufs; ++j) {
+                        if (j != 0) src0_seg_ne += ",";
+                        src0_seg_ne += std::to_string(src0_ss.ne[s*src0_bufs + j]);
+                    }
+                    src0_seg_ne += ")";
+                }
+                src0_desc =
+                    "src0_op=" + std::string(ggml_op_name(src0->op)) +
+                    " src0_axis=" + std::to_string(int(src0_ss.axis)) +
+                    " src0_ne=[" + std::to_string(src0->ne[0]) + "," + std::to_string(src0->ne[1]) + "," +
+                    std::to_string(src0->ne[2]) + "," + std::to_string(src0->ne[3]) + "]" +
+                    " src0_nr0=" + std::to_string(src0_ss.nr[0]) +
+                    " src0_seg_ne=[" + src0_seg_ne + "]";
+            }
+            GGML_LOG_ERROR(
+                "TP5_META_SPLIT_TOTAL_MISMATCH name='%s' op=%s axis=%d child_sum=%lld tensor_ne=%lld "
+                "ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] n_segments=%u nr0=%u nr_all=[%s] "
+                "seg_ne=[%s] explicit_ne=%d groups=%zu exact_groups=%zu has_groups_periods=[%s] "
+                "%s view_src=%d\n",
+                ggml_get_name(tensor), ggml_op_name(tensor->op), split_dim,
+                (long long) ne_split_sum, (long long) tensor->ne[split_dim],
+                (long long) tensor->ne[0], (long long) tensor->ne[1],
+                (long long) tensor->ne[2], (long long) tensor->ne[3],
+                tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
+                split_state.n_segments, split_state.nr[0], nr_all.c_str(),
+                seg_ne.c_str(), int(explicit_ne), split_groups.size(), exact_groups.size(),
+                group_periods.c_str(), src0_desc.c_str(),
+                int(tensor->view_src != nullptr));
             return GGML_STATUS_FAILED;
         }
     }
