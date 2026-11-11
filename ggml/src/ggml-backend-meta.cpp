@@ -2652,6 +2652,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (a.axis != b.axis) {
             return false;
         }
+        // Negative axes (MIRRORED / PARTIAL / UNKNOWN) carry no owner runs:
+        // two states with the same negative axis are the same state.
+        if (a.axis < 0) {
+            return true;
+        }
         // Compare the expanded canonical (owner, run length) sequence. The
         // segment/nr spelling may differ (one nr=2 segment vs two nr=1
         // segments) while every logical coordinate has the same owner.
@@ -2668,8 +2673,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto merge_owner_states = [&](const ggml_backend_meta_split_state & a,
                                   const ggml_backend_meta_split_state & b) -> ggml_backend_meta_split_state {
         ggml_backend_meta_split_state out = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
-        if (a.axis != b.axis || a.axis < 0 || a.axis >= GGML_MAX_DIMS) {
+        if (a.axis != b.axis || a.axis >= GGML_MAX_DIMS) {
             return out;
+        }
+        if (a.axis < 0) {
+            // Same negative axis (MIRRORED/PARTIAL): nothing to merge.
+            return a;
         }
         std::vector<std::pair<size_t, int64_t>> ra, rb;
         if (!canonical_owner_runs(a, ra) || !canonical_owner_runs(b, rb) || ra != rb || ra.empty()) {
@@ -2909,8 +2918,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 return src_ss[0];
             }
             default: {
-                GGML_ABORT("fatal error");
-                //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+                // A source state this reshape cannot describe (UNKNOWN from an
+                // unsupported upstream op) must fail closed: init_tensor_impl turns
+                // UNKNOWN into GGML_STATUS_FAILED with the TP5_META_SPLIT_UNKNOWN
+                // diagnostic instead of aborting the whole process.
+                return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
             }
         }
     };
@@ -2966,8 +2978,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
             return src_ss[0];
         }
-        GGML_ABORT("view of permuted tensor not implemented");
-        //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+        // An unsupported view shape must fail closed; init_tensor_impl turns
+        // UNKNOWN into GGML_STATUS_FAILED instead of aborting the process.
+        return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
     };
 
     auto handle_permute = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
