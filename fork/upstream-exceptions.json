@@ -571,7 +571,7 @@
     },
     {
       "path": "ggml/src/ggml-backend-meta.cpp",
-      "sha256": "b13edd1a9156c0c8ae70dfd620ee5e4a4286c326a674a6bad86e8c28431dbcc9",
+      "sha256": "8981a978881f59ae4764ee83d9b55448bcd702d3b5b9aa8f71ba3af78902406d",
       "mode": "100644",
       "consumers": [
         "public meta backend tensor transfers",

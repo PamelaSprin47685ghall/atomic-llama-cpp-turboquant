@@ -3089,14 +3089,23 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
-        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        if (src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
+                src_ss[1].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
+                src_ss[2].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
+                src_ss[3].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
+                src_ss[4].axis != GGML_BACKEND_SPLIT_AXIS_1) {
+            // Fail closed instead of aborting: init_tensor_impl turns UNKNOWN
+            // into GGML_STATUS_FAILED with the TP5_META_SPLIT_UNKNOWN
+            // diagnostic.
+            return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+        }
         // state shape is [S_v, S_v, H_v, n_seqs] (s0 only); the heads dim is its own axis 2,
         // so a head-aligned split on the input cache lands on axis 2 here.
-        GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        if (src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_2 &&
+                src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_1 &&
+                src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_0) {
+            return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+        }
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
     };
 
@@ -3430,7 +3439,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 if (tensor->src[i] == nullptr || tensor->src[i] == tensor || src_groups[i].empty()) {
                     continue;
                 }
-                if (split_states_equal(split_state, src_ss[i])) {
+                if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS &&
+                        src_ss[i].axis == split_state.axis &&
+                        split_states_equal(split_state, src_ss[i])) {
                     *groups = src_groups[i];
                     for (ggml_backend_meta_split_group & group : *groups) {
                         group.state.axis = split_state.axis;
