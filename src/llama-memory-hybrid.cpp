@@ -301,6 +301,16 @@ bool llama_memory_hybrid_context::next() {
 bool llama_memory_hybrid_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
+    // An init_full() context carries no ubatches and no scheduler. Its
+    // sub-contexts are full contexts, not updates; applying them would call
+    // llama_kv_cache::update(nullptr, ...) on a reserve-only path. Return
+    // true without touching the caches. An init_update() context also has no
+    // ubatches but is an update; keep it on the normal path below.
+    if (ubatches.empty() && ctx_attn != nullptr &&
+            !static_cast<const llama_kv_cache_context *>(ctx_attn.get())->is_update()) {
+        return true;
+    }
+
     bool res = true;
 
     res = res & ctx_attn->apply();

@@ -2028,7 +2028,7 @@
     },
     {
       "path": "src/llama-kv-cache.cpp",
-      "sha256": "64701fcbc34db7b6ff87f3ac1c01e8a95f3f04025004a3c726a3ba64ec6d3fce",
+      "sha256": "0ab6530d84e54ae85935a5a2b2c9d79bb175103763c9b7cdc69c4e05deb5e3fe",
       "mode": "100644",
       "consumers": [
         "fork/rerot-compose",
@@ -2075,7 +2075,7 @@
     },
     {
       "path": "src/llama-memory-hybrid-idx.cpp",
-      "sha256": "625e25573a95d564a56edeab7debee4080cd4d16aef9e2d6e401aad7da654ccc",
+      "sha256": "49d69dd7c106997ac3e0592b7aefec71e6ee2bfd0274ce5a91059fe1cdc11ba3",
       "mode": "100644",
       "consumers": [
         "KV cache/stream consumers",
@@ -2123,7 +2123,7 @@
     },
     {
       "path": "src/llama-memory-hybrid.cpp",
-      "sha256": "a7e1a15dde194c84ef2ff0bda7a0e949d608e2c25489b31e471ebc8419e61804",
+      "sha256": "b08cf1b1128af9f575745d797d06649cebbab4e506b3c3fbbf7682e79cae8355",
       "mode": "100644",
       "consumers": [
         "KV cache/stream consumers",

@@ -1916,6 +1916,19 @@ llama_memory_apply_status llama_kv_cache::update(llama_context * lctx, bool do_s
         return LLAMA_MEMORY_APPLY_NO_UPDATE;
     }
 
+    if (lctx == nullptr) {
+        // A full-context (reserve/init_full) apply carries no scheduler and no
+        // pending work: every real update comes from init_update(), which always
+        // passes the owning llama_context. Never dereference a null lctx; a live
+        // shift or stream copy here would be a contract violation, so fail closed.
+        if (!sc_info.empty() || do_shift) {
+            LLAMA_LOG_ERROR("%s: K-shift/stream copy requested without a llama_context; refusing\n", __func__);
+            return LLAMA_MEMORY_APPLY_FAILED;
+        }
+        shift_backup_clear();
+        return LLAMA_MEMORY_APPLY_NO_UPDATE;
+    }
+
     llama_memory_apply_status status = LLAMA_MEMORY_APPLY_NO_UPDATE;
 
     auto * sched = lctx->get_sched();

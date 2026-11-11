@@ -822,6 +822,13 @@ bool llama_memory_hybrid_idx_context::apply() {
     const bool is_update = ctx_attn != nullptr &&
         static_cast<const llama_kv_cache_context *>(ctx_attn.get())->is_update();
 
+    // An init_full() context carries no ubatches and no scheduler; do not run
+    // the sub-contexts' apply() on the reserve path. init_update() keeps the
+    // normal path even though its ubatches vector is also empty.
+    if (ubatches.empty() && ctx_attn != nullptr && !is_update) {
+        return true;
+    }
+
     if (is_update) {
         static_cast<llama_kv_cache_context *>(ctx_attn.get())->set_keep_shift_undo(true);
         if (ctx_idx) {
