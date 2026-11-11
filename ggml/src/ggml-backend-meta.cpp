@@ -3384,24 +3384,28 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
             } break;
         }
-        // The ratio takeover below is only for handlers that returned a
-        // placeholder state with all-zero ne. Handlers that already filled
-        // exact per-child ne (handle_generic/merge/repeat/permute/reshape
-        // multi-segment) must keep it.
-        bool has_explicit_ne = false;
+        // The ratio takeover below only runs when the handler's own widths do
+        // not add up to the output axis. A handler may leave per-child widths
+        // inherited from a different axis (for example handle_mul_mat retargets
+        // AXIS_1 -> AXIS_0 and sets nr = 1), so a nonzero ne is not enough;
+        // require sum(ne*nr) over all children to equal tensor->ne[axis].
+        bool explicit_total_ok = false;
         if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
-            const size_t n_bufs_probe = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
-            for (size_t s = 0; s < split_state.n_segments && !has_explicit_ne; s++) {
-                for (size_t j = 0; j < n_bufs_probe; j++) {
-                    if (split_state.ne[s*n_bufs_probe + j] != 0) {
-                        has_explicit_ne = true;
-                        break;
+            int64_t total = 0;
+            bool any = false;
+            for (size_t s = 0; s < split_state.n_segments; ++s) {
+                for (size_t j = 0; j < n_bufs; ++j) {
+                    const int64_t w = split_state.ne[s*n_bufs + j];
+                    if (w != 0) {
+                        any = true;
                     }
+                    total += w * int64_t(split_state.nr[s]);
                 }
             }
+            explicit_total_ok = any && total == tensor->ne[split_state.axis];
         }
-        last_has_explicit_ne = has_explicit_ne;
-        if (!exact_view && !has_explicit_ne && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+        last_has_explicit_ne = explicit_total_ok;
+        if (!exact_view && !explicit_total_ok && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
             const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
 
@@ -3602,6 +3606,36 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         ggml_backend_meta_split_state exact;
         exact_view = ggml_backend_meta_view_exact_split(
                 tensor, tensor->view_src, parent_ss, n_simple_bufs, exact, &exact_groups, exact_view_starts);
+
+        if (exact_view) {
+            int64_t exact_ne = 0;
+            if (!exact_groups.empty()) {
+                for (const auto & g : exact_groups) {
+                    int64_t per = 0;
+                    for (size_t s = 0; s < g.state.n_segments; ++s) {
+                        for (size_t j = 0; j < n_simple_bufs; ++j) {
+                            per += g.state.ne[s*n_simple_bufs + j] * g.state.nr[s];
+                        }
+                    }
+                    exact_ne += per * int64_t(g.periods);
+                }
+            } else {
+                for (size_t s = 0; s < exact.n_segments; ++s) {
+                    for (size_t j = 0; j < n_simple_bufs; ++j) {
+                        exact_ne += int64_t(exact.ne[s*n_simple_bufs + j]) * exact.nr[s];
+                    }
+                }
+            }
+            if (exact_ne != tensor->ne[split_dim]) {
+                // The exact per-child split does not cover this view's axis:
+                // this is a reshape whose parent boundaries are not aligned to
+                // the view's own axis. Fall back to the legacy ratio path,
+                // which is what this tree used before exact-view support.
+                exact_view = false;
+                exact_view_starts.clear();
+                exact_groups.clear();
+            }
+        }
     }
 
     std::vector<ggml_tensor *> simple_tensors;
