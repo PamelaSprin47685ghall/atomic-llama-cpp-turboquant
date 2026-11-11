@@ -571,7 +571,7 @@
     },
     {
       "path": "ggml/src/ggml-backend-meta.cpp",
-      "sha256": "a4d899990836dce2868e98b7d7bfdd65a2051d46d7f11abf7107ec53db5615f9",
+      "sha256": "11099ad5b91b067e5ade0838e3938c7d1751c3be83ffdaa85151d821a3c36f12",
       "mode": "100644",
       "consumers": [
         "public meta backend tensor transfers",
@@ -3117,7 +3117,7 @@
     },
     {
       "path": "tests/test-meta-host-view-copy.cpp",
-      "sha256": "fb9b25e46467f201763b17de239cb3662718d3dc5c69be676f2dc64a83ea23a7",
+      "sha256": "a2e8cbfd0f93ed0793fc8490bcfdedffaa15435744b9498d478df522a938dc89",
       "mode": "100644",
       "consumers": [
         "TP5 CPU tests",

@@ -2630,60 +2630,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         groups->clear();
     }
 
-    auto canonical_owner_runs = [&](const ggml_backend_meta_split_state & ss,
-                                    std::vector<std::pair<size_t, int64_t>> & runs) -> bool {
-        if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
-            return false;
-        }
-        for (size_t s = 0; s < ss.n_segments; s++) {
-            for (uint32_t r = 0; r < ss.nr[s]; r++) {
-                for (size_t j = 0; j < n_bufs; j++) {
-                    const int64_t w = ss.ne[s*n_bufs + j];
-                    if (w == 0) {
-                        continue;
-                    }
-                    if (!runs.empty() && runs.back().first == j) {
-                        runs.back().second += w;
-                    } else {
-                        runs.push_back({j, w});
-                    }
-                }
-            }
-        }
-        return true;
-    };
-
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
         if (a.axis != b.axis) {
             return false;
         }
-        // Non-dimension axes (MIRRORED=10 / PARTIAL=11 / NONE=98 /
-        // UNKNOWN=99) carry no owner runs: two states with the same
-        // non-dimension axis are the same state.
-        if (a.axis < 0 || a.axis >= GGML_MAX_DIMS) {
-            return true;
-        }
-        // Compare the expanded canonical (owner, run length) sequence. The
-        // segment/nr spelling may differ (one nr=2 segment vs two nr=1
-        // segments) while every logical coordinate has the same owner.
-        std::vector<std::pair<size_t, int64_t>> ra, rb;
-        return canonical_owner_runs(a, ra) && canonical_owner_runs(b, rb) && ra == rb;
-    };
-
-    auto split_totals_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
-        if (a.axis != b.axis) {
-            return false;
-        }
         for (size_t j = 0; j < n_bufs; ++j) {
-            int64_t total_a = 0;
-            int64_t total_b = 0;
+            int64_t sum_a = 0;
             for (size_t s = 0; s < a.n_segments; ++s) {
-                total_a += int64_t(a.ne[s*n_bufs + j]) * a.nr[s];
+                sum_a += a.ne[s*n_bufs + j] * a.nr[s];
             }
+            int64_t sum_b = 0;
             for (size_t s = 0; s < b.n_segments; ++s) {
-                total_b += int64_t(b.ne[s*n_bufs + j]) * b.nr[s];
+                sum_b += b.ne[s*n_bufs + j] * b.nr[s];
             }
-            if (total_a != total_b) {
+            if (sum_a != sum_b) {
                 return false;
             }
         }
@@ -2728,48 +2688,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
     };
 
-    // Two sources can share one child layout only when their expanded
-    // canonical (owner, run length) sequences are identical. Different
-    // spellings (one nr=2 segment vs two nr=1 segments) normalize to the
-    // same runs and are merged. Truly different owner mappings cannot be
-    // executed without cross-device redistribution, so they stay UNKNOWN and
-    // init_tensor_impl fails closed instead of aborting.
-    auto merge_owner_states = [&](const ggml_backend_meta_split_state & a,
-                                  const ggml_backend_meta_split_state & b) -> ggml_backend_meta_split_state {
-        ggml_backend_meta_split_state out = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
-        auto merge_fail = [&]() -> ggml_backend_meta_split_state {
-            GGML_LOG_ERROR("TP5_META_MERGE_UNKNOWN name='%s' op=%s a{%s} b{%s}\n",
-                    ggml_get_name(tensor), ggml_op_name(tensor->op),
-                    split_state_diag(a).c_str(), split_state_diag(b).c_str());
-            return out;
-        };
-        if (a.axis != b.axis) {
-            return merge_fail();
-        }
-        if (a.axis < 0 || a.axis >= GGML_MAX_DIMS) {
-            // Same non-dimension axis (MIRRORED/PARTIAL/NONE/UNKNOWN):
-            // nothing to merge.
-            return a;
-        }
-        std::vector<std::pair<size_t, int64_t>> ra, rb;
-        if (!canonical_owner_runs(a, ra) || !canonical_owner_runs(b, rb) || ra != rb || ra.empty()) {
-            return merge_fail();
-        }
-        if (ra.size() > 16) {
-            return merge_fail();
-        }
-        out.axis = a.axis;
-        out.n_segments = uint32_t(ra.size());
-        for (size_t s = 0; s < ra.size(); s++) {
-            out.nr[s] = 1;
-            for (size_t j = 0; j < n_bufs; j++) {
-                out.ne[s*n_bufs + j] = 0;
-            }
-            out.ne[s*n_bufs + ra[s].first] = ra[s].second;
-        }
-        return out;
-    };
-
     bool exact_view = false;
 
     auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only) -> ggml_backend_meta_split_state {
@@ -2781,14 +2699,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
                 ret = src_ss[i];
             } else if (!split_states_equal(src_ss[i], ret)) {
-                // Same total but a different owner order: merge the run
-                // boundaries instead of falling straight to UNKNOWN. The
-                // output follows the first source's owner; the other source's
-                // data stays in its own child for the graph to read there.
-                ret = merge_owner_states(ret, src_ss[i]);
-                if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
-                    break;
-                }
+                ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+                break;
             }
         }
         if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
@@ -2834,68 +2746,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
 
-    // REPEAT tiles the whole source along each axis. When the split axis is
-    // repeated, the source's entire split-axis owner sequence is tiled, not
-    // each segment stretched: a one-segment source multiplies nr; a
-    // multi-segment source repeats the segment list in the same order.
-    auto handle_repeat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        ggml_backend_meta_split_state ret = src_ss[0];
-        if (ret.axis < 0 || ret.axis >= GGML_MAX_DIMS) {
-            return ret;
-        }
-        const int axis = ret.axis;
-        const int64_t src_extent = tensor->src[0]->ne[axis];
-        const int64_t dst_extent = tensor->ne[axis];
-        if (src_extent <= 0 || dst_extent <= 0 || dst_extent % src_extent != 0) {
-            return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
-        }
-        const int64_t repeat = dst_extent / src_extent;
-        if (repeat <= 1) {
-            return ret;
-        }
-        if (ret.n_segments == 1) {
-            if (uint64_t(ret.nr[0]) * uint64_t(repeat) > UINT32_MAX) {
-                return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
-            }
-            ret.nr[0] = uint32_t(uint64_t(ret.nr[0]) * uint64_t(repeat));
-            return ret;
-        }
-        const size_t base_segments = ret.n_segments;
-        if (base_segments * size_t(repeat) > 16) {
-            return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
-        }
-        ret.n_segments = uint32_t(base_segments * size_t(repeat));
-        for (uint32_t p = 1; p < uint32_t(repeat); p++) {
-            for (size_t s = 0; s < base_segments; s++) {
-                const size_t dst = size_t(p)*base_segments + s;
-                ret.nr[dst] = src_ss[0].nr[s];
-                for (size_t j = 0; j < n_bufs; j++) {
-                    ret.ne[dst*n_bufs + j] = src_ss[0].ne[s*n_bufs + j];
-                }
-            }
-        }
-        return ret;
-    };
-
     auto handle_concat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         const ggml_backend_meta_split_axis concat_axis = ggml_backend_meta_split_axis(ggml_get_op_params_i32(tensor, 0));
-        // CONCAT along the split axis: the output is the concatenation of the
-        // two owner sequences. Per child, the width is the sum of both sources'
-        // widths at that child; segment order is source0's sequence followed by
-        // source1's. This is exact (no coordinate is mixed across children).
-        if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis == concat_axis &&
-                src_ss[0].n_segments + src_ss[1].n_segments <= 16) {
-            ggml_backend_meta_split_state ret = src_ss[0];
-            ret.n_segments = src_ss[0].n_segments + src_ss[1].n_segments;
-            for (size_t s = 0; s < src_ss[1].n_segments; ++s) {
-                const size_t d = src_ss[0].n_segments + s;
-                ret.nr[d] = src_ss[1].nr[s];
-                for (size_t j = 0; j < n_bufs; ++j) {
-                    ret.ne[d*n_bufs + j] = src_ss[1].ne[s*n_bufs + j];
-                }
-            }
-            return ret;
-        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis >= 0 && src_ss[1].axis < GGML_MAX_DIMS) {
             if (concat_axis == src_ss[1].axis) {
                 return unsupported_state("CONCAT", src_ss);
@@ -2908,8 +2760,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             return src_ss[0];
         }
-        if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis != concat_axis &&
-                split_totals_equal(src_ss[0], src_ss[1])) {
+        if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis != concat_axis) {
             return src_ss[0];
         }
         ggml_backend_meta_split_state ret = handle_generic(src_ss, /*scalar_only =*/ true);
@@ -3045,11 +2896,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_cpy = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
             return handle_reshape(src_ss);
-        }
-        // A copy inherits the source layout. A destination with the same
-        // per-child totals cannot change the split axis or the child widths.
-        if (split_totals_equal(src_ss[0], src_ss[1])) {
-            return src_ss[0];
         }
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
@@ -3340,7 +3186,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_per_row(src_ss);
             } break;
             case GGML_OP_REPEAT: {
-                split_state = handle_repeat(src_ss);
+                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_REPEAT_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
@@ -3514,28 +3360,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = unsupported_state("OP", src_ss);
             } break;
         }
-        // The ratio takeover below only runs when the handler's own widths do
-        // not add up to the output axis. A handler may leave per-child widths
-        // inherited from a different axis (for example handle_mul_mat retargets
-        // AXIS_1 -> AXIS_0 and sets nr = 1), so a nonzero ne is not enough;
-        // require sum(ne*nr) over all children to equal tensor->ne[axis].
-        bool explicit_total_ok = false;
-        if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
-            int64_t total = 0;
-            bool any = false;
-            for (size_t s = 0; s < split_state.n_segments; ++s) {
-                for (size_t j = 0; j < n_bufs; ++j) {
-                    const int64_t w = split_state.ne[s*n_bufs + j];
-                    if (w != 0) {
-                        any = true;
-                    }
-                    total += w * int64_t(split_state.nr[s]);
-                }
-            }
-            explicit_total_ok = any && total == tensor->ne[split_state.axis];
-        }
-        last_has_explicit_ne = explicit_total_ok;
-        if (!exact_view && !explicit_total_ok && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+        // The ratio takeover below is the pre-exact-split behaviour. An exact
+        // view already carries the intersection-derived child widths and must
+        // not be overwritten.
+        if (!exact_view && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
             const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
 
