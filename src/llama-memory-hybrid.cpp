@@ -278,10 +278,10 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
               llama_memory_hybrid * mem,
                   slot_info_vec_t   sinfos_attn,
         std::vector<llama_ubatch>   ubatches) :
-    ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
-    ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), std::move(sinfos_attn), this->ubatches)),
-    ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
+    ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), std::move(sinfos_attn), ubatches)),
+    ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), ubatches)),
+    ubatches(std::move(ubatches)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 
@@ -301,12 +301,12 @@ bool llama_memory_hybrid_context::next() {
 bool llama_memory_hybrid_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
-    // An init_full() context carries no ubatches and no scheduler. Its
+    // An init_full() context carries no pending ubatches and no scheduler. Its
     // sub-contexts are full contexts, not updates; applying them would call
     // llama_kv_cache::update(nullptr, ...) on a reserve-only path. Return
     // true without touching the caches. An init_update() context also has no
     // ubatches but is an update; keep it on the normal path below.
-    if (ubatches.empty() && ctx_attn != nullptr &&
+    if (!has_pending_ubatches() && ctx_attn != nullptr &&
             !static_cast<const llama_kv_cache_context *>(ctx_attn.get())->is_update()) {
         return true;
     }

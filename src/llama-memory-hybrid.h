@@ -151,6 +151,10 @@ protected:
     const llama_memory_context_ptr ctx_attn;
     const llama_memory_context_ptr ctx_recr;
 
+    // A full-context (init_full) apply carries no ubatches and must be a no-op;
+    // update contexts (init_update) carry no ubatches either but set is_update.
+    bool has_pending_ubatches() const { return !ubatches.empty(); }
+
 private:
     // the index of the next ubatch to process
     size_t i_next = 0;
