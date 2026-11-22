@@ -1397,6 +1397,144 @@ The server supports parsing and returning reasoning via the `reasoning_content` 
 
 Reasoning input (preserve reasoning in history) is also supported by some specific templates. For more details, please refer to [PR#18994](https://github.com/ggml-org/llama.cpp/pull/18994).
 
+### POST `/v1/compress`: Compress a Chat Completions request
+
+Accepts the complete JSON body of a `/v1/chat/completions` request. Returns a
+smaller request of the same format. The response body is a **byte subsequence of
+the original HTTP body**: the server only deletes source ranges. It does not add
+a summary, an ellipsis, replacement text, or response metadata to that body.
+Original JSON spelling, field order, whitespace outside deleted ranges, and
+escapes are retained.
+
+Set `target_tokens` in the query string. It must be a positive integer. The
+default is half the original prompt token count, rounded up. The budget counts
+the prompt after the loaded model's actual chat template, including tool schemas
+and special tokens. It does not include future generated tokens. Reserve space
+for generation when choosing the budget. If the original prompt fits, the body
+is returned byte-for-byte unchanged without model scoring.
+
+```sh
+curl --fail-with-body http://localhost:8080/v1/compress?target_tokens=8192 \
+  -H 'Content-Type: application/json' \
+  --data-binary @request.json \
+  -D compression-headers.txt \
+  -o compressed-request.json
+
+curl --fail-with-body http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  --data-binary @compressed-request.json
+```
+
+The endpoint uses the existing authentication and model router. Add the normal
+authorization header if the server requires an API key. `/v1/compress` itself
+returns one JSON response, including when the preserved request has `stream:true`.
+It does not generate an answer or execute any tools.
+
+**What can be deleted**
+
+- Historical messages can be removed. An assistant's tool calls and all their
+  matching results form one indivisible group, including parallel calls and
+  links across other messages. Legacy `function_call` and `function` messages
+  are also linked. An ordinary user message and its immediate ordinary
+  assistant reply form a pair; other ordinary messages stand alone. A long tool
+  loop after a single user instruction can therefore shed old tool exchanges.
+- `system` and `developer` messages stay intact. The latest user message and the
+  final message group retain their shells and tool identities. Large text
+  inside those messages can still shrink.
+- Text `content`, `content` parts of type `text`, and assistant
+  `reasoning_content` are divided into blocks of
+  about 32 model tokens. Each field's first and last blocks are kept. Boundaries
+  stay on complete Unicode code points. Short fields therefore stay intact
+  unless their whole historical group is removed.
+- Valid JSON inside `function.arguments` is handled as a second source map.
+  Only its string **values** can shrink. Keys, short string values such as paths,
+  numbers, booleans, array structure, and JSON syntax stay intact. Opaque or
+  incomplete argument JSON stays intact within a retained message. This permits
+  compression inside a single large write call as well as a large read result.
+- Non-message top-level fields, including `model`, `tools`, generation settings,
+  and unknown extension fields, stay intact. Other message fields and non-text
+  content parts stay intact within each retained message.
+
+**How text is selected**
+
+The model computes next-token negative log likelihood (NLL) for each eligible
+text field. Scoring uses the server task queue and bounded windows of at most
+512 tokens (or the slot context, if smaller), with up to 32 tokens of left
+overlap. Input text can therefore exceed one model context. Each available token
+score contributes once to ranking; overlap supplies context. Mean NLL ranks blocks and historical
+groups, with less surprising text removed first and earlier source order used
+to break ties. A vocabulary that normalizes text uses fixed Unicode blocks as a
+source-preserving fallback. No sentence splitter or language-specific text
+parser is used.
+
+Deletion costs are estimates during selection. After each group of deletions,
+the server applies the real chat template and tokenizes again. A successful
+response always meets `target_tokens`. A whole historical group can take the
+result below the requested budget. Candidates rejected by the template, for
+example because roles do not alternate, are skipped while deletion continues.
+Token IDs at newly joined text boundaries
+can change; the subsequence guarantee concerns source bytes and text order,
+not re-tokenized token IDs.
+
+NLL is a heuristic for predictability, not a proof of relevance to the current
+coding task. Windows do not see the complete history or future questions. Rare
+noise can score highly, and important repetitive code can score low. The API
+preserves JSON and tool relationships; it does not promise equivalent answers
+or valid source code inside shortened strings. Keep the original request for
+recovery and evaluate task success before choosing a production compression
+ratio. This implementation does not edit live KV entries or shift positions;
+the returned request receives a normal fresh prefill when submitted later.
+
+Scoring needs a decoder model and raw logits. It consumes inference capacity
+and adds a model pass; a speedup is not guaranteed. The server explicitly
+reserves up to 32 scoring output rows, bounded by batch and microbatch sizes.
+The raw logit rows use up to `32 * vocabulary_size * sizeof(float)` bytes;
+other output buffers and graph workspaces can require additional memory. TP5
+batch limits and existing context guards remain in force. Use a template that
+includes tool arguments when measuring savings on tool histories: text omitted
+by a template does not contribute to that model's prompt budget.
+
+With unified KV memory, a scoring window waits for active inference to finish,
+runs alone, and clears idle prompt caches before use. Other inference tasks can
+run between windows. This prevents a scoring window from exhausting KV memory
+that belongs to an active completion; it can reduce prompt-cache reuse. Separate
+KV streams keep normal slot scheduling.
+An active compression request keeps the model awake during tokenization,
+scoring, and final budget checks; idle sleep resumes after the request releases
+that model activity guard.
+
+**Response headers**
+
+| Header | Meaning |
+| --- | --- |
+| `X-Compression-Original-Tokens` | Original formatted prompt size |
+| `X-Compression-Tokens` | Returned formatted prompt size |
+| `X-Compression-Target-Tokens` | Applied budget |
+| `X-Compression-Method` | `unchanged` or `windowed-nll` |
+| `X-Compression-Scored-Tokens` | Token positions with finite NLL, excluding repeated overlap |
+| `X-Compression-Score-Windows` | Number of queued scoring windows |
+| `X-Compression-Removed-Messages` | Number of removed historical messages |
+
+Malformed JSON, duplicate object keys, invalid Unicode, an invalid budget, or
+unmatched/duplicate tool results return HTTP 400. Nesting is limited to 128 JSON
+containers. If the deletion policy cannot reach the budget while retaining its
+protected fields, the endpoint returns HTTP 422 with
+`error.type = "compression_budget_exceeded"`. Its `minimum_tokens` is the token
+count of the maximally pruned candidate under this policy. It is not a
+mathematical lower bound over all possible subsequences, since tokenization at
+deletion boundaries is not monotonic; it is `null` if the template rejects that
+candidate. No over-budget candidate is returned as
+a successful request. Unsupported scoring models return HTTP 501.
+
+For model-backed protocol tests without downloading server test presets, run:
+
+```sh
+LLAMA_TEST_MODEL=/path/to/tiny-decoder.gguf \
+  ctest --test-dir build -R '^(test-compress-json|test-server-score|test-server-model-activity)$' --output-on-failure
+python3 tools/server/tests/test_compress_standalone.py \
+  --binary build/bin/llama-server --model /path/to/tiny-decoder.gguf
+```
+
 ### POST `/v1/chat/completions/control`: Control a running chat completion in real time
 
 Acts on an in-flight completion identified by its `id` (the `id` field streamed back by `/v1/chat/completions`). The request is processed in parallel with the SSE stream, so the client sends it while still reading tokens.

@@ -1,3 +1,33 @@
+## 2026-11-22: Request compression in the original llama-server
+
+The requested consumer is `POST /v1/compress` in the existing server. It accepts
+a Chat Completions request and returns a request formed only by deleting ranges
+from the original HTTP JSON bytes. The contract, budget parameter, protection
+policy, and limitations are documented in
+[the server API](../tools/server/README.md#post-v1compress-compress-a-chat-completions-request).
+
+This is an explicit server-private A change. The source map and deletion plan
+live beside the server, and NLL scoring uses its private task/slot queue. These
+files are not represented as an independent B library, and no service callback
+is used to hide an A/B dependency. The public llama C API alone cannot add a
+safe scoring task to the existing server scheduler. Exact changed A paths and
+digests are registered in `upstream-exceptions.json`; remove this exception when
+the selected upstream provides the same request-compression operation and its
+runtime guarantees, or the named consumer is retired.
+
+| Decision | Scope |
+| --- | --- |
+| Kept | Source-byte subsequence output, real template/token budget, tool-result closure, large text and JSON string argument slicing, queued windowed NLL |
+| Excluded | Generated summaries, sentence splitting, text reserialization, live KV eviction/position shifting, external services or new runtime dependencies |
+| Deferred | Query-aware semantic importance, task-quality qualification on coding workloads, reverse-pass scores, GPU/TP5 performance qualification |
+
+The score is predictability under a bounded local text window. It does not prove
+that a deleted token is irrelevant. A valid compressed request can still lose
+task information. Runtime evidence for this change is recorded separately in
+[VALIDATION.md](VALIDATION.md); prior TP5 measurements do not qualify it.
+
+---
+
 <!-- two-requests-current-status-20261021 -->
 ## 2026-10-21：双请求保留版本与最终测量；每路 47 tok/s 目标未达到
 

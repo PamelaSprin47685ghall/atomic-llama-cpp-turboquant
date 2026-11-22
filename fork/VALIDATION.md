@@ -1,3 +1,85 @@
+## 2026-11-22: `/v1/compress` request and runtime validation
+
+Base: `feat/p5-conservative-20261111` at
+`21b936536a45a5a2b50a47697e808c9f6a89cee5`. This record applies to the
+server-private request compression change, separately from the historical TP5
+measurements below. Its maintained contract is in
+[the server API](../tools/server/README.md#post-v1compress-compress-a-chat-completions-request).
+
+The final Linux CPU Release build passed. Three CTests passed (3/3, 7.27 seconds),
+and all ten standalone HTTP cases passed against the same binary. The fixture
+was `ggml-org/models`, `tinyllamas/stories260K.gguf`, with SHA-256:
+
+```text
+270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d
+```
+
+| Acceptance | Observed result |
+| --- | --- |
+| JSON source mapping | `test-compress-json` passed: raw-byte deletion, UTF-8 and surrogate boundaries, duplicate/invalid JSON rejection, nested argument JSON mapping |
+| Real NLL | `test-server-score` passed against independent single-token decodes and long-double logsumexp; 0, 1, 32, 33, 65, 97, and 512-token inputs, full-context acceptance and over-context refusal |
+| Shared KV | Queued scoring is exclusive with unified KV; near-full generation and full-context scoring succeed in both arrival orders; idle prompt cells are released; cancellation and later generation/scoring succeed |
+| Model lifetime | `test-server-model-activity` passed without a model: nested/moved activity guards prevent sleep, release allows sleep, and acquire waits for wake completion |
+| HTTP contract | 10/10 cases passed: unchanged raw body when fitting, invalid requests, infeasible budget, 8,608-token single message, Unicode/escapes, large read result, large write arguments, one-user long tool loop, large reasoning content, strict alternating template |
+| Independent budget oracle | Each successful HTTP result was checked with `/apply-template` then `/tokenize`, in addition to the raw-byte subsequence oracle, unchanged top-level fields, and tool-call/result closure |
+| Continued inference | A returned compressed request was submitted to `/v1/chat/completions` and generated tokens |
+| Real idle sleep and reload | With `--sleep-idle-seconds 1`: sleep, unchanged compression response with zero scoring windows, sleep again, compress 4,418 to 482 prompt tokens in 10 scoring windows, generate two tokens from the returned request, then sleep again |
+
+The JSON source-map test also passed an independent ASan + UBSan run with
+`ASAN_OPTIONS=detect_leaks=0`. LeakSanitizer could not run under this environment's
+ptrace setup; that run does not establish leak freedom for the server.
+
+The one-user tool-loop case first failed on the earlier implementation with
+HTTP 422 (`minimum_tokens=3469`, `target_tokens=1024`). Protecting every exchange
+after the latest user had made the complete loop indivisible. The final grouping
+keeps each tool call and its results together while allowing earlier exchanges
+to be removed; that same regression now passes. Ordinary user/assistant pairs
+and final template validation also preserve compatibility with strict role
+alternation.
+
+The test template explicitly renders tool arguments and retained reasoning.
+The built-in `chatml` template omits tool arguments, so it could not qualify the
+large-write test: the uncompressed body already fit that template's prompt
+budget. Likewise, a final assistant message can be converted to a prefill
+continuation. The reasoning fixture uses a real assistant tool call followed by
+its result and `preserve_reasoning=true`, and verifies the reasoning marker is
+present in the actual formatted prompt before attempting compression.
+
+Reproduction (supply the local fixture path; no server test presets are loaded):
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
+  -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_APP=OFF \
+  -DLLAMA_BUILD_TESTS=ON -DGGML_NATIVE=OFF
+cmake --build build --target llama-server test-compress-json test-server-score -j 4
+LLAMA_TEST_MODEL=/path/to/stories260K.gguf \
+  ctest --test-dir build \
+  -R '^(test-compress-json|test-server-score|test-server-model-activity)$' \
+  --output-on-failure
+python3 tools/server/tests/test_compress_standalone.py \
+  --binary build/bin/llama-server --model /path/to/stories260K.gguf
+python3 fork/check-upstream.py > build/compress-boundary.json
+git diff --check
+```
+
+The baseline tiny CPU server requires `--kv-unified` in this environment. Without
+it, the unchanged base aborts in the startup sequence-removal probe at
+`src/llama-kv-cache.cpp:3178`; disabling the CPU union binder did not fix it.
+Both the baseline completion and the new endpoint were tested with unified KV.
+Also, both UI build switches above are needed to avoid downloading incompatible
+latest UI assets for this pinned branch. Neither baseline issue was changed by
+this feature.
+
+These runs establish protocol handling, real scoring, token budgets, and the
+specified CPU lifecycle behavior. They do not establish coding-task answer
+quality, latency gains, non-unified runtime qualification on this fixture, or
+GPU/TP5 qualification. NLL remains a local predictability heuristic. The byte
+subsequence guarantee does not imply that token IDs remain a subsequence after
+the shortened text is tokenized again.
+
+---
+
 <!-- two-requests-current-status-20261021 -->
 ## 2026-10-21：双请求保留版本与最终测量；每路 47 tok/s 目标未达到
 

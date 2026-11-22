@@ -1524,6 +1524,16 @@ json server_task_result_rerank::to_json() {
 }
 
 //
+// server_task_result_score
+//
+json server_task_result_score::to_json() {
+    return json {
+        {"index", index},
+        {"nll",   nll},
+    };
+}
+
+//
 // server_task_result_error
 //
 json server_task_result_error::to_json() {

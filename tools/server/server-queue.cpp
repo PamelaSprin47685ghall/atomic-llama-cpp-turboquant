@@ -4,6 +4,7 @@
 #include "log.h"
 
 #include <chrono>
+#include <stdexcept>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define QUE_WRN(fmt, ...) LOG_WRN("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -18,6 +19,39 @@
 //
 // server_queue
 //
+
+server_queue::model_activity::~model_activity() {
+    if (queue) {
+        queue->release_model_activity();
+    }
+}
+
+server_queue::model_activity server_queue::acquire_model_activity() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    ++model_activity_count;
+    try {
+        if (sleeping) {
+            req_stop_sleeping = true;
+            condition_tasks.notify_all();
+            condition_tasks.wait(lock, [&] { return !sleeping || !running; });
+            if (sleeping) {
+                throw std::runtime_error("server stopped while waking the model");
+            }
+        }
+    } catch (...) {
+        --model_activity_count;
+        throw;
+    }
+    return model_activity(*this);
+}
+
+void server_queue::release_model_activity() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    GGML_ASSERT(model_activity_count > 0);
+    --model_activity_count;
+    time_last_task = ggml_time_ms();
+    condition_tasks.notify_all();
+}
 
 int server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
@@ -123,13 +157,16 @@ void server_queue::terminate() {
 }
 
 void server_queue::start_loop(int64_t idle_sleep_ms) {
-    running = true;
-    time_last_task = ggml_time_ms();
+    {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        running = true;
+        time_last_task = ggml_time_ms();
+    }
 
     constexpr auto max_wait_time = std::chrono::seconds(1);
     auto should_sleep = [&]() -> bool {
         // caller must hold mutex_tasks
-        if (idle_sleep_ms < 0) {
+        if (idle_sleep_ms < 0 || model_activity_count > 0) {
             return false;
         }
         int64_t now = ggml_time_ms();

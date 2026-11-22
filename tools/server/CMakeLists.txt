@@ -13,6 +13,10 @@ add_library(${TARGET} STATIC
     server-queue.h
     server-common.cpp
     server-common.h
+    server-compress.cpp
+    server-compress.h
+    server-compress-json.cpp
+    server-compress-json.h
     server-context.cpp
     server-context.h
     server-stream.cpp
