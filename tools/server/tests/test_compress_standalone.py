@@ -23,6 +23,10 @@ import urllib.request
 from dataclasses import dataclass
 
 
+MARKER = "\u2421"
+MARKER_BYTES = MARKER.encode("utf-8")
+
+
 def require(condition, message):
     if not condition:
         raise AssertionError(message)
@@ -35,6 +39,103 @@ def is_subsequence(shorter, original):
         if next_index < len(shorter) and shorter[next_index] == item:
             next_index += 1
     return next_index == len(shorter)
+
+
+def marked_subsequence(result, original):
+    """Return a source-alignment witness and the offsets of inserted markers.
+
+    An existing marker can be copied from the source. Only an inserted marker
+    can be skipped. Keep both choices when either can permit a later match.
+    This proves that a legal edit exists; the renderer tests check its actual
+    insertion ranges when identical source characters make origins ambiguous.
+    """
+    require(type(result) is type(original), "source and result types differ")
+    marker = MARKER_BYTES if isinstance(result, bytes) else MARKER
+    states = [(0, ())]
+    output_position = 0
+
+    def advance(position, literal):
+        if original.startswith(literal, position):
+            return position + len(literal)
+        for index in range(len(literal)):
+            position = original.find(literal[index:index + 1], position)
+            if position < 0:
+                return None
+            position += 1
+        return position
+
+    def keep_states(candidates):
+        # A state with an earlier source position and no more insertions can
+        # match everything that a later, more expensive state can match.
+        best = None
+        kept = []
+        for position, inserted in sorted(candidates, key=lambda item: (item[0], len(item[1]))):
+            if best is None or len(inserted) < best:
+                kept.append((position, inserted))
+                best = len(inserted)
+        return kept
+
+    while True:
+        marker_position = result.find(marker, output_position)
+        literal_end = len(result) if marker_position < 0 else marker_position
+        literal = result[output_position:literal_end]
+        candidates = []
+        for source_position, inserted in states:
+            source_position = advance(source_position, literal)
+            if source_position is None:
+                continue
+            if marker_position < 0:
+                candidates.append((source_position, inserted))
+                continue
+            copied_marker = original.find(marker, source_position)
+            if copied_marker >= 0:
+                candidates.append((copied_marker + len(marker), inserted))
+            candidates.append((source_position, inserted + (marker_position,)))
+        states = keep_states(candidates)
+        require(states, "result contains bytes or characters that are neither copied source nor an inserted marker")
+        if marker_position < 0:
+            break
+        output_position = marker_position + len(marker)
+
+    _, inserted = min(states, key=lambda item: (len(item[1]), item[0]))
+    pieces = []
+    previous = 0
+    for position in inserted:
+        pieces.append(result[previous:position])
+        previous = position + len(marker)
+    pieces.append(result[previous:])
+    restored = result[:0].join(pieces)
+    require(is_subsequence(restored, original), "insertion witness does not leave a source subsequence")
+    require(not inserted or len(restored) < len(original), "a marker was added without deleting source content")
+    return restored, inserted
+
+
+def assert_marked_deletion(result, original):
+    restored, inserted = marked_subsequence(result, original)
+    require(inserted, "removed text has no inserted deletion marker")
+    require(0 < len(restored) < len(original), "large text did not retain a shorter source subsequence")
+    return restored, inserted
+
+
+def check_marker_oracle():
+    original = MARKER + " ORIGINAL 0123456789 END " + MARKER
+    result = MARKER + " ORIGINAL " + MARKER + " END " + MARKER
+    restored, inserted = marked_subsequence(result, original)
+    require(len(inserted) == 1, "oracle discarded an original marker")
+    require(restored.startswith(MARKER) and restored.endswith(MARKER), "original marker provenance was lost")
+    # Matching the final source marker first would make the following 'b'
+    # unreachable. The oracle must retain the insertion alternative.
+    restored, inserted = marked_subsequence("a" + MARKER + "b", "a123b" + MARKER)
+    require(restored == "ab" and inserted == (1,), "oracle lost a valid insertion alignment")
+    escaped = b'{"text":"\\u2421"}'
+    require(marked_subsequence(escaped, escaped) == (escaped, ()), "escaped original marker changed")
+    for result, original in (("aXc", "abc"), ("a" + MARKER + "bc", "abc")):
+        try:
+            marked_subsequence(result, original)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("oracle accepted an unsupported edit")
 
 
 def decode_json(raw):
@@ -68,7 +169,7 @@ def decode_json(raw):
 
 def encode_json(value, ascii_only=False):
     # Whitespace and escapes are deliberate: a parse-and-dump response must fail
-    # the identity and byte-subsequence checks.
+    # the identity and source-alignment checks when it rewrites retained bytes.
     return (" \n" + json.dumps(value, ensure_ascii=ascii_only, indent=2) + "\t\n").encode("utf-8")
 
 
@@ -197,7 +298,7 @@ def assert_tool_closure(messages):
     calls = set()
     results = set()
     for message in messages:
-        for call in message.get("tool_calls", []):
+        for call in message.get("tool_calls") or []:
             call_id = call["id"]
             require(call_id and call_id not in calls, "tool call IDs must stay unique")
             calls.add(call_id)
@@ -210,10 +311,10 @@ def assert_tool_closure(messages):
 
 
 def assert_json_string_deletions(before, after):
-    """Inner arguments keep their structure; only string values may shrink."""
+    """Inner arguments keep their structure; string edits only delete and mark."""
     require(type(before) is type(after), "argument value type changed")
     if isinstance(before, str):
-        require(is_subsequence(after, before), "argument string was rewritten")
+        marked_subsequence(after, before)
     elif isinstance(before, dict):
         require(list(before) == list(after), "argument keys or order changed")
         for key in before:
@@ -246,7 +347,7 @@ class Suite:
                 f"compress returned {response.status}: {response.raw[:1000]!r}")
         require("application/json" in response.headers.get("content-type", ""),
                 "compression must return one JSON response, including for stream:true")
-        require(is_subsequence(response.raw, raw), "response is not an original-body byte subsequence")
+        _, inserted = marked_subsequence(response.raw, raw)
         after = response.json()
         require(isinstance(after, dict) and "messages" in after, "response is not a chat request")
         require({key: value for key, value in after.items() if key != "messages"} ==
@@ -264,9 +365,22 @@ class Suite:
             require(name in response.headers, "missing " + name)
             require(int(response.headers[name]) == expected,
                     f"{name}: expected {expected}, got {response.headers[name]}")
+        marker_header = "x-compression-markers"
+        require(marker_header in response.headers, "missing " + marker_header)
+        added_markers = int(response.headers[marker_header])
+        require(added_markers >= len(inserted), "marker count is below the source-alignment minimum")
+        if MARKER_BYTES not in raw:
+            require(added_markers == len(inserted), "marker count disagrees with newly inserted UTF-8 markers")
+        method = "unchanged" if response.raw == raw else "content-bidirectional-nll"
+        require(response.headers.get("x-compression-method") == method, "wrong compression method")
+        if response.raw == raw:
+            require(added_markers == 0, "an unchanged request reported new markers")
         original_system = [item for item in before["messages"] if item["role"] in ("system", "developer")]
         final_system = [item for item in after["messages"] if item["role"] in ("system", "developer")]
         require(original_system == final_system, "system or developer content changed")
+        print(f"  tokens {original_tokens} -> {actual_tokens}; target {target}; markers {added_markers}; "
+              f"score windows {response.headers.get('x-compression-score-windows', '?')}; "
+              f"messages {len(before['messages'])} -> {len(after['messages'])}", flush=True)
         return response, after
 
     def fit_and_stream(self):
@@ -275,14 +389,14 @@ class Suite:
                 SYSTEM,
                 {"role": "user", "content": "Hi."},
                 {"role": "assistant", "content": "OK.", "tool_calls": None, "function_call": None},
-                {"role": "user", "content": "Reply OK. 中文😀"},
+                {"role": "user", "content": "Reply OK. 中文😀 " + MARKER},
             ], stream=stream)
             raw = encode_json(body, ascii_only=stream)
             count = self.client.prompt_tokens(body)
             response, after = self.compress(raw, count + 16, count)
             require(response.raw == raw, "a request that fits must keep its exact original bytes")
             require(after["stream"] is stream, "stream setting changed")
-        self.passed_case("fit preserves bytes and nullable fields; stream:true still returns one JSON request")
+        self.passed_case("fit preserves literal and escaped markers, bytes, and nullable fields; stream:true returns one request")
 
     def bad_inputs(self):
         raw = encode_json(request_body([{"role": "user", "content": "Hi"}]))
@@ -323,8 +437,7 @@ class Suite:
         raw = encode_json(body)
         response, after = self.compress(raw, self.target, count)
         require(len(after["messages"]) == 2, "the latest user turn must remain")
-        require(0 < len(after["messages"][1]["content"]) < len(content), "large user content did not shrink")
-        require(is_subsequence(after["messages"][1]["content"], content), "user text was rewritten")
+        assert_marked_deletion(after["messages"][1]["content"], content)
         second, _ = self.compress(raw, self.target, count)
         require(second.raw == response.raw, "repeated identical requests must select the same bytes")
         reused = self.client.request("/v1/chat/completions", response.raw)
@@ -332,7 +445,7 @@ class Suite:
         result = reused.json()
         require(result.get("choices") and "message" in result["choices"][0], "completion response is missing")
         require(result.get("usage", {}).get("completion_tokens", 0) > 0, "completion produced no tokens")
-        self.passed_case(f"single user over 2×context ({count} tokens), deterministic deletion, and completion reuse")
+        self.passed_case(f"single native user text over 2×context ({count} tokens), marked deletion, determinism, and completion reuse")
 
     def unicode_and_escapes(self):
         content = "Inspect these bytes.\n" + (
@@ -343,7 +456,7 @@ class Suite:
         response, after = self.compress(raw, self.target)
         require(len(response.raw) < len(raw), "Unicode case did not compress")
         result = after["messages"][1]["content"]
-        require(is_subsequence(result, content), "Unicode text was rewritten")
+        assert_marked_deletion(result, content)
         result.encode("utf-8", errors="strict")
         self.passed_case("literal UTF-8, surrogate escapes, quotes, and backslashes stay valid")
 
@@ -361,14 +474,14 @@ class Suite:
         assert_tool_closure(after["messages"])
         require(after["messages"][2] == messages[2], "short read call changed")
         result = after["messages"][3]["content"]
-        require(0 < len(result) < len(content) and is_subsequence(result, content), "large read result did not shrink by deletion")
-        self.passed_case("one large read result shrinks within its retained tool turn")
+        assert_marked_deletion(result, content)
+        self.passed_case("one large native read result shrinks internally with deletion markers")
 
     def long_write_arguments(self):
-        content = "// source begins\n" + ''.join(
+        content = MARKER + " // source begins\n" + ''.join(
             f'const char * value_{index} = "中文 😀 \\\\ cache";\n' for index in range(256)
-        ) + "// source ends\n"
-        argument_values = {"path": "src/cache.cpp", "content": content, "mode": "write"}
+        ) + "// source ends " + MARKER
+        argument_values = {"path": "src/" + MARKER + "cache.cpp", "content": content, "mode": "write"}
         arguments = json.dumps(argument_values, ensure_ascii=True, indent=2)
         call = tool_call("write_latest", "write", arguments)
         messages = [SYSTEM, {"role": "user", "content": "Write the source file, then explain the change."},
@@ -385,14 +498,17 @@ class Suite:
         expected_call["function"]["arguments"] = result_arguments
         require(after["messages"][2]["tool_calls"] == [expected_call], "write call metadata changed")
         require(after["messages"][3] == messages[3], "short write result changed")
-        require(is_subsequence(result_arguments.encode("utf-8"), arguments.encode("utf-8")),
-                "the inner arguments JSON was reserialized or rewritten")
+        marked_subsequence(result_arguments.encode("utf-8"), arguments.encode("utf-8"))
         result_values = decode_json(result_arguments.encode("utf-8"))
         assert_json_string_deletions(argument_values, result_values)
         require(result_values["path"] == argument_values["path"] and result_values["mode"] == "write",
                 "short write parameters changed")
-        require(0 < len(result_values["content"]) < len(content), "large write content did not shrink")
-        self.passed_case("large nested write content shrinks; JSON syntax, keys, and short values survive")
+        restored, _ = assert_marked_deletion(result_values["content"], content)
+        require(restored.startswith(MARKER) and restored.endswith(MARKER),
+                "original markers at the write-content edges were discarded")
+        require(result_arguments.count("\\u2421") == arguments.count("\\u2421"),
+                "original escaped argument markers were rewritten or removed")
+        self.passed_case("large nested write content has marked deletions; JSON syntax, original escaped markers, and short values survive")
 
     def parallel_tool_turns(self):
         instruction = {"role": "user", "content": "Inspect these file pairs, then explain the latest result."}
@@ -407,7 +523,11 @@ class Suite:
             ]
         body = request_body(messages, tools=[tool_definition("read")], parallel_tool_calls=True)
         original_count = self.client.prompt_tokens(body)
-        _, after = self.compress(encode_json(body), min(self.target, original_count // 2), original_count)
+        raw = encode_json(body)
+        response, after = self.compress(raw, min(self.target, original_count // 2), original_count)
+        require(is_subsequence(response.raw, raw), "whole-message deletion inserted bytes into JSON structure")
+        require(int(response.headers["x-compression-markers"]) == 0,
+                "whole-message deletion must not insert a marker into JSON structure")
         require(len(after["messages"]) < len(messages), "old tool exchanges under one user task were not removed")
         require(after["messages"][1] == instruction, "the current user task changed or disappeared")
         require(after["messages"][-3:] == messages[-3:], "the latest parallel tool exchange changed or disappeared")
@@ -441,9 +561,58 @@ class Suite:
         expected["reasoning_content"] = result
         require(after["messages"][-2] == expected, "non-reasoning assistant fields changed")
         require(after["messages"][-1] == messages[-1], "the short reasoning tool result changed")
-        require(0 < len(result) < len(content) and is_subsequence(result, content),
-                "large reasoning_content did not shrink by deletion")
-        self.passed_case("large reasoning_content in the current task can shrink")
+        assert_marked_deletion(result, content)
+        self.passed_case("large native reasoning content shrinks internally with deletion markers")
+
+    def original_markers(self):
+        content = MARKER + " Original opening.\n" + "".join(
+            f"trace {index % 13}: cached value unchanged; continue inspection.\n" for index in range(144)
+        ) + "Original ending. " + MARKER
+        system = {"role": "system", "content": "Keep this literal symbol intact: " + MARKER}
+        body = request_body([system, {"role": "user", "content": content}])
+        for ascii_only in (False, True):
+            raw = encode_json(body, ascii_only=ascii_only)
+            response, after = self.compress(raw, self.target)
+            result = after["messages"][1]["content"]
+            restored, inserted = assert_marked_deletion(result, content)
+            require(restored.startswith(MARKER) and restored.endswith(MARKER),
+                    "source alignment discarded an original edge marker")
+            require(restored.count(MARKER) == 2, "source alignment did not retain the two original text markers")
+            require(result.count(MARKER) == len(inserted) + 2, "text marker provenance is inconsistent")
+            require(after["messages"][0] == system, "the protected original marker changed")
+            if ascii_only:
+                require(response.raw.count(b"\\u2421") == raw.count(b"\\u2421"),
+                        "original escaped markers lost their exact JSON spelling")
+            _, raw_inserted = marked_subsequence(response.raw, raw)
+            require(int(response.headers["x-compression-markers"]) == len(raw_inserted),
+                    "the response marker count includes existing source markers")
+            require(int(response.headers["x-compression-tokens"]) <= self.target,
+                    "the final budget omitted marker tokens")
+        self.passed_case("inserted marker provenance preserves original literal and escaped markers")
+
+    def native_content_items(self):
+        parts = []
+        for name, word, repetitions in (("FIRST", "alpha", 91), ("SECOND", "beta", 117), ("THIRD", "gamma", 143)):
+            text = name + "_BEGIN " + ((word + " cached value unchanged; ") * repetitions) + " " + name + "_END"
+            parts.append({"type": "text", "text": text})
+        body = request_body([SYSTEM, {"role": "user", "content": parts}])
+        prompt = self.client.json_request("/apply-template", body)["prompt"]
+        positions = [prompt.index(name + "_BEGIN") for name in ("FIRST", "SECOND", "THIRD")]
+        require(positions == sorted(positions), "the fixture template reordered its native content items")
+        response, after = self.compress(encode_json(body), self.target)
+        result_parts = after["messages"][1]["content"]
+        require(len(result_parts) == len(parts), "native content item structure changed")
+        changed = 0
+        for name, original, result in zip(("FIRST", "SECOND", "THIRD"), parts, result_parts):
+            require(result["type"] == original["type"], "native content item type changed")
+            require(result["text"].startswith(name + "_BEGIN ") and result["text"].endswith(" " + name + "_END"),
+                    "native content items were reordered or their protected edges changed")
+            if result["text"] != original["text"]:
+                assert_marked_deletion(result["text"], original["text"])
+                changed += 1
+        require(changed > 0, "native content items were not compressed internally")
+        require(int(response.headers["x-compression-markers"]) > 0, "native item deletion has no marker")
+        self.passed_case("native text items keep their original output order while their interiors shrink")
 
     def strict_alternation(self):
         messages = [
@@ -459,7 +628,9 @@ class Suite:
         rejected = self.client.request("/apply-template", encode_json(invalid))
         require(rejected.status >= 400, "the strict test template must reject consecutive user messages")
         original_count = self.client.prompt_tokens(body)
-        _, after = self.compress(encode_json(body), original_count - 1, original_count)
+        raw = encode_json(body)
+        response, after = self.compress(raw, original_count - 1, original_count)
+        require(is_subsequence(response.raw, raw), "whole-pair deletion inserted bytes into JSON structure")
         result = after["messages"]
         require(0 < len(result) <= 3 and len(result) % 2 == 1,
                 "strict alternation requires deleting at least one whole message pair")
@@ -470,6 +641,8 @@ class Suite:
         self.passed_case("strict alternating template accepts the compressed request and keeps the latest user")
 
     def run(self):
+        check_marker_oracle()
+        print("PASS source-alignment oracle preserves original markers (no HTTP)", flush=True)
         self.fit_and_stream()
         self.bad_inputs()
         self.impossible_budget()
@@ -479,6 +652,8 @@ class Suite:
         self.long_write_arguments()
         self.parallel_tool_turns()
         self.long_reasoning_content()
+        self.original_markers()
+        self.native_content_items()
         self.strict_alternation()
         print(f"All {self.passed} compression HTTP cases passed.", flush=True)
 

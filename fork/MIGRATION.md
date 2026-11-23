@@ -1,3 +1,44 @@
+## 2026-11-23: Native content order and visible compression gaps
+
+PR #1 now follows the requested marker contract: a continuous deletion inside
+a string becomes `␡` (U+2421). All other returned bytes retain their original
+spelling and order. Whole-message removal remains structural erasure. The
+marker is counted through the real chat template and tokenizer, including when
+it occupies several model tokens. Selection also estimates the net cost when
+a gap starts, extends, or merges, rather than counting deleted tokens alone.
+Existing literal or escaped markers are
+ordinary source text; internal provenance records only new insertions.
+
+Scoring now uses two actual conditional streams. Native content items,
+assistant reasoning fields, and complete tool calls define the block order.
+The reverse pass reverses those blocks while keeping tokens inside each block
+in forward order. Protected text still supplies context. Both passes use the
+same local target ranges, so a different global window alignment cannot create
+a spurious difference inside a long block. The private stream helper has no
+model or scheduler ownership; queued SCORE tasks retain those responsibilities.
+
+Mean forward NLL minus reverse NLL is the primary ranking score. Forward NLL
+and then original source order break ties, including for a single native block
+whose two scoring streams are identical. Deletion spans follow token and
+Unicode/escape boundaries rather than fixed-size chunks. The existing
+32-token prefix/suffix protection is retained as a protection policy, not as a
+block definition. A large content item or write argument can still shrink
+internally. Tokenizers without a reversible source map retain that field
+internally instead of creating artificial code-point blocks.
+
+This remains an explicit server-private A exception. Its current contract and
+runtime limits are in [the server API](../tools/server/README.md#post-v1compress-compress-a-chat-completions-request).
+The two-pass score is a bounded-context heuristic, not exact PMI or proof of
+coding-task importance. Model-quality and GPU/TP5 qualification remain separate
+work. Current test evidence is recorded in the 2026-11-23 entry in
+[VALIDATION.md](VALIDATION.md).
+
+The 2026-11-22 entry below describes the initial implementation. Its pure
+deletion, fixed block, and forward-only scoring decisions are superseded by
+this update; its historical test observations retain their original identity.
+
+---
+
 ## 2026-11-22: Request compression in the original llama-server
 
 The requested consumer is `POST /v1/compress` in the existing server. It accepts

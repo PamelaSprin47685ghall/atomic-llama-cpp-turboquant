@@ -300,6 +300,81 @@ size_t source_boundary(const node & value, size_t offset) {
     return unit->source.begin;
 }
 
+void validate_range(const std::string & raw, const range & span) {
+    if (span.begin > span.end || span.end > raw.size()) {
+        throw std::invalid_argument("deletion range is outside the JSON source");
+    }
+}
+
+std::vector<range> merge_ranges(const std::string & raw, std::vector<range> ranges) {
+    for (const auto & span : ranges) {
+        validate_range(raw, span);
+    }
+    std::sort(ranges.begin(), ranges.end(), [](const range & left, const range & right) {
+        return left.begin < right.begin || (left.begin == right.begin && left.end < right.end);
+    });
+    size_t count = 0;
+    for (const auto span : ranges) {
+        if (span.begin == span.end) {
+            continue;
+        }
+        if (count != 0 && span.begin <= ranges[count - 1].end) {
+            ranges[count - 1].end = std::max(ranges[count - 1].end, span.end);
+        } else {
+            ranges[count++] = span;
+        }
+    }
+    ranges.resize(count);
+    return ranges;
+}
+
+void collect_string_values(const node & value, std::vector<const node *> & strings) {
+    if (value.type == kind::string) {
+        strings.push_back(&value);
+    } else {
+        // Object children contain values only. Keys cannot receive a marker.
+        for (const auto & child : value.children) {
+            collect_string_values(child, strings);
+        }
+    }
+}
+
+bool is_source_boundary(const node & value, size_t offset) {
+    if (offset == value.source.end - 1) {
+        return true;
+    }
+    const auto unit = std::lower_bound(value.units.begin(), value.units.end(), offset,
+                                      [](const string_unit & item, size_t position) {
+                                          return item.source.begin < position;
+                                      });
+    return unit != value.units.end() && unit->source.begin == offset;
+}
+
+void validate_string_ranges(const std::string & raw, const node & document, const std::vector<range> & ranges) {
+    std::vector<const node *> strings;
+    collect_string_values(document, strings);
+    for (const auto & span : ranges) {
+        validate_range(raw, span);
+        if (span.begin == span.end) {
+            continue;
+        }
+        auto it = std::upper_bound(strings.begin(), strings.end(), span.begin,
+                                   [](size_t position, const node * value) {
+                                       return position < value->source.begin;
+                                   });
+        if (it == strings.begin()) {
+            throw std::invalid_argument("marked deletion must stay inside a JSON string value");
+        }
+        const auto & value = **--it;
+        if (value.source.begin > value.source.end || value.source.end > raw.size() ||
+            value.source.end - value.source.begin < 2 || span.begin <= value.source.begin ||
+            span.end >= value.source.end || !is_source_boundary(value, span.begin) ||
+            !is_source_boundary(value, span.end)) {
+            throw std::invalid_argument("marked deletion must use complete JSON string code points");
+        }
+    }
+}
+
 } // namespace
 
 const node * node::find(const std::string & key) const {
@@ -326,14 +401,7 @@ range map_string_range(const node & value, size_t decoded_begin, size_t decoded_
 }
 
 std::string erase_ranges(const std::string & raw, std::vector<range> ranges) {
-    for (const auto & span : ranges) {
-        if (span.begin > span.end || span.end > raw.size()) {
-            throw std::invalid_argument("deletion range is outside the JSON source");
-        }
-    }
-    std::sort(ranges.begin(), ranges.end(), [](const range & left, const range & right) {
-        return left.begin < right.begin || (left.begin == right.begin && left.end < right.end);
-    });
+    ranges = merge_ranges(raw, std::move(ranges));
     std::string result;
     result.reserve(raw.size());
     size_t next = 0;
@@ -344,6 +412,54 @@ std::string erase_ranges(const std::string & raw, std::vector<range> ranges) {
         next = std::max(next, span.end);
     }
     result.append(raw, next, raw.size() - next);
+    return result;
+}
+
+deletion_result apply_deletions(const std::string & raw, const node & document,
+                               std::vector<range> structural, std::vector<range> string_ranges) {
+    validate_string_ranges(raw, document, string_ranges);
+    structural = merge_ranges(raw, std::move(structural));
+    string_ranges = merge_ranges(raw, std::move(string_ranges));
+    struct edit {
+        range source;
+        bool marker;
+    };
+    std::vector<edit> edits;
+    edits.reserve(structural.size() + string_ranges.size());
+    for (const auto & span : structural) {
+        edits.push_back({span, false});
+    }
+    size_t structural_index = 0;
+    for (const auto & span : string_ranges) {
+        while (structural_index < structural.size() && structural[structural_index].end <= span.begin) {
+            ++structural_index;
+        }
+        if (structural_index < structural.size() && structural[structural_index].begin < span.end) {
+            const auto & removed = structural[structural_index];
+            if (removed.begin <= span.begin && removed.end >= span.end) {
+                continue;
+            }
+            throw std::invalid_argument("structural deletion partially overlaps a marked string deletion");
+        }
+        edits.push_back({span, true});
+    }
+    std::sort(edits.begin(), edits.end(), [](const edit & left, const edit & right) {
+        return left.source.begin < right.source.begin;
+    });
+
+    deletion_result result;
+    result.text.reserve(raw.size());
+    size_t next = 0;
+    for (const auto & change : edits) {
+        result.text.append(raw, next, change.source.begin - next);
+        if (change.marker) {
+            const size_t begin = result.text.size();
+            result.text += "\xe2\x90\xa1";
+            result.markers.push_back({begin, result.text.size()});
+        }
+        next = change.source.end;
+    }
+    result.text.append(raw, next, raw.size() - next);
     return result;
 }
 

@@ -46,4 +46,21 @@ range map_string_range(const node & value, size_t decoded_begin, size_t decoded_
 // This function preserves source bytes; it does not validate the resulting JSON.
 std::string erase_ranges(const std::string & raw, std::vector<range> ranges);
 
+struct deletion_result {
+    std::string text;
+    // Output byte ranges for markers inserted by this operation only. Original
+    // literal or escaped U+2421 characters are not included.
+    std::vector<range> markers;
+};
+
+// Replace each continuous string deletion with UTF-8 U+2421 (the delete symbol).
+// document must be the tree parsed from raw. String ranges must use complete
+// code point/escape boundaries within a JSON string value, never a key.
+// Map nested argument ranges through the outer string before calling this.
+// Structural deletions are plain erasure and suppress markers they fully cover.
+// Partial overlap between structural and string deletions is an error.
+// Empty ranges do not insert markers. Errors use std::invalid_argument.
+deletion_result apply_deletions(const std::string & raw, const node & document,
+                               std::vector<range> structural, std::vector<range> string_ranges);
+
 } // namespace server_compress_json

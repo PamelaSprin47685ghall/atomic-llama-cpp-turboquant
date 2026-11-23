@@ -148,6 +148,134 @@ static void test_erase_ranges() {
     rejects([&] { erase_ranges(raw, {{0, std::numeric_limits<size_t>::max()}}); });
 }
 
+static void check_marker_provenance(const deletion_result & result, const std::string & raw) {
+    size_t previous_end = 0;
+    for (const auto & marker : result.markers) {
+        require(marker.begin >= previous_end && marker.end <= result.text.size(), "ordered marker provenance");
+        require(result.text.substr(marker.begin, marker.end - marker.begin) == "␡", "inserted marker spelling");
+        previous_end = marker.end;
+    }
+    require(is_subsequence(erase_ranges(result.text, result.markers), raw),
+            "removing only inserted markers leaves original source bytes");
+}
+
+static void test_marked_deletions() {
+    const std::string raw = R"json( { "text" : "ABCDEFGHIJ", "untouched":"\u2421" } )json";
+    const auto root = parse(raw);
+    const auto & value = member(root, "text");
+    const auto result = apply_deletions(raw, root, {}, {
+        map_string_range(value, 6, 8), map_string_range(value, 2, 4),
+        map_string_range(value, 3, 6), map_string_range(value, 2, 4),
+    });
+    require(result.text == R"json( { "text" : "AB␡IJ", "untouched":"\u2421" } )json",
+            "overlapping and adjacent string deletions use one marker");
+    require(result.markers.size() == 1, "one continuous deletion has one inserted marker");
+    check_marker_provenance(result, raw);
+
+    const auto unchanged = apply_deletions(raw, root, {}, {{0, 0}, {raw.size(), raw.size()}});
+    require(unchanged.text == raw && unchanged.markers.empty(), "empty edits keep exact bytes");
+    const auto whole = apply_deletions(raw, root, {}, {map_string_range(value, 0, value.text.size())});
+    require(member(parse(whole.text), "text").text == "␡", "whole string deletion retains a marker value");
+    check_marker_provenance(whole, raw);
+}
+
+static void test_marker_collision() {
+    const std::string raw = R"json({"text":"left␡right","escaped":"\u2421"})json";
+    const auto root = parse(raw);
+    const auto & value = member(root, "text");
+    const auto result = apply_deletions(raw, root, {}, {
+        map_string_range(value, 0, 4), map_string_range(value, 7, value.text.size()),
+    });
+    require(member(parse(result.text), "text").text == "␡␡␡", "literal user marker remains between inserted markers");
+    require(result.markers.size() == 2, "provenance excludes the original marker");
+    const auto restored = erase_ranges(result.text, result.markers);
+    require(restored == R"json({"text":"␡","escaped":"\u2421"})json",
+            "provenance retains literal and escaped user markers");
+    check_marker_provenance(result, raw);
+
+    const std::string escaped_raw = R"json({"text":"left\u2421right"})json";
+    const auto escaped_root = parse(escaped_raw);
+    const auto & escaped_value = member(escaped_root, "text");
+    const auto escaped_result = apply_deletions(escaped_raw, escaped_root, {}, {
+        map_string_range(escaped_value, 0, 4), map_string_range(escaped_value, 7, escaped_value.text.size()),
+    });
+    require(escaped_result.text == R"json({"text":"␡\u2421␡"})json",
+            "adjacent markers do not change the user's original escape spelling");
+    require(escaped_result.markers.size() == 2 &&
+            erase_ranges(escaped_result.text, escaped_result.markers) == R"json({"text":"\u2421"})json",
+            "provenance excludes an escaped user marker in the same string");
+    check_marker_provenance(escaped_result, escaped_raw);
+}
+
+static void test_nested_marked_deletions() {
+    const std::string raw = R"json({"arguments":"{ \"path\":\"src/x.cpp\", \"content\":\"keep ␡ A\\n\\uD83D\\uDE00\\\" drop tail\", \"mode\":1 }"})json";
+    const auto root = parse(raw);
+    const auto & outer = member(root, "arguments");
+    const auto inner = parse(outer.text);
+    const auto & value = member(inner, "content");
+    const size_t begin = value.text.find("A\n");
+    const size_t end = value.text.find(" tail");
+    require(begin != std::string::npos && end != std::string::npos, "nested test boundaries");
+    const auto inner_span = map_string_range(value, begin, end);
+    const auto span = map_string_range(outer, inner_span.begin, inner_span.end);
+    const auto result = apply_deletions(raw, root, {}, {span});
+    const auto final_root = parse(result.text);
+    const auto final_inner = parse(member(final_root, "arguments").text);
+    require(member(final_inner, "content").text == "keep ␡ ␡ tail", "nested marker keeps both JSON layers valid");
+    require(member(final_inner, "path").text == "src/x.cpp" && member(final_inner, "mode").text == "1",
+            "nested marker leaves other arguments unchanged");
+    require(result.markers.size() == 1, "one nested marker has one outer provenance span");
+    check_marker_provenance(result, raw);
+}
+
+static void test_structural_and_marked_deletions() {
+    const std::string raw = R"json({"messages":[{"content":"old text"},{"content":"keep more tail"}]})json";
+    const auto root = parse(raw);
+    const auto & messages = member(root, "messages").children;
+    const auto & old_text = member(messages[0], "content");
+    const auto & new_text = member(messages[1], "content");
+    const range old_message = {messages[0].source.begin, messages[1].source.begin};
+    const auto result = apply_deletions(raw, root, {old_message}, {
+        map_string_range(old_text, 0, old_text.text.size()), map_string_range(new_text, 5, 9),
+    });
+    require(result.text == R"json({"messages":[{"content":"keep ␡ tail"}]})json",
+            "structural deletion does not leave a marker outside a string");
+    require(result.markers.size() == 1, "structural deletion suppresses covered markers");
+    check_marker_provenance(result, raw);
+    const auto structural_only = apply_deletions(raw, root, {old_message}, {});
+    require(structural_only.text == erase_ranges(raw, {old_message}) && structural_only.markers.empty(),
+            "structural deletions remain pure erasure");
+    const auto span = map_string_range(new_text, 5, 9);
+    rejects([&] { apply_deletions(raw, root, {{span.begin + 1, span.end}}, {span}); });
+    rejects([&] { apply_deletions(raw, root, {{span.begin, span.end - 1}}, {span}); });
+}
+
+static void test_marked_range_validation() {
+    const std::string raw = R"json({"text":"a\uD83D\uDE00éz","other":"tail","number":17})json";
+    const auto root = parse(raw);
+    const auto & value = member(root, "text");
+    const auto & other = member(root, "other");
+    const auto & number = member(root, "number");
+    const auto adjacent = apply_deletions(raw, root, {}, {value.units[2].source, value.units[1].source});
+    require(member(parse(adjacent.text), "text").text == "a␡z" && adjacent.markers.size() == 1,
+            "adjacent UTF-8 and surrogate-pair units merge into one deletion");
+    check_marker_provenance(adjacent, raw);
+    rejects([&] { apply_deletions(raw, root, {}, {value.source}); });
+    rejects([&] { apply_deletions(raw, root, {}, {{2, 5}}); }); // object key
+    rejects([&] { apply_deletions(raw, root, {}, {number.source}); });
+    rejects([&] { apply_deletions(raw, root, {}, {{value.units[0].source.begin, other.units[0].source.end}}); });
+    rejects([&] { apply_deletions(raw, root, {}, {{value.units[1].source.begin, value.units[1].source.end - 1}}); });
+    rejects([&] { apply_deletions(raw, root, {}, {{value.units[1].source.begin + 6, value.units[1].source.end}}); });
+    rejects([&] { apply_deletions(raw, root, {}, {
+        {value.units[1].source.begin, value.units[1].source.begin + 6},
+        {value.units[1].source.begin + 6, value.units[1].source.end},
+    }); });
+    rejects([&] { apply_deletions(raw, root, {}, {{value.units[2].source.begin + 1, value.units[2].source.end}}); });
+    rejects([&] { apply_deletions(raw, root, {}, {{3, 2}}); });
+    rejects([&] { apply_deletions(raw, root, {}, {{0, raw.size() + 1}}); });
+    rejects([&] { apply_deletions(raw, root, {{0, raw.size() + 1}}, {}); });
+}
+
 static void test_invalid_json() {
     const std::vector<std::string> invalid = {
         "", " ", "{}{}", "[] true", "nul", "TRUE", "undefined", "NaN", "Infinity",
@@ -185,6 +313,11 @@ int main() {
         test_string_units();
         test_nested_arguments_mapping();
         test_erase_ranges();
+        test_marked_deletions();
+        test_marker_collision();
+        test_nested_marked_deletions();
+        test_structural_and_marked_deletions();
+        test_marked_range_validation();
         test_invalid_json();
         test_depth_bound();
         std::cout << "compression JSON tests passed\n";

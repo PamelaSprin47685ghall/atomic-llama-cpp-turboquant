@@ -1,3 +1,89 @@
+## 2026-11-23: Native content reversal and U+2421 deletion markers
+
+This update to PR #1 replaces the initial fixed-block, forward-only selector
+with two native-content scoring streams and visible string deletion markers.
+The preceding PR head was `b72f89d645a70665dd8c5d6cc3aa567a62a2a6d9`;
+the base branch remains `feat/p5-conservative-20261111`. The current contract is
+in [the server API](../tools/server/README.md#post-v1compress-compress-a-chat-completions-request).
+Exact current A source digests are recorded in `upstream-exceptions.json`.
+
+The final Linux CPU Release build passed. All four selected CTests passed
+(4/4, 7.51 seconds), as did all twelve standalone HTTP groups and the
+runner's source-alignment oracle self-test. The fixture was the same
+`ggml-org/models` `tinyllamas/stories260K.gguf`, SHA-256
+`270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d`.
+
+| Acceptance | Final observation |
+| --- | --- |
+| Marked source edits | `test-compress-json` passed: complete Unicode/escape boundaries, merged deletion gaps, nested JSON mapping, structural erasure, rejected partial overlaps, and exact provenance of newly inserted markers |
+| Native plan and ranking | `test-server-compress` passed with the real GGUF tokenizer and controlled scores: native content/reasoning/tool-call boundaries, large single-block internal edits, argument keys and short values, paired-score ordering, explicit single-block forward fallback, and atomic tool-group deletion |
+| Actual reversed conditioning | `test-server-score` matched four short forward/reverse streams to independent single-token C API evaluations. Holding block A fixed and changing later block B left A's forward scores unchanged and changed its reverse scores, with maximum NLL difference `6.738942` |
+| Capacity windows | One 97-token native block crossed 32-token test windows without changing its internal order. A long middle block with different-length neighbors had identical deep-window input and losses in both directions; global window phase did not create a false contrast |
+| Existing SCORE runtime | Independent NLL, 0/1/32/33/65/97/full-context cases, over-context refusal, unified-KV isolation, cancellation, and subsequent inference passed again |
+| Model lifetime | `test-server-model-activity` passed again: activity ownership prevents sleep and waits for completed wake-up |
+| Real HTTP contract | 12/12 groups passed: unchanged raw requests, invalid requests, infeasible budgets, huge user/read/write/reasoning text, Unicode and nested escapes, native content item order, marker collisions, tool closure, and strict role alternation |
+| Budget and reuse | Every successful HTTP result was independently formatted by `/apply-template` and counted with `/tokenize`, including all markers. Repeated compression returned identical bytes on the fixture; a returned request generated tokens through `/v1/chat/completions` |
+
+The actual renderer provenance tests distinguish original `␡` characters and
+`\u2421` escapes from newly inserted markers. HTTP source-alignment checks
+establish a legal copy/delete/marker-insertion witness without globally
+stripping marker characters. Retained message, content-item, and tool argument
+order is checked separately from the model's reversed scoring order.
+
+Final HTTP observations below use a target of 1,024 prompt tokens. These are
+synthetic protocol fixtures, not measurements of coding-task answer quality.
+
+| Fixture | Original → returned tokens | New markers | Scoring windows, both passes |
+| --- | ---: | ---: | ---: |
+| Single large user content | 8,608 → 864 | 156 | 38 |
+| Unicode and escape content | 7,810 → 880 | 144 | 36 |
+| Large read result | 10,667 → 938 | 82 | 50 |
+| Large nested write arguments | 12,777 → 1,021 | 85 | 74 |
+| One-user tool loop | 3,469 → 903 | 0 | 100 |
+| Large reasoning field | 11,699 → 936 | 85 | 58 |
+| Existing literal/escaped markers, both encodings | 6,056 → 874 | 149 | 28 |
+| Three native text items | 7,865 → 885 | 139 | 38 |
+
+The tool loop retained 8 of its original 38 messages with tool relationships
+intact. The strict-alternation fixture went from 137 to 89 tokens for a target
+of 136 by removing a whole pair. Already-fitting requests stayed at 176 tokens
+with zero scoring windows and zero new markers.
+
+An earlier candidate in this update passed protocol checks but over-deleted:
+the user fixture fell from 8,608 to 168 tokens because batch estimates counted
+removed tokens without the new marker cost. The final selector estimates the
+net saving when gaps start, extend, or merge, and adjusts whole-group estimates
+for previous internal edits. All HTTP groups were rerun after that correction;
+only the final observations appear in the table. Exact template recounting
+remains the acceptance gate because tokenizer costs are not additive.
+
+The JSON helper passed an independent ASan + UBSan run with
+`ASAN_OPTIONS=detect_leaks=0`; the environment's ptrace limitation still excludes
+LeakSanitizer. No GPU/TP5, model-quality, latency, or all-tokenizer qualification
+is claimed. The two-pass score uses bounded context and is a conditional-NLL
+heuristic, not exact PMI. Separate markers can consume a significant fraction
+of a small budget, as the table illustrates.
+
+Reproduce with a local fixture and the build options in the 2026-11-22 record:
+
+```sh
+cmake --build build --target llama-server test-compress-json test-server-score test-server-compress -j 4
+LLAMA_TEST_MODEL=/path/to/stories260K.gguf \
+  ctest --test-dir build \
+  -R '^(test-compress-json|test-server-compress|test-server-score|test-server-model-activity)$' \
+  --output-on-failure
+python3 tools/server/tests/test_compress_standalone.py \
+  --binary build/bin/llama-server --model /path/to/stories260K.gguf
+python3 fork/check-upstream.py > build/compress-boundary.json
+git diff --check
+```
+
+The 2026-11-22 observations below retain their historical identity. Their
+pure-subsequence contract and forward-only selection describe the preceding
+version; they are superseded by the current marker and native-block contract.
+
+---
+
 ## 2026-11-22: `/v1/compress` request and runtime validation
 
 Base: `feat/p5-conservative-20261111` at

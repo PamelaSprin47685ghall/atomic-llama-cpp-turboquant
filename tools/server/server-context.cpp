@@ -2,6 +2,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-compress.h"
+#include "server-compress-stream.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -6136,9 +6137,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_compress(const serve
         }
         size_t scored_tokens = 0;
         size_t score_windows = 0;
-        auto finish = [&](std::string raw, size_t tokens, const std::string & method) {
+        auto finish = [&](std::string raw, size_t tokens, const std::string & method, size_t markers) {
             res->status = 200;
-            // Do not dump JSON here. The response must be an original-byte subsequence.
+            // Keep source spelling and order. Only deletion markers add bytes.
             res->data = std::move(raw);
             res->headers["X-Compression-Original-Tokens"] = std::to_string(original);
             res->headers["X-Compression-Tokens"] = std::to_string(tokens);
@@ -6147,9 +6148,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_compress(const serve
             res->headers["X-Compression-Scored-Tokens"] = std::to_string(scored_tokens);
             res->headers["X-Compression-Score-Windows"] = std::to_string(score_windows);
             res->headers["X-Compression-Removed-Messages"] = std::to_string(plan.removed_messages());
+            res->headers["X-Compression-Markers"] = std::to_string(markers);
         };
         if (original <= target) {
-            finish(req.body, original, "unchanged");
+            finish(req.body, original, "unchanged", 0);
             return res;
         }
 
@@ -6160,7 +6162,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_compress(const serve
             // This counts the maximally pruned candidate, not a mathematical
             // lower bound: tokenization can change at each deletion boundary.
             size_t minimum = 0;
-            error["minimum_tokens"] = count_candidate(plan.minimum(), minimum) ? json(minimum) : json(nullptr);
+            error["minimum_tokens"] = count_candidate(plan.minimum().text, minimum) ? json(minimum) : json(nullptr);
             error["target_tokens"] = target;
             res->error(error);
         };
@@ -6173,29 +6175,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_compress(const serve
         const size_t overlap = std::min(size_t(32), window_size / 4);
         const llama_token bos = llama_vocab_bos(ctx_server.vocab);
         const bool add_bos = llama_vocab_get_add_bos(ctx_server.vocab) && bos != LLAMA_TOKEN_NULL;
-        for (size_t field = 0; field < plan.texts().size(); ++field) {
-            if (!plan.needs_scores(field)) {
-                continue;
-            }
-            const auto & tokens = plan.texts()[field].tokens;
-            for (size_t begin = 0; begin < tokens.size();) {
+        const auto separator = common_tokenize(ctx_server.vocab, "\n\n", false, false);
+        for (bool reverse : {false, true}) {
+            server_compress_stream stream(plan.texts(), separator, window_size, overlap,
+                                          add_bos ? bos : LLAMA_TOKEN_NULL, reverse);
+            server_compress_window window;
+            while (stream.next(window)) {
                 if (req.should_stop()) {
                     return res;
                 }
-                const size_t left = begin - std::min(begin, overlap);
-                const size_t end = std::min(tokens.size(), left + window_size - size_t(add_bos));
-                llama_tokens window;
-                window.reserve(end - left + size_t(add_bos));
-                if (add_bos) {
-                    window.push_back(bos);
-                }
-                window.insert(window.end(), tokens.begin() + left, tokens.begin() + end);
-
                 // One reader per window bounds queued work and owns cancellation.
                 server_response_reader reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
                 server_task task(SERVER_TASK_TYPE_SCORE);
                 task.id = reader.get_new_id();
-                task.tokens = server_tokens(window, false);
+                task.tokens = server_tokens(window.tokens, false);
                 reader.post_task(std::move(task));
                 auto result = reader.next(req.should_stop);
                 if (!result) {
@@ -6206,21 +6199,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_compress(const serve
                     return res;
                 }
                 const auto * score = dynamic_cast<server_task_result_score *>(result.get());
-                if (!score || score->nll.size() != window.size()) {
+                if (!score || score->nll.size() != window.tokens.size()) {
                     throw std::runtime_error("compression received an invalid score result");
                 }
-                const size_t offset = begin - left + size_t(add_bos);
-                const std::vector<float> losses(score->nll.begin() + offset, score->nll.end());
-                plan.add_scores(field, begin, losses);
+                const std::vector<float> losses(score->nll.begin() + window.score_offset, score->nll.end());
+                plan.add_scores(window.text_index, window.begin, losses, reverse);
                 scored_tokens += std::count_if(losses.begin(), losses.end(), [](float loss) { return std::isfinite(loss); });
                 ++score_windows;
-                begin = end;
             }
         }
 
         plan.rank();
         size_t current = original;
-        std::string output = req.body;
+        server_compress_json::deletion_result output{req.body, {}};
         while (current > target) {
             if (req.should_stop()) {
                 return res;
@@ -6231,12 +6222,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_compress(const serve
                 return res;
             }
             output = plan.render();
-            if (!count_candidate(output, current)) {
+            if (!count_candidate(output.text, current)) {
                 // Remove one more action at a time until the template accepts.
                 current = target + 1;
             }
         }
-        finish(std::move(output), current, "windowed-nll");
+        finish(std::move(output.text), current, "content-bidirectional-nll", output.markers.size());
     } catch (const std::invalid_argument & error) {
         res->error(format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
     } catch (const json::exception & error) {

@@ -2,6 +2,7 @@
 // Run with a small decoder GGUF as argv[1] or LLAMA_TEST_MODEL.
 
 #include "server-context.h"
+#include "server-compress-stream.h"
 #include "server-queue.h"
 #include "server-task.h"
 
@@ -165,6 +166,105 @@ static void test_queue_activity() {
     }
 }
 
+using stream_text = server_compress_plan::text;
+using stream_losses = std::vector<std::vector<float>>;
+
+static stream_text make_text(llama_tokens tokens) {
+    stream_text text;
+    text.tokens = std::move(tokens);
+    return text;
+}
+
+static void compare_losses(const std::vector<float> & actual, const std::vector<float> & expected) {
+    require(actual.size() == expected.size(), "mapped stream score count is wrong");
+    for (size_t i = 0; i < actual.size(); ++i) {
+        if (std::isnan(expected[i])) {
+            require(std::isnan(actual[i]), "a stream token without a predecessor must have no score");
+        } else {
+            const float tolerance = 2e-3f + 1e-4f * std::abs(expected[i]);
+            require(std::isfinite(actual[i]) && std::abs(actual[i] - expected[i]) <= tolerance,
+                    "mapped stream score differs from the causal reference");
+        }
+    }
+}
+
+static stream_losses reference_stream(llama_context * ctx, const std::vector<stream_text> & texts,
+        const llama_tokens & separator, llama_token bos, bool reverse) {
+    // Evaluate the complete short stream one token at a time. This reference
+    // does not use the production window helper or reset at text boundaries.
+    llama_tokens stream;
+    if (bos != LLAMA_TOKEN_NULL) {
+        stream.push_back(bos);
+    }
+    std::vector<size_t> starts(texts.size(), 0);
+    bool first = true;
+    for (size_t i = 0; i < texts.size(); ++i) {
+        const size_t index = reverse ? texts.size() - i - 1 : i;
+        const auto & tokens = texts[index].tokens;
+        if (tokens.empty()) {
+            continue;
+        }
+        if (!first) {
+            stream.insert(stream.end(), separator.begin(), separator.end());
+        }
+        first = false;
+        starts[index] = stream.size();
+        stream.insert(stream.end(), tokens.begin(), tokens.end());
+    }
+    require(stream.size() <= llama_n_ctx(ctx), "reference stream exceeds the test context");
+    const auto losses = reference_scores(ctx, stream);
+    stream_losses result;
+    for (size_t i = 0; i < texts.size(); ++i) {
+        result.emplace_back(losses.begin() + starts[i], losses.begin() + starts[i] + texts[i].tokens.size());
+    }
+    return result;
+}
+
+static stream_losses score_stream(server_context & server, const std::vector<stream_text> & texts,
+        const llama_tokens & separator, size_t capacity, size_t overlap, llama_token bos, bool reverse) {
+    server_compress_stream stream(texts, separator, capacity, overlap, bos, reverse);
+    server_compress_window window;
+    stream_losses result;
+    std::vector<size_t> received(texts.size(), 0);
+    for (const auto & text : texts) {
+        result.emplace_back(text.tokens.size(), std::numeric_limits<float>::quiet_NaN());
+    }
+    while (stream.next(window)) {
+        require(window.tokens.size() <= capacity, "stream window exceeds inference capacity");
+        require(window.score_offset < window.tokens.size(), "stream window has no target tokens");
+        require(window.begin == received.at(window.text_index), "stream targets skipped or repeated source tokens");
+        const size_t count = window.tokens.size() - window.score_offset;
+        const auto & original = texts.at(window.text_index).tokens;
+        require(window.begin + count <= original.size(), "stream target leaves its natural text block");
+        require(std::equal(window.tokens.begin() + window.score_offset, window.tokens.end(), original.begin() + window.begin),
+                "stream changed the token order inside a natural block");
+
+        auto reader = server.get_response_reader();
+        reader.post_task(make_task(reader, SERVER_TASK_TYPE_SCORE, window.tokens));
+        auto raw = reader.next(deadline());
+        require(raw && !raw->is_error(), "stream score task failed");
+        const auto * score = dynamic_cast<server_task_result_score *>(raw.get());
+        require(score && score->nll.size() == window.tokens.size(), "stream score result has the wrong shape");
+        std::copy(score->nll.begin() + window.score_offset, score->nll.end(), result[window.text_index].begin() + window.begin);
+        received[window.text_index] += count;
+    }
+    for (size_t i = 0; i < texts.size(); ++i) {
+        require(received[i] == texts[i].tokens.size(), "stream omitted a natural text block");
+    }
+    return result;
+}
+
+static std::vector<server_compress_window> stream_windows(const std::vector<stream_text> & texts,
+        const llama_tokens & separator, size_t capacity, size_t overlap, llama_token bos, bool reverse) {
+    server_compress_stream stream(texts, separator, capacity, overlap, bos, reverse);
+    std::vector<server_compress_window> result;
+    server_compress_window window;
+    while (stream.next(window)) {
+        result.push_back(window);
+    }
+    return result;
+}
+
 static void test_scores(const char * model_path) {
     common_params params;
     params.model.path = model_path;
@@ -203,7 +303,92 @@ static void test_scores(const char * model_path) {
         expected.push_back(reference_scores(ctx, windows.back()));
     }
 
+    const llama_tokens separator = common_tokenize(vocab, "\n\n", false, false);
+    const llama_token bos = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : LLAMA_TOKEN_NULL;
+    const auto a = common_tokenize(vocab, "The little fox found a red book. The book had many stories.", false, false);
+    const auto b = common_tokenize(vocab, "The red book belonged to the little fox. He read it every day.", false, false);
+    const auto alternative = common_tokenize(vocab, "A big bear played with a blue ball beside a lake.", false, false);
+    require(!a.empty() && !b.empty() && !alternative.empty(), "stream test tokenization failed");
+    std::vector<stream_text> texts = {make_text(a), make_text({}), make_text(b)};
+    auto changed = texts;
+    for (size_t i = 0; i < b.size(); ++i) {
+        changed[2].tokens[i] = alternative[i % alternative.size()];
+    }
+    require(changed[2].tokens != texts[2].tokens, "context fixture did not change its tokens");
+    const auto forward_reference = reference_stream(ctx, texts, separator, bos, false);
+    const auto reverse_reference = reference_stream(ctx, texts, separator, bos, true);
+    const auto changed_forward_reference = reference_stream(ctx, changed, separator, bos, false);
+    const auto changed_reverse_reference = reference_stream(ctx, changed, separator, bos, true);
+
     running_server loop(server);
+    {
+        const auto forward = score_stream(server, texts, separator, n_ctx, 32, bos, false);
+        const auto reverse = score_stream(server, texts, separator, n_ctx, 32, bos, true);
+        const auto changed_forward = score_stream(server, changed, separator, n_ctx, 32, bos, false);
+        const auto changed_reverse = score_stream(server, changed, separator, n_ctx, 32, bos, true);
+        for (size_t i = 0; i < texts.size(); ++i) {
+            compare_losses(forward[i], forward_reference[i]);
+            compare_losses(reverse[i], reverse_reference[i]);
+            compare_losses(changed_forward[i], changed_forward_reference[i]);
+            compare_losses(changed_reverse[i], changed_reverse_reference[i]);
+        }
+        // A is unchanged. B can affect A only when block reversal puts B first.
+        // Do not assume the small fixture model understands any semantic ranking.
+        compare_losses(forward[0], changed_forward[0]);
+        float context_difference = 0.0f;
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (std::isfinite(reverse[0][i]) && std::isfinite(changed_reverse[0][i])) {
+                context_difference = std::max(context_difference, std::abs(reverse[0][i] - changed_reverse[0][i]));
+            }
+        }
+        require(context_difference > 1e-4f, "reversed scoring did not use the preceding natural block");
+        std::printf("SERVER_COMPRESS_STREAM_CONTEXT_DELTA %.6f\n", context_difference);
+    }
+    {
+        const std::vector<stream_text> single = {make_text(windows[5])};
+        const auto forward_windows = stream_windows(single, separator, 32, 8, bos, false);
+        const auto reverse_windows = stream_windows(single, separator, 32, 8, bos, true);
+        require(forward_windows.size() > 1 && forward_windows.size() == reverse_windows.size(),
+                "long block did not cross inference windows");
+        for (size_t i = 0; i < forward_windows.size(); ++i) {
+            require(forward_windows[i].tokens == reverse_windows[i].tokens &&
+                    forward_windows[i].begin == reverse_windows[i].begin &&
+                    forward_windows[i].score_offset == reverse_windows[i].score_offset,
+                    "reversing one natural block reversed or realigned its capacity chunks");
+        }
+        const auto forward = score_stream(server, single, separator, 32, 8, bos, false);
+        const auto reverse = score_stream(server, single, separator, 32, 8, bos, true);
+        compare_losses(forward[0], reverse[0]);
+
+        // Different neighbor lengths must not change the local window phase.
+        // Once a window's prefix lies wholly inside the long middle block,
+        // forward and reverse receive exactly the same model input.
+        const std::vector<stream_text> surrounded = {
+            make_text(llama_tokens(tokens.begin(), tokens.begin() + 3)),
+            make_text(windows[5]),
+            make_text(llama_tokens(tokens.begin() + 17, tokens.begin() + 34)),
+        };
+        const auto surrounded_forward = stream_windows(surrounded, separator, 32, 8, bos, false);
+        const auto surrounded_reverse = stream_windows(surrounded, separator, 32, 8, bos, true);
+        size_t checked = 0;
+        for (const auto & window : surrounded_forward) {
+            if (window.text_index != 1 || window.begin < 32) {
+                continue;
+            }
+            const auto match = std::find_if(surrounded_reverse.begin(), surrounded_reverse.end(), [&](const server_compress_window & other) {
+                return other.text_index == 1 && other.begin == window.begin;
+            });
+            require(match != surrounded_reverse.end() && match->tokens == window.tokens && match->score_offset == window.score_offset,
+                    "window phase created a false forward/reverse contrast inside a long block");
+            ++checked;
+        }
+        require(checked != 0, "phase test did not reach the interior of its long block");
+        const auto surrounded_forward_scores = score_stream(server, surrounded, separator, 32, 8, bos, false);
+        const auto surrounded_reverse_scores = score_stream(server, surrounded, separator, 32, 8, bos, true);
+        compare_losses(
+            std::vector<float>(surrounded_forward_scores[1].begin() + 32, surrounded_forward_scores[1].end()),
+            std::vector<float>(surrounded_reverse_scores[1].begin() + 32, surrounded_reverse_scores[1].end()));
+    }
     {
         auto reader = server.get_response_reader();
         std::vector<server_task> tasks;
