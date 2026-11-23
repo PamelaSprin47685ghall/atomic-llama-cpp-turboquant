@@ -1397,6 +1397,185 @@ The server supports parsing and returning reasoning via the `reasoning_content` 
 
 Reasoning input (preserve reasoning in history) is also supported by some specific templates. For more details, please refer to [PR#18994](https://github.com/ggml-org/llama.cpp/pull/18994).
 
+### POST `/v1/compress`: Compress a Chat Completions request
+
+Accepts the complete JSON body of a `/v1/chat/completions` request. Returns a
+smaller request of the same format. It deletes source ranges and inserts **`␡`
+(U+2421, SYMBOL FOR DELETE)** at each continuous deletion inside a string. Apart
+from those marker insertions, the returned bytes are a subsequence of the
+original HTTP body. Retained JSON spelling, message and content order,
+whitespace, and escapes stay unchanged. It adds no summary or metadata to the
+body. Whole-message deletions are structural erasures; they do not insert a
+marker outside JSON strings or create a placeholder message.
+
+Set `target_tokens` in the query string. It must be a positive integer. The
+default is half the original prompt token count, rounded up. The budget counts
+the prompt after the loaded model's actual chat template, including tool schemas,
+deletion markers, and special tokens. `␡` is an ordinary Unicode character and
+can occupy multiple model tokens. The budget does not include future generated tokens. Reserve space
+for generation when choosing the budget. If the original prompt fits, the body
+is returned byte-for-byte unchanged without model scoring.
+
+```sh
+curl --fail-with-body http://localhost:8080/v1/compress?target_tokens=8192 \
+  -H 'Content-Type: application/json' \
+  --data-binary @request.json \
+  -D compression-headers.txt \
+  -o compressed-request.json
+
+curl --fail-with-body http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  --data-binary @compressed-request.json
+```
+
+The endpoint uses the existing authentication and model router. Add the normal
+authorization header if the server requires an API key. `/v1/compress` itself
+returns one JSON response, including when the preserved request has `stream:true`.
+It does not generate an answer or execute any tools.
+
+**What can be deleted**
+
+- Historical messages can be removed. An assistant's tool calls and all their
+  matching results form one indivisible group, including parallel calls and
+  links across other messages. Legacy `function_call` and `function` messages
+  are also linked. An ordinary user message and its immediate ordinary
+  assistant reply form a pair; other ordinary messages stand alone. A long tool
+  loop after a single user instruction can therefore shed old tool exchanges.
+- `system` and `developer` messages stay intact. The latest user message and the
+  final message group retain their shells and tool identities. Large text
+  inside those messages can still shrink.
+- Text `content`, `content` parts of type `text`, and assistant
+  `reasoning_content` can shrink internally, including a single large content
+  item. Deletion units use the smallest spans whose ends are both model-token
+  and complete Unicode boundaries; there is no fixed token block size. The
+  existing protection policy keeps each field's first and last 32 tokens,
+  extending to safe boundaries. Short fields stay intact unless their whole
+  historical group is removed. Adjacent removed units produce one `␡`.
+- Valid JSON inside `function.arguments` is handled as a second source map.
+  Only its string **values** can shrink. Keys, short string values such as paths,
+  numbers, booleans, array structure, and JSON syntax stay intact. Opaque or
+  incomplete argument JSON stays intact within a retained message. This permits
+  compression inside a single large write call as well as a large read result.
+- Non-message top-level fields, including `model`, `tools`, generation settings,
+  and unknown extension fields, stay intact. Other message fields and non-text
+  content parts stay intact within each retained message.
+
+**How text is selected**
+
+Scoring uses the request's native structure. A string `content` is one block;
+each text item in a `content` array is a separate block. An assistant's
+`reasoning_content` is one block, before its visible content. Each tool call is
+one block containing its name and complete argument JSON, including keys and
+short values. Argument string leaves are editable regions, not separately
+reversed blocks. Messages follow their original order; within one assistant,
+the scoring order is reasoning, visible content items, then tool calls. The
+Chat Completions parser does not accept Anthropic-style `type:"thinking"`
+content items; use the formats supported by `/v1/chat/completions`.
+
+The model computes next-token negative log likelihood (NLL) in two passes:
+
+- Forward: native blocks `C1, C2, ..., Cn`.
+- Reverse: native blocks `Cn, ..., C2, C1`, with **all tokens inside each block
+  still in their original order**.
+
+Protected text also supplies scoring context. Two newlines separate blocks in
+the scoring input only. Scores are mapped back to the original source; returned
+messages and content items are never reversed. Mean `forward NLL - reverse NLL`
+ranks editable spans and removable historical groups, with the lowest score
+removed first. Mean forward NLL breaks ties, then original source order. For a
+single native block, both passes have the same input, so the forward-NLL tie
+break still permits internal compression. This is a bidirectional conditional
+NLL heuristic, not exact PMI or a causal importance measurement.
+
+The server task queue evaluates windows of at most 512 tokens (or the slot
+context, if smaller). The two passes use the same local target ranges within
+each native block. Each window takes its preceding context from the correctly
+ordered block stream, with up to 32 tokens reserved for overlap on full target
+windows and more prefix context when a target is short. Capacity windows are
+only an inference limit: they never become reversal or deletion blocks. This
+also prevents different window alignments from creating artificial score
+differences inside a long content item. Each finite target loss is counted once
+per pass; BOS, separators, and repeated prefix scores are excluded. Input can
+exceed one model context, but a window does not see all earlier or later blocks.
+
+If a tokenizer normalizes text so its token pieces cannot map back to the
+source, the native block still supplies context but its text stays internally
+intact. Whole historical groups may still be removed. No sentence splitter,
+language-specific text parser, or new runtime dependency is used.
+
+Deletion estimates include marker token costs: starting a gap adds a marker,
+extending one adds none, and joining two gaps removes a marker. After each batch of deletions,
+the server applies the real chat template and tokenizes again. A successful
+response always meets `target_tokens`. A whole historical group can take the
+result below the requested budget. Candidates rejected by the template, for
+example because roles do not alternate, are skipped while deletion continues.
+Token IDs at deletion boundaries can change. Source retention and order are
+guaranteed; re-tokenized token IDs need not form a subsequence. Original literal
+`␡` characters and `\u2421` escapes are treated as source text, not as prior
+compression metadata. The marker count reports only insertions by this request.
+
+The score does not prove relevance to the current coding task. It can miss
+long-range relationships outside the window, and reversing content changes the
+model's input distribution. Rare noise and important repetitive code can both
+be misranked. Fine-grained deletion can also spend tokens on many separate
+markers, requiring further deletion to meet the budget. The API
+preserves JSON and tool relationships; it does not promise equivalent answers
+or valid source code inside shortened strings. Keep the original request for
+recovery and evaluate task success before choosing a production compression
+ratio. This implementation does not edit live KV entries or shift positions;
+the returned request receives a normal fresh prefill when submitted later.
+
+Scoring needs a decoder model and raw logits. It consumes inference capacity
+and adds two scoring passes; a speedup is not guaranteed. The server explicitly
+reserves up to 32 scoring output rows, bounded by batch and microbatch sizes.
+The raw logit rows use up to `32 * vocabulary_size * sizeof(float)` bytes;
+other output buffers and graph workspaces can require additional memory. TP5
+batch limits and existing context guards remain in force. Use a template that
+includes tool arguments when measuring savings on tool histories: text omitted
+by a template does not contribute to that model's prompt budget.
+
+With unified KV memory, a scoring window waits for active inference to finish,
+runs alone, and clears idle prompt caches before use. Other inference tasks can
+run between windows. This prevents a scoring window from exhausting KV memory
+that belongs to an active completion; it can reduce prompt-cache reuse. Separate
+KV streams keep normal slot scheduling.
+An active compression request keeps the model awake during tokenization,
+scoring, and final budget checks; idle sleep resumes after the request releases
+that model activity guard.
+
+**Response headers**
+
+| Header | Meaning |
+| --- | --- |
+| `X-Compression-Original-Tokens` | Original formatted prompt size |
+| `X-Compression-Tokens` | Returned formatted prompt size |
+| `X-Compression-Target-Tokens` | Applied budget |
+| `X-Compression-Method` | `unchanged` or `content-bidirectional-nll` |
+| `X-Compression-Scored-Tokens` | Finite target losses across both passes, excluding repeated prefixes, BOS, and separators |
+| `X-Compression-Score-Windows` | Number of queued scoring windows across both passes |
+| `X-Compression-Removed-Messages` | Number of removed historical messages |
+| `X-Compression-Markers` | Number of newly inserted `␡` markers; zero for an unchanged response |
+
+Malformed JSON, duplicate object keys, invalid Unicode, an invalid budget, or
+unmatched/duplicate tool results return HTTP 400. Nesting is limited to 128 JSON
+containers. If the deletion policy cannot reach the budget while retaining its
+protected fields, the endpoint returns HTTP 422 with
+`error.type = "compression_budget_exceeded"`. Its `minimum_tokens` is the token
+count of the maximally pruned candidate under this policy. It is not a
+mathematical lower bound over all possible subsequences, since tokenization at
+deletion boundaries is not monotonic; it is `null` if the template rejects that
+candidate. No over-budget candidate is returned as
+a successful request. Unsupported scoring models return HTTP 501.
+
+For model-backed protocol tests without downloading server test presets, run:
+
+```sh
+LLAMA_TEST_MODEL=/path/to/tiny-decoder.gguf \
+  ctest --test-dir build -R '^(test-compress-json|test-server-compress|test-server-score|test-server-model-activity)$' --output-on-failure
+python3 tools/server/tests/test_compress_standalone.py \
+  --binary build/bin/llama-server --model /path/to/tiny-decoder.gguf
+```
+
 ### POST `/v1/chat/completions/control`: Control a running chat completion in real time
 
 Acts on an in-flight completion identified by its `id` (the `id` field streamed back by `/v1/chat/completions`). The request is processed in parallel with the SSE stream, so the client sends it while still reading tokens.

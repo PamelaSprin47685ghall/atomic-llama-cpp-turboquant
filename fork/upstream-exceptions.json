@@ -1942,13 +1942,14 @@
     },
     {
       "path": "tests/CMakeLists.txt",
-      "sha256": "036adf8f825e634187e797795419c707bd2e00d1cf0462f26e8078c1a1101feb",
+      "sha256": "1f29b3fcc0392dcd0ddf946a9e4a48c0dba2d1bce324ac943ac53f9ec55d15f6",
       "mode": "100644",
       "consumers": [
-        "llama batch allocator tests"
+        "llama batch allocator tests",
+        "llama-server /v1/compress"
       ],
-      "reason": "Register the TP5 ubatch-pool, staging scheduler/pool/lock, context-retention and prefab sub-envelope CPU tests. Register the relay verification counter CPU test. Register the CPU-only Meta partial-enqueue test target.",
-      "removal_condition": "Remove when the pool test moves into the upstream test tree."
+      "reason": "Register the TP5 ubatch-pool, staging scheduler/pool/lock, context-retention and prefab sub-envelope CPU tests. Register the relay verification counter CPU test. Register the CPU-only Meta partial-enqueue test target. Register JSON source/marker mapping, native-content plan, real bidirectional queued-score, and model-activity lifetime tests for request compression.",
+      "removal_condition": "Remove when the pool test moves into the upstream test tree. Remove the compression addition when upstream supplies equivalent behavior or this endpoint is retired."
     },
     {
       "path": "tests/nkv-cpu-probe/README.md",
@@ -2621,6 +2622,26 @@
       "removal_condition": "Remove when the equivalent change is accepted upstream."
     },
     {
+      "path": "tests/test-server-compress.cpp",
+      "sha256": "2de3d9d436906d81874869a09c38cd5f3a92d2a5f24cf93eb3c04c4095b1ac6c",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Use a real GGUF tokenizer and controlled scores to test native content boundaries, paired ranking, single-block fallback, source-preserving marked edits, and atomic tool exchange deletion. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
+      "path": "tests/test-server-score.cpp",
+      "sha256": "44e5a3165d9f122c9c210082c66cc60b4b9ce395621951aa8289971c36356226",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Compare queued NLL and native-block forward/reverse streams with independent single-token model evaluations; exercise unified KV scheduling, cancellation, and model-activity sleep/wake ownership. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
       "path": "tests/test-shape-cache.cpp",
       "sha256": "87bdaa8b36694727928bca0fd3643e96d1c39cc8eab4a23e306dbc783d35162c",
       "mode": "100644",
@@ -2791,37 +2812,170 @@
       "removal_condition": "Remove when the equivalent change is accepted upstream."
     },
     {
-      "path": "tools/server/server-context.cpp",
-      "sha256": "a5892b7e9101f08a05769387758e736c038bc22fd70afad43d9b07f013041e2d",
+      "path": "tools/server/CMakeLists.txt",
+      "sha256": "30327df9097251b592c605e16cbb6cf151d3c90f486851e9a06ab9d6d154d03c",
       "mode": "100644",
       "consumers": [
-        "stock llama-server"
+        "llama-server /v1/compress"
       ],
-      "reason": "Keep sticky prefill selection and phase fences in the existing private server loop; this is an explicit orchestration exception.",
-      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+      "reason": "Compile the server-private source-map and deletion-plan files into the existing server-context target without a new runtime dependency. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
+      "path": "tools/server/README.md",
+      "sha256": "3156f9eb8afa7238cb439a52cd7ee310c2c0efdecc7e2fc159ba558d7ae1ddea",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Document native-content bidirectional compression, source retention plus U+2421 markers, exact prompt budgets, selection and runtime costs, and bounded validation scope. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
+      "path": "tools/server/server-compress-json.cpp",
+      "sha256": "380cadf5991de3c0ce6883ec3a02d2ddc9908e58450c166086404529ccee1b08",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Parse original JSON, map Unicode and nested argument string ranges, and render source-preserving deletions with U+2421 markers and exact insertion provenance. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
+      "path": "tools/server/server-compress-json.h",
+      "sha256": "6785e3f7bc66555e833de139134649bab6799bb20289dda07f9963182b19d288",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Declare the owned source tree, Unicode byte-range mapping, and marked-deletion result with inserted-marker provenance. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
+      "path": "tools/server/server-compress-stream.h",
+      "sha256": "3020e9a5dfb4e56acf2a5f612d7f79cdcc223e68ce902300662a57d9aaacb0ea",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Build forward and reversed native-content scoring streams with unchanged within-block token order and matched local target windows; retain cross-block context without owning inference state. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
+      "path": "tools/server/server-compress.cpp",
+      "sha256": "ffdb11c963a2cde1a7a196752c733f6bb031bb5df63d4c83ac90aec64ae26802",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Group tool exchanges, map native content tokens to safe source spans, rank paired NLL differences, and render marked requests using marker-aware deletion estimates. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
+      "path": "tools/server/server-compress.h",
+      "sha256": "094b704d4ac6136094b814347dc8f6e1f025a1080a61791fcda8c8ece19b3cdf",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Declare the server-private native-content plan, paired score/source state, and marked-edit results; this is not an independent B library. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
+      "path": "tools/server/server-context.cpp",
+      "sha256": "9457513398dcd8ec692f970f39bb258d6e219245e5fc6c6caf87c4f0a15d7938",
+      "mode": "100644",
+      "consumers": [
+        "stock llama-server",
+        "llama-server /v1/compress"
+      ],
+      "reason": "Keep sticky prefill selection and phase fences in the existing private server loop; this is an explicit orchestration exception. Add bounded raw-logit scoring tasks and the /v1/compress handler, with unified KV isolation, native-content forward/reverse scoring, marker-inclusive template budget checks, and guarded model lifetime.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Remove the compression addition when upstream supplies equivalent behavior or this endpoint is retired."
+    },
+    {
+      "path": "tools/server/server-context.h",
+      "sha256": "9982244c2ef965b384601412f4093056b99b8d6685a2ad43f91613f792ba209f",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Declare the compression handler on the existing server routes. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
+      "path": "tools/server/server-queue.cpp",
+      "sha256": "7b65b612bec47c1141400eeac7c57b725f04d4791f2f2a419bfe84d2485b4deb",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Hold model activity between scoring windows so idle sleep cannot unload vocabulary or model data during HTTP-side tokenization and budget checks. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
+      "path": "tools/server/server-queue.h",
+      "sha256": "55401d39fb64dc6930818bdb5f6b5f31e7643e214cea9cd2c03f5bbb18fdb27e",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Provide a move-only model-activity lifetime guard on the server queue, without granting HTTP threads inference-context access. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
+      "path": "tools/server/server-task.cpp",
+      "sha256": "19b4d465a35c10fdf3ff8c9e586849c4b7b5a9414b590794e7eda140b9d94a93",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Serialize the typed queued-score result using the existing server task-result contract. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
     },
     {
       "path": "tools/server/server-task.h",
-      "sha256": "1505c19411c4dc0d5a498ff5dab554bee01e9324ab542f6e2740106c38679a7e",
+      "sha256": "48eaf58eabe931a0b0827c3db0747b22c43c034bbd8c605ad3c46b166de81638",
       "mode": "100644",
       "consumers": [
-        "stock llama-server task values"
+        "stock llama-server task values",
+        "llama-server /v1/compress"
       ],
-      "reason": "Initialize slot action ID to -1 so ordinary task moves do not copy an indeterminate integer.",
-      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+      "reason": "Initialize slot action ID to -1 so ordinary task moves do not copy an indeterminate integer. Add a non-sampling score task and an owned per-token NLL result for the compression consumer.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Remove the compression addition when upstream supplies equivalent behavior or this endpoint is retired."
     },
     {
       "path": "tools/server/server.cpp",
-      "sha256": "603018e5ae36a41ca4abbf45bdf0efebb73027a1f7e6a4ce338aa2a53c0c35a3",
+      "sha256": "5ae62019fb1ad6bf29ff2086144071264f7cc41ca2b1dd1be64381663a242bd2",
       "mode": "100644",
       "consumers": [
-        "stock llama-server"
+        "stock llama-server",
+        "llama-server /v1/compress"
       ],
-      "reason": "Reject phase release with disabled prefill priority or the incompatible shared CUDA phase arena.",
-      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression."
+      "reason": "Reject phase release with disabled prefill priority or the incompatible shared CUDA phase arena. Register /v1/compress and forward the route through the existing model router.",
+      "removal_condition": "Remove when the selected upstream supplies equivalent behavior, or when all named consumers stop requiring it; update the pin and rerun the corresponding real runtime regression. Remove the compression addition when upstream supplies equivalent behavior or this endpoint is retired."
     },
     {
-      "path": "\u4fdd\u59c6\u7ea7\u84dd\u56fe\u624b\u518c.md",
+      "path": "tools/server/tests/test_compress_standalone.py",
+      "sha256": "fc8fe0d65048cf2c3fc982fff985571890b8703bf2c76b2b30fb2c248225bdf6",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Exercise the real HTTP endpoint with independent marker-inclusive template budgets, insertion-aware source alignment, native content order, large tool payloads, and returned-request generation. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
+      "path": "tools/server/tests/unit/test_compress_json.cpp",
+      "sha256": "060999d66aac6ba60bc086299121eec0e6161f886edf0a357c21b20eeef01b78",
+      "mode": "100644",
+      "consumers": [
+        "llama-server /v1/compress"
+      ],
+      "reason": "Test raw JSON and nested argument source mapping, marker provenance and collisions, Unicode and escape boundaries, invalid edits, and field preservation. This is an explicit server-private A change.",
+      "removal_condition": "Remove when the selected upstream provides equivalent request compression and runtime guarantees, or the named server consumer is retired."
+    },
+    {
+      "path": "保姆级蓝图手册.md",
       "sha256": "1c68cfdaf1eca706a950e6601b97ecad66f8884ccb638e0f0eb70c3be591a537",
       "mode": "100644",
       "consumers": [

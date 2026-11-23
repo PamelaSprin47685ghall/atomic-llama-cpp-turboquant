@@ -1,6 +1,8 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-compress.h"
+#include "server-compress-stream.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -20,11 +22,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cmath>
 #include <exception>
 #include <memory>
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <limits>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -57,7 +61,27 @@ static uint32_t server_n_outputs_max(const common_params & params) {
 
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
 
-    return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+    // Prompt scoring needs several raw-logit rows. Keep its reservation bounded:
+    // at most 32 * vocabulary_size * sizeof(float) bytes for the logit rows.
+    // Other output buffers and graph workspaces can require additional memory.
+    const uint32_t n_score_outputs = std::min({n_batch, (uint32_t) params.n_ubatch, 32u});
+    return std::max<uint32_t>(n_score_outputs, std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs)));
+}
+
+static float server_token_nll(const float * logits, int32_t n_vocab, llama_token target) {
+    if (logits == nullptr || target < 0 || target >= n_vocab) {
+        throw std::runtime_error("cannot score a token without its logits");
+    }
+    const float maximum = *std::max_element(logits, logits + n_vocab);
+    double sum = 0.0;
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        sum += std::exp((double) logits[i] - maximum);
+    }
+    const double nll = std::log(sum) + ((double) maximum - logits[target]);
+    if (!std::isfinite(nll)) {
+        throw std::runtime_error("model returned non-finite token scores");
+    }
+    return (float) nll;
 }
 
 struct server_shared_draft_device_config {
@@ -420,6 +444,9 @@ struct server_slot {
 
     std::vector<completion_token_output> generated_token_probs;
 
+    // Scores belong to this task, and are moved to its result when prefill ends.
+    std::vector<float> prompt_nll;
+
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
@@ -550,6 +577,7 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        prompt_nll.clear();
         json_schema = json();
 
         // clear speculative decoding stats
@@ -596,6 +624,9 @@ struct server_slot {
 
     bool need_embd() const {
         GGML_ASSERT(task);
+        if (task->type == SERVER_TASK_TYPE_SCORE) {
+            return false;
+        }
         return task->need_embd() || (spec && common_speculative_need_embd(spec));
     }
 
@@ -730,8 +761,9 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
-            // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // A child uses its parent's cache. Scores do not seed a completion cache,
+            // including when scoring stops early or returns an error.
+            if (task->is_child() || task->type == SERVER_TASK_TYPE_SCORE) {
                 prompt_clear();
             }
 
@@ -2169,6 +2201,10 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
+        if (slot.task->type == SERVER_TASK_TYPE_SCORE) {
+            slot.prompt_nll.assign(slot.task->n_tokens(), std::numeric_limits<float>::quiet_NaN());
+        }
+
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
@@ -2813,6 +2849,7 @@ private:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_SCORE:
                 {
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
@@ -2822,7 +2859,40 @@ private:
                         }
                     }
 
+                    if (task.type == SERVER_TASK_TYPE_SCORE) {
+                        if (task.tokens.has_mtmd || task.is_parent() || task.is_child()) {
+                            send_error(task, "scoring requires one text token sequence", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        // Cached prefixes have no saved per-token logits. Score every token again.
+                        task.params.cache_prompt = false;
+                        task.params.stream = false;
+                        if (task.tokens.empty()) {
+                            auto res = std::make_unique<server_task_result_score>();
+                            res->id = task.id;
+                            res->index = task.index;
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+                    }
+
                     const int id_task = task.id;
+
+                    if (params_base.kv_unified) {
+                        const bool active_score = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                            return slot.is_processing() && slot.task->type == SERVER_TASK_TYPE_SCORE;
+                        });
+                        const bool active_task = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                            return slot.is_processing();
+                        });
+                        // A scoring window can use the entire shared KV pool. Wait for
+                        // current inference to finish, and keep new inference out until
+                        // this bounded window releases its slot.
+                        if (active_score || (task.type == SERVER_TASK_TYPE_SCORE && active_task)) {
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
+                    }
 
                     server_slot * slot = get_available_slot(task);
 
@@ -2860,6 +2930,18 @@ private:
                     } else if (!launch_slot_with_task(*slot, std::move(task))) {
                         SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
                         break; // drop the task
+                    }
+
+                    if (params_base.kv_unified && slot->task->type == SERVER_TASK_TYPE_SCORE) {
+                        // Idle slots still own KV cells. Their cached prompts must not
+                        // reduce the capacity promised to this exclusive scoring window.
+                        llama_synchronize(ctx_tgt);
+                        if (ctx_dft) {
+                            llama_synchronize(ctx_dft);
+                        }
+                        for (auto & cached : slots) {
+                            cached.prompt_clear();
+                        }
                     }
 
                     if (params_base.cache_idle_slots) {
@@ -3610,6 +3692,25 @@ private:
                     return;
                 }
 
+                if (slot.task->type == SERVER_TASK_TYPE_SCORE) {
+                    // Output capacity is a hard context limit. Keep the complete scoring
+                    // batch within it, including when several score tasks share a batch.
+                    n_batch = std::min({n_batch, n_ubatch, params_base.n_outputs_max, 32});
+
+                    // A context with any backend sampler permits only one output row per
+                    // sequence, including sequences which do not use that sampler.
+                    const bool has_backend_sampling = std::any_of(slots.begin(), slots.end(), [](const server_slot & active) {
+                        return active.is_processing() && active.task->need_sampling() &&
+                               active.task->params.sampling.backend_sampling;
+                    });
+                    if (has_backend_sampling) {
+                        n_batch = 1;
+                    }
+                    if (batch.size() >= n_batch) {
+                        return;
+                    }
+                }
+
                 // check if this is a child slot
                 if (slot.state == SLOT_STATE_WAIT_OTHER) {
                     SLT_DBG(slot, "%s", "waiting for parent slot to complete\n");
@@ -3690,7 +3791,8 @@ private:
                                 return;
                             }
                         } else {
-                            if (slot.task->n_tokens() >= slot.n_ctx) {
+                            const int n_generation = slot.task->type == SERVER_TASK_TYPE_SCORE ? 0 : 1;
+                            if (slot.task->n_tokens() > slot.n_ctx - n_generation) {
                                 send_error(slot,
                                            string_format("request (%d tokens) exceeds the available context size (%d "
                                                          "tokens), try increasing it",
@@ -4025,7 +4127,8 @@ private:
                         add_ok &= batch.add(slot.id,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
-                            slot.need_embd());
+                            slot.need_embd() || (slot.task->type == SERVER_TASK_TYPE_SCORE &&
+                                                slot.prompt.n_tokens() + 1 < slot.task->n_tokens()));
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
@@ -4081,8 +4184,11 @@ private:
 
                         GGML_ASSERT(batch.size() > 0);
 
-                        // extract the logits only for the last token
-                        batch.set_output(batch.size() - 1, true);
+                        // Generation uses the final row. Scoring uses each preceding row
+                        // to predict the following input token, and needs no final row.
+                        if (slot.task->type != SERVER_TASK_TYPE_SCORE) {
+                            batch.set_output(batch.size() - 1, true);
+                        }
 
                         slot.n_decoded = 0;
                         slot.i_batch   = batch.size() - 1;
@@ -4157,6 +4263,14 @@ private:
         }
 
         const int ret = llama_decode(ctx_tgt, batch_view);
+        if (batch.slot_batched->task->type == SERVER_TASK_TYPE_SCORE) {
+            // Also drain failed and zero-output batches before their input arrays or
+            // sequence memory can be changed by the next scoring step.
+            llama_synchronize(ctx_tgt);
+            if (ctx_dft) {
+                llama_synchronize(ctx_dft);
+            }
+        }
 
         metrics.on_decoded(slots);
 
@@ -4213,7 +4327,8 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_view)) {
+        if (batch.slot_batched->task->type != SERVER_TASK_TYPE_SCORE &&
+            !common_speculative_process(spec.get(), batch_view)) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error
@@ -4268,6 +4383,39 @@ private:
         };
 
         iterate(slots, [&](server_slot & slot) {
+            if (slot.is_processing() && slot.task->type == SERVER_TASK_TYPE_SCORE) {
+                // The output for position p predicts input token p + 1. Read each row
+                // before the next llama_decode replaces the output buffer.
+                for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                    if (!batch_view.logits[i] || batch_view.seq_id[i][0] != slot.id) {
+                        continue;
+                    }
+                    const int64_t target = (int64_t) batch_view.pos[i] + 1;
+                    if (target < 1 || target >= slot.task->n_tokens()) {
+                        throw std::runtime_error("scoring output does not match an input token");
+                    }
+                    slot.prompt_nll[target] = server_token_nll(
+                        llama_get_logits_ith(ctx_tgt, i), llama_vocab_n_tokens(vocab), slot.task->tokens[target]);
+                }
+
+                if (slot.state == SLOT_STATE_DONE_PROMPT && is_inside_view(slot.i_batch)) {
+                    for (size_t i = 1; i < slot.prompt_nll.size(); ++i) {
+                        if (!std::isfinite(slot.prompt_nll[i])) {
+                            throw std::runtime_error("model did not score every requested token");
+                        }
+                    }
+                    auto res = std::make_unique<server_task_result_score>();
+                    res->id = slot.task->id;
+                    res->id_slot = slot.id;
+                    res->index = slot.task->index;
+                    res->nll = std::move(slot.prompt_nll);
+                    slot.release();
+                    slot.i_batch = -1;
+                    queue_results.send(std::move(res));
+                }
+                return;
+            }
+
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
@@ -5293,6 +5441,10 @@ void server_routes::init_routes() {
         return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, req, TASK_RESPONSE_TYPE_OAI_CHAT);
     };
 
+    this->post_compress = [this](const server_http_req & req) {
+        return handle_compress(req);
+    };
+
     this->post_control = [this](const server_http_req & req) {
         auto res = create_response();
         const json body = json::parse(req.body);
@@ -5929,5 +6081,157 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
         response["object"] = "response.input_tokens";
     }
     res->ok(response);
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_compress(const server_http_req & req) {
+    auto activity = queue_tasks.acquire_model_activity();
+    auto res = create_response();
+    try {
+        size_t target = 0;
+        const auto target_arg = req.params.find("target_tokens");
+        if (target_arg != req.params.end()) {
+            const auto & value = target_arg->second;
+            if (value.empty()) {
+                throw std::invalid_argument("target_tokens must be a positive integer");
+            }
+            for (const char c : value) {
+                if (c < '0' || c > '9' || target > (std::numeric_limits<size_t>::max() - (c - '0')) / 10) {
+                    throw std::invalid_argument("target_tokens must be a positive integer");
+                }
+                target = target * 10 + (c - '0');
+            }
+            if (target == 0) {
+                throw std::invalid_argument("target_tokens must be a positive integer");
+            }
+        }
+
+        // Keep the source separately: the chat parser can mutate its JSON copy.
+        server_compress_plan plan(req.body, ctx_server.vocab);
+        auto count_tokens = [&](const std::string & raw) -> size_t {
+            json body = json::parse(raw);
+            std::vector<raw_buffer> files;
+            json formatted = oaicompat_chat_params_parse(body, meta->chat_params, files);
+            const auto & prompt = formatted.at("prompt");
+            if (ctx_server.mctx != nullptr) {
+                return process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, true).size();
+            }
+            return tokenize_mixed(ctx_server.vocab, prompt, true, true).size();
+        };
+
+        const size_t original = count_tokens(req.body);
+        auto count_candidate = [&](const std::string & raw, size_t & tokens) {
+            try {
+                tokens = count_tokens(raw);
+                return true;
+            } catch (const std::invalid_argument &) {
+            } catch (const std::runtime_error &) {
+            } catch (const json::exception &) {
+            }
+            // A template may require alternating roles or another conversation
+            // shape. The original already passed; discard this candidate only.
+            return false;
+        };
+        if (target_arg == req.params.end()) {
+            target = std::max(size_t(1), original / 2 + original % 2);
+        }
+        size_t scored_tokens = 0;
+        size_t score_windows = 0;
+        auto finish = [&](std::string raw, size_t tokens, const std::string & method, size_t markers) {
+            res->status = 200;
+            // Keep source spelling and order. Only deletion markers add bytes.
+            res->data = std::move(raw);
+            res->headers["X-Compression-Original-Tokens"] = std::to_string(original);
+            res->headers["X-Compression-Tokens"] = std::to_string(tokens);
+            res->headers["X-Compression-Target-Tokens"] = std::to_string(target);
+            res->headers["X-Compression-Method"] = method;
+            res->headers["X-Compression-Scored-Tokens"] = std::to_string(scored_tokens);
+            res->headers["X-Compression-Score-Windows"] = std::to_string(score_windows);
+            res->headers["X-Compression-Removed-Messages"] = std::to_string(plan.removed_messages());
+            res->headers["X-Compression-Markers"] = std::to_string(markers);
+        };
+        if (original <= target) {
+            finish(req.body, original, "unchanged", 0);
+            return res;
+        }
+
+        auto budget_error = [&]() {
+            auto error = format_error_response("compression cannot reach target_tokens while keeping the protected request structure", ERROR_TYPE_INVALID_REQUEST);
+            error["code"] = 422;
+            error["type"] = "compression_budget_exceeded";
+            // This counts the maximally pruned candidate, not a mathematical
+            // lower bound: tokenization can change at each deletion boundary.
+            size_t minimum = 0;
+            error["minimum_tokens"] = count_candidate(plan.minimum().text, minimum) ? json(minimum) : json(nullptr);
+            error["target_tokens"] = target;
+            res->error(error);
+        };
+        if (params.embedding || llama_model_has_encoder(ctx_server.model_tgt) || meta->slot_n_ctx < 4) {
+            res->error(format_error_response("compression scoring requires a decoder model with a text context", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const size_t window_size = std::min(size_t(512), size_t(meta->slot_n_ctx));
+        const size_t overlap = std::min(size_t(32), window_size / 4);
+        const llama_token bos = llama_vocab_bos(ctx_server.vocab);
+        const bool add_bos = llama_vocab_get_add_bos(ctx_server.vocab) && bos != LLAMA_TOKEN_NULL;
+        const auto separator = common_tokenize(ctx_server.vocab, "\n\n", false, false);
+        for (bool reverse : {false, true}) {
+            server_compress_stream stream(plan.texts(), separator, window_size, overlap,
+                                          add_bos ? bos : LLAMA_TOKEN_NULL, reverse);
+            server_compress_window window;
+            while (stream.next(window)) {
+                if (req.should_stop()) {
+                    return res;
+                }
+                // One reader per window bounds queued work and owns cancellation.
+                server_response_reader reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
+                server_task task(SERVER_TASK_TYPE_SCORE);
+                task.id = reader.get_new_id();
+                task.tokens = server_tokens(window.tokens, false);
+                reader.post_task(std::move(task));
+                auto result = reader.next(req.should_stop);
+                if (!result) {
+                    return res;
+                }
+                if (result->is_error()) {
+                    res->error(result->to_json());
+                    return res;
+                }
+                const auto * score = dynamic_cast<server_task_result_score *>(result.get());
+                if (!score || score->nll.size() != window.tokens.size()) {
+                    throw std::runtime_error("compression received an invalid score result");
+                }
+                const std::vector<float> losses(score->nll.begin() + window.score_offset, score->nll.end());
+                plan.add_scores(window.text_index, window.begin, losses, reverse);
+                scored_tokens += std::count_if(losses.begin(), losses.end(), [](float loss) { return std::isfinite(loss); });
+                ++score_windows;
+            }
+        }
+
+        plan.rank();
+        size_t current = original;
+        server_compress_json::deletion_result output{req.body, {}};
+        while (current > target) {
+            if (req.should_stop()) {
+                return res;
+            }
+            // Token estimates choose a batch of deletions, never the final budget.
+            if (!plan.remove_tokens(current - target)) {
+                budget_error();
+                return res;
+            }
+            output = plan.render();
+            if (!count_candidate(output.text, current)) {
+                // Remove one more action at a time until the template accepts.
+                current = target + 1;
+            }
+        }
+        finish(std::move(output.text), current, "content-bidirectional-nll", output.markers.size());
+    } catch (const std::invalid_argument & error) {
+        res->error(format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
+    } catch (const json::exception & error) {
+        res->error(format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
+    }
     return res;
 }

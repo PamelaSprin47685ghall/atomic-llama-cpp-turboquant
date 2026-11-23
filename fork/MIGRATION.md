@@ -1,3 +1,74 @@
+## 2026-11-23: Native content order and visible compression gaps
+
+PR #1 now follows the requested marker contract: a continuous deletion inside
+a string becomes `␡` (U+2421). All other returned bytes retain their original
+spelling and order. Whole-message removal remains structural erasure. The
+marker is counted through the real chat template and tokenizer, including when
+it occupies several model tokens. Selection also estimates the net cost when
+a gap starts, extends, or merges, rather than counting deleted tokens alone.
+Existing literal or escaped markers are
+ordinary source text; internal provenance records only new insertions.
+
+Scoring now uses two actual conditional streams. Native content items,
+assistant reasoning fields, and complete tool calls define the block order.
+The reverse pass reverses those blocks while keeping tokens inside each block
+in forward order. Protected text still supplies context. Both passes use the
+same local target ranges, so a different global window alignment cannot create
+a spurious difference inside a long block. The private stream helper has no
+model or scheduler ownership; queued SCORE tasks retain those responsibilities.
+
+Mean forward NLL minus reverse NLL is the primary ranking score. Forward NLL
+and then original source order break ties, including for a single native block
+whose two scoring streams are identical. Deletion spans follow token and
+Unicode/escape boundaries rather than fixed-size chunks. The existing
+32-token prefix/suffix protection is retained as a protection policy, not as a
+block definition. A large content item or write argument can still shrink
+internally. Tokenizers without a reversible source map retain that field
+internally instead of creating artificial code-point blocks.
+
+This remains an explicit server-private A exception. Its current contract and
+runtime limits are in [the server API](../tools/server/README.md#post-v1compress-compress-a-chat-completions-request).
+The two-pass score is a bounded-context heuristic, not exact PMI or proof of
+coding-task importance. Model-quality and GPU/TP5 qualification remain separate
+work. Current test evidence is recorded in the 2026-11-23 entry in
+[VALIDATION.md](VALIDATION.md).
+
+The 2026-11-22 entry below describes the initial implementation. Its pure
+deletion, fixed block, and forward-only scoring decisions are superseded by
+this update; its historical test observations retain their original identity.
+
+---
+
+## 2026-11-22: Request compression in the original llama-server
+
+The requested consumer is `POST /v1/compress` in the existing server. It accepts
+a Chat Completions request and returns a request formed only by deleting ranges
+from the original HTTP JSON bytes. The contract, budget parameter, protection
+policy, and limitations are documented in
+[the server API](../tools/server/README.md#post-v1compress-compress-a-chat-completions-request).
+
+This is an explicit server-private A change. The source map and deletion plan
+live beside the server, and NLL scoring uses its private task/slot queue. These
+files are not represented as an independent B library, and no service callback
+is used to hide an A/B dependency. The public llama C API alone cannot add a
+safe scoring task to the existing server scheduler. Exact changed A paths and
+digests are registered in `upstream-exceptions.json`; remove this exception when
+the selected upstream provides the same request-compression operation and its
+runtime guarantees, or the named consumer is retired.
+
+| Decision | Scope |
+| --- | --- |
+| Kept | Source-byte subsequence output, real template/token budget, tool-result closure, large text and JSON string argument slicing, queued windowed NLL |
+| Excluded | Generated summaries, sentence splitting, text reserialization, live KV eviction/position shifting, external services or new runtime dependencies |
+| Deferred | Query-aware semantic importance, task-quality qualification on coding workloads, reverse-pass scores, GPU/TP5 performance qualification |
+
+The score is predictability under a bounded local text window. It does not prove
+that a deleted token is irrelevant. A valid compressed request can still lose
+task information. Runtime evidence for this change is recorded separately in
+[VALIDATION.md](VALIDATION.md); prior TP5 measurements do not qualify it.
+
+---
+
 <!-- two-requests-current-status-20261021 -->
 ## 2026-10-21：双请求保留版本与最终测量；每路 47 tok/s 目标未达到
 

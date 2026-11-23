@@ -7,6 +7,7 @@
 #include <mutex>
 #include <vector>
 #include <unordered_set>
+#include <utility>
 
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
@@ -17,6 +18,7 @@ private:
     bool sleeping = false;
     bool req_stop_sleeping = false;
     int64_t time_last_task = 0;
+    size_t model_activity_count = 0;
 
     // queues
     std::deque<server_task> queue_tasks;
@@ -31,6 +33,25 @@ private:
     std::function<void(bool)>           callback_sleeping_state;
 
 public:
+    // Keep read-only model APIs available between queued inference tasks.
+    // This guard does not permit llama_context access from an HTTP thread.
+    class model_activity {
+    public:
+        model_activity(model_activity && other) noexcept : queue(std::exchange(other.queue, nullptr)) {}
+        model_activity(const model_activity &) = delete;
+        model_activity & operator=(const model_activity &) = delete;
+        model_activity & operator=(model_activity &&) = delete;
+        ~model_activity();
+
+    private:
+        friend struct server_queue;
+        explicit model_activity(server_queue & queue) : queue(&queue) {}
+        server_queue * queue;
+    };
+
+    // Wake the model if needed, then prevent idle sleep until the guard is destroyed.
+    model_activity acquire_model_activity();
+
     // Add a new task to the end of the queue
     int post(server_task && task, bool front = false);
 
@@ -112,6 +133,7 @@ public:
 
 private:
     void cleanup_pending_task(int id_target);
+    void release_model_activity();
 };
 
 // struct for managing server responses

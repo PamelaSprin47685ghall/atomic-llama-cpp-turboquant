@@ -17,6 +17,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
+    SERVER_TASK_TYPE_SCORE,
     SERVER_TASK_TYPE_INFILL,
     SERVER_TASK_TYPE_CANCEL,
     SERVER_TASK_TYPE_CONTROL,
@@ -197,6 +198,7 @@ struct server_task {
         switch (type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
+            case SERVER_TASK_TYPE_SCORE:
                 return true;
             default:
                 return false;
@@ -490,6 +492,14 @@ struct server_task_result_rerank : server_task_result {
     float score = -1e6;
 
     int32_t n_tokens;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_score : server_task_result {
+    // One entry per input token. The first token has no preceding logits and is NaN.
+    // Entry i is -log P(tokens[i] | tokens[0:i]), in natural-log units.
+    std::vector<float> nll;
 
     virtual json to_json() override;
 };

@@ -1,5 +1,13 @@
 llama_add_compile_flags()
 
+# Exact source-byte deletion and JSON string span mapping need no model.
+add_executable(test-compress-json
+    ../tools/server/tests/unit/test_compress_json.cpp
+    ../tools/server/server-compress-json.cpp)
+target_include_directories(test-compress-json PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-compress-json PRIVATE cxx_std_17)
+add_test(NAME test-compress-json COMMAND test-compress-json)
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 
@@ -870,6 +878,22 @@ endif()
 llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN)
+        # Pass a decoder GGUF through LLAMA_TEST_MODEL. Missing models are explicit skips.
+        add_executable(test-server-score test-server-score.cpp)
+        target_include_directories(test-server-score PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+        target_link_libraries(test-server-score PRIVATE llama-server-impl server-context)
+        add_test(NAME test-server-score COMMAND test-server-score)
+        set_tests_properties(test-server-score PROPERTIES SKIP_RETURN_CODE 77 LABELS "model;server")
+        add_test(NAME test-server-model-activity COMMAND test-server-score --queue-only)
+        set_tests_properties(test-server-model-activity PROPERTIES LABELS "server")
+        add_executable(test-server-compress test-server-compress.cpp)
+        target_include_directories(test-server-compress PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+        target_compile_features(test-server-compress PRIVATE cxx_std_17)
+        target_link_libraries(test-server-compress PRIVATE server-context)
+        add_test(NAME test-server-compress COMMAND test-server-compress)
+        set_tests_properties(test-server-compress PROPERTIES SKIP_RETURN_CODE 77 LABELS "model;server")
+    endif()
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
